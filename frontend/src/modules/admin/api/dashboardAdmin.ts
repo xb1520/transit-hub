@@ -77,14 +77,33 @@ export const refreshDashboardAdminSession = async (): Promise<DashboardAdminStat
 
 // ─── 仪表盘指标数据 ────────────────────────────────────────
 
-/** 五项核心指标的实时数据。 */
+/** 核心指标的实时数据。 */
 export interface DashboardMetricsResponse {
   todayProfit: number
+  siteRevenueBalance?: number
+  upstreamPrepaidBalance?: number
+  upstreamCreditReference?: number
+  coverageApplicable?: boolean
+  coverageRatio?: number | null
   siteBalance: number
   todayPurchase: number
+  todayCost?: number
+  todayInbound?: number
   netProfit: number
   upstreamBalance: number
   groupCount: number
+  /** 工作区站点充值倍率（平台余额 → 成本/CNY） */
+  siteRechargeRate?: number
+  /** 倍率换算前的平台单位站点余额 */
+  siteBalancePlatform?: number
+  siteRevenueBalancePlatform?: number
+  /** 全站累计赠送/返利/充值（CNY，流水标记合计） */
+  siteGiftTotal?: number
+  siteRebateTotal?: number
+  siteRechargeTotal?: number
+  siteGiftTotalPlatform?: number
+  siteRebateTotalPlatform?: number
+  siteRechargeTotalPlatform?: number
 }
 
 /** 历史趋势单日数据点。 */
@@ -93,6 +112,8 @@ export interface DashboardTrendPoint {
   todayProfit: number
   siteBalance: number
   todayPurchase: number
+  todayCost?: number
+  todayInbound?: number
   netProfit: number
   upstreamBalance: number
 }
@@ -102,10 +123,12 @@ export interface DashboardTrendsResponse {
   points: DashboardTrendPoint[]
 }
 
-/** 站点用户余额筛选配置。 */
+/** 站点用户余额筛选配置（双口径：赠送只扣营收侧）。 */
 export interface BalanceFilterConfig {
   excludeAdmin: boolean
   excludeBalances: number[]
+  excludeUserIds?: string[]
+  userGiftAmounts?: Record<string, number>
 }
 
 /** 获取当前用户的余额筛选配置。 */
@@ -209,3 +232,22 @@ export interface UpstreamBalanceBreakdownResponse {
 /** 获取当前工作区所有上游站点的缓存余额明细（不触发外部平台请求）。仅在弹窗打开时按需调用。 */
 export const getUpstreamBalanceBreakdown = async (): Promise<UpstreamBalanceBreakdownResponse> =>
   requestJson<UpstreamBalanceBreakdownResponse>('/dashboard/upstream-balance-breakdown')
+
+/** 今日进货按上游站点汇总。 */
+export interface TodayInboundBreakdownItem {
+  siteId: string
+  siteName: string
+  platform: string
+  amountCost: number
+  entryCount: number
+  rechargeRate: number
+}
+
+export interface TodayInboundBreakdownResponse {
+  date: string
+  total: number
+  sites: TodayInboundBreakdownItem[]
+}
+
+export const getTodayInboundBreakdown = async (): Promise<TodayInboundBreakdownResponse> =>
+  requestJson<TodayInboundBreakdownResponse>('/dashboard/today-inbound-breakdown')

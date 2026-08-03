@@ -20,3 +20,7 @@ backend/.prisma
 *.tsbuildinfo
 development-docs/
 data/
+
+# local docker override & credentials
+deploy/docker-compose.local.override.yml
+data/

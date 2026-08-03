@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -394,8 +395,8 @@ func (s *PlatformService) FetchSub2APIGroupDailyStats(session Session, groups ..
 	if err := s.VerifySub2APIAdmin(session); err != nil {
 		return nil, err
 	}
-	today := time.Now().Format("2006-01-02")
-	statsURL := session.BaseURL + "/api/v1/admin/dashboard/groups?start_date=" + today + "&end_date=" + today
+	today := BusinessToday()
+	statsURL := session.BaseURL + "/api/v1/admin/dashboard/groups?start_date=" + today + "&end_date=" + today + "&timezone=" + url.QueryEscape(BusinessTimezone)
 	response, err := s.httpClient.requestJSON(statsURL, adminAuthOptions(session))
 	if err != nil {
 		return nil, err
@@ -421,20 +422,130 @@ func (s *PlatformService) FetchSub2APIGroupDailyStats(session Session, groups ..
 // 查询指定日期范围内的总实际消费（即站点的盈利额度）。
 // startDate 和 endDate 格式为 "2006-01-02"，查询当天数据时两者传同一天即可。
 func (s *PlatformService) FetchSub2APIAdminUsageStats(session Session, startDate, endDate string) (float64, error) {
+	return s.FetchSub2APIAdminUsageStatsFiltered(session, startDate, endDate, "")
+}
+
+// FetchSub2APIAdminUsageStatsFiltered 同 usage/stats，可按 user_id 过滤单用户总实际消费。
+func (s *PlatformService) FetchSub2APIAdminUsageStatsFiltered(session Session, startDate, endDate, platformUserID string) (float64, error) {
 	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
 		return 0, newRequestError(ErrorAuth, PlatformSub2API)
 	}
-	statsURL := session.BaseURL + "/api/v1/admin/usage/stats?start_date=" + startDate + "&end_date=" + endDate
+	values := url.Values{}
+	values.Set("start_date", strings.TrimSpace(startDate))
+	values.Set("end_date", strings.TrimSpace(endDate))
+	values.Set("timezone", BusinessTimezone)
+	if uid := strings.TrimSpace(platformUserID); uid != "" {
+		values.Set("user_id", uid)
+	}
+	statsURL := session.BaseURL + "/api/v1/admin/usage/stats?" + values.Encode()
 	response, err := s.httpClient.requestJSON(statsURL, adminAuthOptions(session))
 	if err != nil {
 		return 0, err
 	}
 	data := dataRecord(response.Payload)
-	cost := firstNumber(data, []string{"total_actual_cost", "totalActualCost", "total_cost", "totalCost"})
+	cost := firstNumber(data, []string{"total_actual_cost", "totalActualCost", "total_cost", "totalCost", "actual_cost", "actualCost"})
 	if cost == nil {
 		return 0, nil
 	}
 	return *cost, nil
+}
+
+// FetchSub2APIAdminUserGroupUsage 拉取指定用户在日期区间内的分组用量明细。
+// 走 GET /api/v1/admin/dashboard/groups?user_id=…；与全站 groups 同一接口，靠 user_id 过滤。
+func (s *PlatformService) FetchSub2APIAdminUserGroupUsage(session Session, platformUserID, startDate, endDate string) ([]Sub2APIUserGroupUsage, error) {
+	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+		return nil, newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	platformUserID = strings.TrimSpace(platformUserID)
+	if platformUserID == "" {
+		return nil, newRequestError(ErrorInvalidResponse, PlatformSub2API)
+	}
+	values := url.Values{}
+	values.Set("user_id", platformUserID)
+	values.Set("start_date", strings.TrimSpace(startDate))
+	values.Set("end_date", strings.TrimSpace(endDate))
+	values.Set("timezone", BusinessTimezone)
+	requestURL := session.BaseURL + "/api/v1/admin/dashboard/groups?" + values.Encode()
+	response, err := s.httpClient.requestJSON(requestURL, adminAuthOptions(session))
+	if err != nil {
+		return nil, err
+	}
+	items := dataArray(response.Payload)
+	if len(items) == 0 {
+		if groups, ok := dataRecord(response.Payload)["groups"].([]any); ok {
+			items = groups
+		}
+	}
+	out := make([]Sub2APIUserGroupUsage, 0, len(items))
+	for _, item := range items {
+		record := dataRecord(item)
+		name := firstString(item, []string{"group_name", "groupName", "name"})
+		if name == nil || strings.TrimSpace(*name) == "" {
+			continue
+		}
+		gid := firstStringy(record, []string{"group_id", "groupId", "id"})
+		usage := Sub2APIUserGroupUsage{
+			GroupID:     gid,
+			GroupName:   strings.TrimSpace(*name),
+			ActualCost:  sub2APIGroupDailyCost(item),
+			Cost:        floatFromRecord(record, []string{"cost", "total_cost", "totalCost"}),
+			Requests:    intFromRecord(record, []string{"requests", "request_count", "requestCount"}, 0),
+			TotalTokens: int64FromRecord(record, []string{"total_tokens", "totalTokens"}),
+		}
+		// 若 today_* 字段未命中但有 actual_cost，上面已覆盖；保证至少有 actual/cost 之一
+		if usage.ActualCost == 0 {
+			if ac := firstNumber(record, []string{"total_actual_cost", "totalActualCost", "actual_cost", "actualCost"}); ac != nil {
+				usage.ActualCost = *ac
+			}
+		}
+		out = append(out, usage)
+	}
+	// 按实际消费降序
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].ActualCost > out[j].ActualCost
+	})
+	return out, nil
+}
+
+// FetchSiteUsageActualCost 查询上游站点账号在业务时区指定日期范围内的实际消费。
+// 用于仪表盘午夜快照回填昨天进货额度：不能再用已翻日的 TodayConsume 缓存。
+// sub2api 走 /api/v1/usage/stats；new-api 走 /api/log/self/stat 的时间戳区间。
+func (s *PlatformService) FetchSiteUsageActualCost(session Session, startDate, endDate string) (float64, error) {
+	switch session.Platform {
+	case PlatformNewAPI:
+		return s.fetchNewAPISelfUsageActualCost(session, startDate, endDate)
+	default:
+		return s.fetchSub2APISiteUsageActualCost(session, startDate, endDate)
+	}
+}
+
+func (s *PlatformService) fetchSub2APISiteUsageActualCost(session Session, startDate, endDate string) (float64, error) {
+	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+		return 0, newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	statsURL := session.BaseURL + "/api/v1/usage/stats?start_date=" + url.QueryEscape(startDate) +
+		"&end_date=" + url.QueryEscape(endDate) + "&timezone=" + url.QueryEscape(BusinessTimezone)
+	response, err := s.httpClient.requestJSON(statsURL, sub2APIUserAuthOptions(session))
+	if err != nil {
+		return 0, err
+	}
+	return sub2APIUsageStatsCost(dataRecord(response.Payload)), nil
+}
+
+func (s *PlatformService) fetchNewAPISelfUsageActualCost(session Session, startDate, endDate string) (float64, error) {
+	if session.Platform != PlatformNewAPI || !session.IsAuthenticated() {
+		return 0, newRequestError(ErrorAuth, PlatformNewAPI)
+	}
+	startTS, endTS, err := BusinessDayRange(startDate, endDate)
+	if err != nil {
+		return 0, err
+	}
+	statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(startTS) + "&end_timestamp=" + strconvInt(endTS)
+	response, err := s.httpClient.requestJSON(statURL, newAPIAuthOptions(session))
+	if err != nil {
+		return 0, err
+	}
+	return quotaToUSDValueWithUnit(firstNumber(dataRecord(response.Payload), []string{"quota", "used_quota", "usedQuota"}), session.QuotaPerUnit), nil
 }
 
 // FetchSub2APIAdminSiteBalance 使用默认过滤规则（排除 admin 角色）统计站点用户总余额。
@@ -463,14 +574,14 @@ func (s *PlatformService) FetchSub2APIAdminSiteBalanceFiltered(session Session, 
 	}
 	firstUsers := dataArray(firstResponse.Payload)
 	if len(firstUsers) == 0 {
-		return AdminSiteBalance{Balance: 0}, nil
+		return AdminSiteBalance{}, nil
 	}
-	totalBalance := sumFilteredBalances(firstUsers, filter)
+	totals := sumFilteredBalances(firstUsers, filter)
 
 	// 判断是否只有一页。
 	total, hasTotal := paginationTotal(firstResponse.Payload)
 	if (!hasTotal && len(firstUsers) < pageSize) || (hasTotal && pageSize >= total) {
-		return AdminSiteBalance{Balance: totalBalance}, nil
+		return totals, nil
 	}
 
 	// 计算剩余页数，并发获取。
@@ -505,9 +616,11 @@ func (s *PlatformService) FetchSub2APIAdminSiteBalanceFiltered(session Session, 
 			if len(users) == 0 {
 				return
 			}
-			pageBalance := sumFilteredBalances(users, filter)
+			pageTotals := sumFilteredBalances(users, filter)
 			mu.Lock()
-			totalBalance += pageBalance
+			totals.CostBalance += pageTotals.CostBalance
+			totals.RevenueBalance += pageTotals.RevenueBalance
+			totals.Balance = totals.CostBalance
 			mu.Unlock()
 		}(page)
 	}
@@ -516,18 +629,29 @@ func (s *PlatformService) FetchSub2APIAdminSiteBalanceFiltered(session Session, 
 	if fetchErr != nil {
 		return AdminSiteBalance{}, fetchErr
 	}
-	return AdminSiteBalance{Balance: totalBalance}, nil
+	totals.Balance = totals.CostBalance
+	return totals, nil
 }
 
-// sumFilteredBalances 对一页用户数据按过滤条件计算余额小计。
-func sumFilteredBalances(users []any, filter BalanceFilter) float64 {
-	var sum float64
+// sumFilteredBalances 对一页用户数据按过滤条件计算成本侧/营收侧余额小计。
+func sumFilteredBalances(users []any, filter BalanceFilter) AdminSiteBalance {
+	excludedUsers := stringSet(filter.ExcludeUserIDs)
+	var costSum, revenueSum float64
 	for _, user := range users {
 		if filter.ExcludeAdmin {
 			role := firstString(user, []string{"role"})
 			if role != nil && strings.EqualFold(strings.TrimSpace(*role), "admin") {
 				continue
 			}
+		}
+		userID := strings.TrimSpace(groupID2(asMap(user)))
+		if userID == "" {
+			if id := firstString(user, []string{"id", "user_id", "userId"}); id != nil {
+				userID = strings.TrimSpace(*id)
+			}
+		}
+		if userID != "" && excludedUsers[userID] {
+			continue
 		}
 		balance := firstNumber(user, []string{"balance"})
 		if balance == nil {
@@ -536,9 +660,35 @@ func sumFilteredBalances(users []any, filter BalanceFilter) float64 {
 		if balanceExcluded(*balance, filter.ExcludeBalances) {
 			continue
 		}
-		sum += *balance
+		costSum += *balance
+		gift := 0.0
+		if filter.UserGiftAmounts != nil && userID != "" {
+			gift = filter.UserGiftAmounts[userID]
+		}
+		revenue := *balance - gift
+		if revenue < 0 {
+			revenue = 0
+		}
+		revenueSum += revenue
 	}
-	return sum
+	return AdminSiteBalance{Balance: costSum, CostBalance: costSum, RevenueBalance: revenueSum}
+}
+
+func asMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+func stringSet(values []string) map[string]bool {
+	out := make(map[string]bool, len(values))
+	for _, v := range values {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			out[trimmed] = true
+		}
+	}
+	return out
 }
 
 // FetchSub2APIAdminGroups 获取管理员站点的所有分组列表。
@@ -837,7 +987,7 @@ func (s *PlatformService) fetchSub2APIKeyGroupDailyStats(session Session) ([]Gro
 	if len(keys) == 0 {
 		return nil, newRequestError(ErrorInvalidResponse, PlatformSub2API)
 	}
-	today := time.Now().Format("2006-01-02")
+	today := BusinessToday()
 	totals := map[string]float64{}
 	for _, item := range keys {
 		keyID := firstNumber(item, []string{"id"})
@@ -849,7 +999,7 @@ func (s *PlatformService) fetchSub2APIKeyGroupDailyStats(session Session) ([]Gro
 		// key carries its group object from /keys, so summing every key's actual cost
 		// by group gives a group-level total even when the admin dashboard endpoint is
 		// unavailable for ordinary upstream tokens.
-		statsURL := session.BaseURL + "/api/v1/usage/stats?start_date=" + today + "&end_date=" + today + "&api_key_id=" + strconvInt(int64(*keyID)) + "&timezone=Asia%2FShanghai"
+		statsURL := session.BaseURL + "/api/v1/usage/stats?start_date=" + today + "&end_date=" + today + "&api_key_id=" + strconvInt(int64(*keyID)) + "&timezone=" + url.QueryEscape(BusinessTimezone)
 		statsResponse, err := s.httpClient.requestJSON(statsURL, authOptions)
 		if err != nil {
 			return nil, err
@@ -906,7 +1056,7 @@ func (s *PlatformService) FetchNewAPIGroupDailyStats(session Session, groups []G
 		if name == "" || name == defaultDisplay {
 			continue
 		}
-		statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(todayStart()) + "&end_timestamp=" + strconvInt(todayEnd()) + "&group=" + url.QueryEscape(name)
+		statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(BusinessDayStart()) + "&end_timestamp=" + strconvInt(BusinessDayEnd()) + "&group=" + url.QueryEscape(name)
 		payload, err := s.httpClient.requestJSON(statURL, cookieOptions)
 		if err != nil {
 			return nil, err
@@ -984,7 +1134,7 @@ func (s *PlatformService) fetchSub2APIKeyUsageToday(session Session) ([]KeyUsage
 		return nil, nil
 	}
 
-	today := time.Now().Format("2006-01-02")
+	today := BusinessToday()
 	const maxKeyConcurrency = 4
 	sem := make(chan struct{}, maxKeyConcurrency)
 	var wg sync.WaitGroup
@@ -999,7 +1149,7 @@ func (s *PlatformService) fetchSub2APIKeyUsageToday(session Session) ([]KeyUsage
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			statsURL := session.BaseURL + "/api/v1/usage/stats?start_date=" + today + "&end_date=" + today + "&api_key_id=" + record.id + "&timezone=Asia%2FShanghai"
+			statsURL := session.BaseURL + "/api/v1/usage/stats?start_date=" + today + "&end_date=" + today + "&api_key_id=" + record.id + "&timezone=" + url.QueryEscape(BusinessTimezone)
 			response, err := s.httpClient.requestJSON(statsURL, authOptions)
 			if err != nil {
 				mu.Lock()
@@ -1105,7 +1255,7 @@ func (s *PlatformService) fetchNewAPIKeyUsageToday(session Session, _ []GroupInf
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(todayStart()) + "&end_timestamp=" + strconvInt(todayEnd()) + "&token_name=" + url.QueryEscape(record.name)
+			statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(BusinessDayStart()) + "&end_timestamp=" + strconvInt(BusinessDayEnd()) + "&token_name=" + url.QueryEscape(record.name)
 			if record.groupName != "" {
 				statURL += "&group=" + url.QueryEscape(record.groupName)
 			}
@@ -1215,7 +1365,7 @@ func (s *PlatformService) fetchNewAPIMetrics(session Session, loginData map[stri
 	if err != nil {
 		return Metrics{}, err
 	}
-	statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(todayStart()) + "&end_timestamp=" + strconvInt(todayEnd())
+	statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(BusinessDayStart()) + "&end_timestamp=" + strconvInt(BusinessDayEnd())
 	stat, err := s.httpClient.requestJSON(statURL, cookieOptions)
 	if err != nil {
 		log.Printf("new-api stat request failed base_url=%s err=%v", session.BaseURL, err)
@@ -1258,11 +1408,12 @@ func (s *PlatformService) fetchNewAPIMetrics(session Session, loginData map[stri
 	}
 	qpu := session.QuotaPerUnit
 	return Metrics{
-		Balance:         metric(quotaToUSDWithUnit(quota, qpu)),
-		TodayConsume:    metric(quotaToUSDWithUnit(firstNumber(dataRecord(stat.Payload), []string{"quota", "used_quota", "usedQuota"}), qpu)),
-		HistoryRecharge: metric(quotaToUSDWithUnit(estimatedGranted, qpu)),
-		Group:           group,
-		Groups:          groups,
+		Balance:          metric(quotaToUSDWithUnit(quota, qpu)),
+		TodayConsume:     metric(quotaToUSDWithUnit(firstNumber(dataRecord(stat.Payload), []string{"quota", "used_quota", "usedQuota"}), qpu)),
+		HistoryRecharge:  metric(quotaToUSDWithUnit(estimatedGranted, qpu)),
+		LifetimeConsume: metric(quotaToUSDWithUnit(usedQuota, qpu)),
+		Group:            group,
+		Groups:           groups,
 	}, nil
 }
 
@@ -1284,14 +1435,21 @@ func (s *PlatformService) fetchSub2APIMetrics(session Session) (Metrics, error) 
 		log.Printf("[sub2api-metrics] 分组列表拉取失败 base_url=%s err=%v", session.BaseURL, err)
 		return Metrics{}, err
 	}
+	subscriptions, subErr := s.fetchSub2APISubscriptions(session)
+	if subErr != nil {
+		// 订阅为增强展示，失败不阻断主指标。
+		log.Printf("[sub2api-metrics] 订阅列表拉取失败 base_url=%s err=%v", session.BaseURL, subErr)
+		subscriptions = nil
+	}
 
 	meData := dataRecord(me.Payload)
 	statsData := dataRecord(stats.Payload)
 	balance := firstNumber(meData, []string{"balance"})
 	totalRecharged := firstNumber(meData, []string{"total_recharged"})
+	lifetimeConsume := firstNumber(statsData, []string{"total_actual_cost", "totalActualCost"})
 	if totalRecharged == nil || *totalRecharged == 0 {
-		if totalActualCost := firstNumber(statsData, []string{"total_actual_cost"}); totalActualCost != nil && balance != nil {
-			fallbackTotal := *totalActualCost + *balance
+		if lifetimeConsume != nil && balance != nil {
+			fallbackTotal := *lifetimeConsume + *balance
 			totalRecharged = &fallbackTotal
 		}
 	}
@@ -1301,12 +1459,112 @@ func (s *PlatformService) fetchSub2APIMetrics(session Session) (Metrics, error) 
 		firstGroup = groups[0]
 	}
 	return Metrics{
-		Balance:         metric(balance),
-		TodayConsume:    metric(firstNumber(statsData, []string{"today_actual_cost"})),
-		HistoryRecharge: metric(totalRecharged),
-		Group:           firstGroup,
-		Groups:          groups,
+		Balance:          metric(balance),
+		TodayConsume:     metric(firstNumber(statsData, []string{"today_actual_cost"})),
+		HistoryRecharge:  metric(totalRecharged),
+		LifetimeConsume: metric(lifetimeConsume),
+		Group:            firstGroup,
+		Groups:           groups,
+		Subscriptions:    subscriptions,
 	}, nil
+}
+
+// fetchSub2APISubscriptions 拉取用户订阅资产列表（只读展示，与钱包余额分离）。
+func (s *PlatformService) fetchSub2APISubscriptions(session Session) ([]SubscriptionInfo, error) {
+	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+		return nil, newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	authOptions := sub2APIUserAuthOptions(session)
+	response, err := s.httpClient.requestJSON(session.BaseURL+"/api/v1/subscriptions", authOptions)
+	if err != nil {
+		return nil, err
+	}
+	items := dataArray(response.Payload)
+	if len(items) == 0 {
+		return []SubscriptionInfo{}, nil
+	}
+	out := make([]SubscriptionInfo, 0, len(items))
+	for _, item := range items {
+		record, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		info := SubscriptionInfo{
+			ID:              groupID2(record),
+			Status:          strings.TrimSpace(safeString(record, "status")),
+			DailyUsageUSD:   numberOrZero(firstNumber(record, []string{"daily_usage_usd", "dailyUsageUsd"})),
+			WeeklyUsageUSD:  numberOrZero(firstNumber(record, []string{"weekly_usage_usd", "weeklyUsageUsd"})),
+			MonthlyUsageUSD: numberOrZero(firstNumber(record, []string{"monthly_usage_usd", "monthlyUsageUsd"})),
+		}
+		if v := firstString(record, []string{"starts_at", "startsAt"}); v != nil {
+			info.StartsAt = *v
+		}
+		if v := firstString(record, []string{"expires_at", "expiresAt"}); v != nil {
+			info.ExpiresAt = *v
+		}
+		if gid := firstNumber(record, []string{"group_id", "groupId"}); gid != nil {
+			info.GroupID = strconv.FormatInt(int64(*gid), 10)
+		} else if gs := firstString(record, []string{"group_id", "groupId"}); gs != nil {
+			info.GroupID = *gs
+		}
+		if group, ok := record["group"].(map[string]any); ok {
+			if name := firstString(group, []string{"name"}); name != nil {
+				info.GroupName = *name
+			}
+			if info.GroupID == "" {
+				info.GroupID = groupID2(group)
+			}
+			info.RateMultiplier = firstNumber(group, []string{"rate_multiplier", "rateMultiplier"})
+			info.DailyLimitUSD = firstNumber(group, []string{"daily_limit_usd", "dailyLimitUsd"})
+			info.WeeklyLimitUSD = firstNumber(group, []string{"weekly_limit_usd", "weeklyLimitUsd"})
+			info.MonthlyLimitUSD = firstNumber(group, []string{"monthly_limit_usd", "monthlyLimitUsd"})
+		}
+		info.DailyRemaining = remainingLimit(info.DailyLimitUSD, info.DailyUsageUSD)
+		info.WeeklyRemaining = remainingLimit(info.WeeklyLimitUSD, info.WeeklyUsageUSD)
+		info.MonthlyRemaining = remainingLimit(info.MonthlyLimitUSD, info.MonthlyUsageUSD)
+		// 今日实际还能用多少：受日/周/月剩余共同约束，取最小值。
+		info.TodayMaxConsumableUSD = minPositiveRemaining(
+			info.DailyRemaining, info.WeeklyRemaining, info.MonthlyRemaining,
+		)
+		if info.GroupName == "" {
+			info.GroupName = info.GroupID
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+func numberOrZero(v *float64) float64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func remainingLimit(limit *float64, usage float64) *float64 {
+	if limit == nil || *limit <= 0 {
+		return nil
+	}
+	left := *limit - usage
+	if left < 0 {
+		left = 0
+	}
+	return &left
+}
+
+// minPositiveRemaining 在多个窗口剩余中取最小值；全部未知时返回 nil。
+func minPositiveRemaining(values ...*float64) *float64 {
+	var min *float64
+	for _, v := range values {
+		if v == nil {
+			continue
+		}
+		if min == nil || *v < *min {
+			cur := *v
+			min = &cur
+		}
+	}
+	return min
 }
 
 func cookieHeader(headers http.Header) string {
@@ -1328,17 +1586,9 @@ func newAPIUserID(loginData map[string]any) string {
 	return ""
 }
 
-func todayStart() int64 {
-	now := time.Now()
-	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	return start.Unix()
-}
-
-func todayEnd() int64 {
-	now := time.Now()
-	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, int(time.Second-time.Nanosecond), now.Location())
-	return end.Unix()
-}
+// todayStart/todayEnd 保留旧名给历史调用点，统一转发到业务时区日界。
+func todayStart() int64 { return BusinessDayStart() }
+func todayEnd() int64   { return BusinessDayEnd() }
 
 // ListSub2APIKeys 获取上游 Sub2API 站点的 API Key 列表。
 // 按创建时间倒序返回，最多 100 条。每条包含 ID、Key 值、名称、所属分组等信息。
@@ -1479,29 +1729,9 @@ func (s *PlatformService) FetchAdminUsageStats(session Session, startDate, endDa
 }
 
 // fetchNewAPIAdminUsageStats 调用 new-api /api/log/self/stat 获取指定日期范围内的总消费 quota。
+// 日期按业务时区（Asia/Shanghai）解释，避免容器 UTC 把中国日界错位 8 小时。
 func (s *PlatformService) fetchNewAPIAdminUsageStats(session Session, startDate, endDate string) (float64, error) {
-	if !session.IsAuthenticated() {
-		return 0, newRequestError(ErrorAuth, PlatformNewAPI)
-	}
-	start, err := time.Parse("2006-01-02", startDate)
-	if err != nil {
-		return 0, err
-	}
-	end, err := time.Parse("2006-01-02", endDate)
-	if err != nil {
-		return 0, err
-	}
-	startTS := start.Unix()
-	endTS := time.Date(end.Year(), end.Month(), end.Day(), 23, 59, 59, 0, end.Location()).Unix()
-	statURL := session.BaseURL + "/api/log/self/stat?type=2&start_timestamp=" + strconvInt(startTS) + "&end_timestamp=" + strconvInt(endTS)
-	cookieOptions := newAPIAuthOptions(session)
-	response, err := s.httpClient.requestJSON(statURL, cookieOptions)
-	if err != nil {
-		return 0, err
-	}
-	data := dataRecord(response.Payload)
-	quota := firstNumber(data, []string{"quota"})
-	return quotaToUSDValueWithUnit(quota, session.QuotaPerUnit), nil
+	return s.fetchNewAPISelfUsageActualCost(session, startDate, endDate)
 }
 
 // FetchAdminSiteBalanceFiltered 平台中性的站点用户总余额统计。
@@ -1534,16 +1764,16 @@ func (s *PlatformService) fetchNewAPIAdminSiteBalanceFiltered(session Session, f
 	firstData := dataRecord(firstResponse.Payload)
 	firstItems := newAPIDataItems(firstResponse.Payload)
 	if len(firstItems) == 0 {
-		return AdminSiteBalance{Balance: 0}, nil
+		return AdminSiteBalance{}, nil
 	}
-	totalBalance := sumNewAPIFilteredQuotas(firstItems, filter, session.QuotaPerUnit)
+	totals := sumNewAPIFilteredQuotas(firstItems, filter, session.QuotaPerUnit)
 
 	total := 0
 	if t := firstNumber(firstData, []string{"total", "count"}); t != nil {
 		total = int(*t)
 	}
 	if total <= pageSize {
-		return AdminSiteBalance{Balance: totalBalance}, nil
+		return totals, nil
 	}
 
 	totalPages := (total + pageSize - 1) / pageSize
@@ -1572,9 +1802,11 @@ func (s *PlatformService) fetchNewAPIAdminSiteBalanceFiltered(session Session, f
 			if len(items) == 0 {
 				return
 			}
-			pageBalance := sumNewAPIFilteredQuotas(items, filter, session.QuotaPerUnit)
+			pageTotals := sumNewAPIFilteredQuotas(items, filter, session.QuotaPerUnit)
 			mu.Lock()
-			totalBalance += pageBalance
+			totals.CostBalance += pageTotals.CostBalance
+			totals.RevenueBalance += pageTotals.RevenueBalance
+			totals.Balance = totals.CostBalance
 			mu.Unlock()
 		}(page)
 	}
@@ -1582,7 +1814,8 @@ func (s *PlatformService) fetchNewAPIAdminSiteBalanceFiltered(session Session, f
 	if fetchErr != nil {
 		return AdminSiteBalance{}, fetchErr
 	}
-	return AdminSiteBalance{Balance: totalBalance}, nil
+	totals.Balance = totals.CostBalance
+	return totals, nil
 }
 
 // newAPIDataItems 提取 new-api 分页响应中的 data.items 数组。
@@ -1602,16 +1835,26 @@ func newAPIDataItems(payload any) []any {
 	return items
 }
 
-// sumNewAPIFilteredQuotas 对 new-api 用户列表按过滤条件汇总 quota。
+// sumNewAPIFilteredQuotas 对 new-api 用户列表按过滤条件汇总 quota（双口径）。
 // new-api role >= 10 为 admin/root，排除时使用数字比较而非字符串。
-func sumNewAPIFilteredQuotas(users []any, filter BalanceFilter, quotaPerUnit float64) float64 {
-	var sum float64
+func sumNewAPIFilteredQuotas(users []any, filter BalanceFilter, quotaPerUnit float64) AdminSiteBalance {
+	excludedUsers := stringSet(filter.ExcludeUserIDs)
+	var costSum, revenueSum float64
 	for _, user := range users {
 		if filter.ExcludeAdmin {
 			role := firstNumber(user, []string{"role"})
 			if role != nil && *role >= 10 {
 				continue
 			}
+		}
+		userID := ""
+		if id := firstString(user, []string{"id", "user_id", "userId"}); id != nil {
+			userID = strings.TrimSpace(*id)
+		} else if n := firstNumber(user, []string{"id", "user_id", "userId"}); n != nil {
+			userID = strconv.FormatInt(int64(*n), 10)
+		}
+		if userID != "" && excludedUsers[userID] {
+			continue
 		}
 		quota := firstNumber(user, []string{"quota"})
 		if quota == nil {
@@ -1621,9 +1864,18 @@ func sumNewAPIFilteredQuotas(users []any, filter BalanceFilter, quotaPerUnit flo
 		if balanceExcluded(usdBalance, filter.ExcludeBalances) {
 			continue
 		}
-		sum += usdBalance
+		costSum += usdBalance
+		gift := 0.0
+		if filter.UserGiftAmounts != nil && userID != "" {
+			gift = filter.UserGiftAmounts[userID]
+		}
+		revenue := usdBalance - gift
+		if revenue < 0 {
+			revenue = 0
+		}
+		revenueSum += revenue
 	}
-	return sum
+	return AdminSiteBalance{Balance: costSum, CostBalance: costSum, RevenueBalance: revenueSum}
 }
 
 // FetchAdminGroups 平台中性的分组列表获取（用户可见分组）。
@@ -2329,7 +2581,9 @@ func normalizeSub2APIUserBreakdownQuery(query Sub2APIUserBreakdownQuery) Sub2API
 	query.StartDate = strings.TrimSpace(query.StartDate)
 	query.EndDate = strings.TrimSpace(query.EndDate)
 	query.SortBy = strings.TrimSpace(query.SortBy)
-	if query.SortBy != "total_tokens" {
+	switch query.SortBy {
+	case "total_tokens", "actual_cost", "cost", "requests":
+	default:
 		query.SortBy = "total_tokens"
 	}
 	if query.Limit < 1 {
@@ -2343,6 +2597,83 @@ func normalizeSub2APIUserBreakdownQuery(query Sub2APIUserBreakdownQuery) Sub2API
 		query.Timezone = "Asia/Shanghai"
 	}
 	return query
+}
+
+// FetchSub2APIAdminBatchUsersUsage 批量拉取用户今日/累计实际消费（POST users-usage）。
+// 用于站点用户列表按用量排序，避免 N 次单用户请求。
+func (s *PlatformService) FetchSub2APIAdminBatchUsersUsage(session Session, platformUserIDs []string) (map[string]Sub2APIBatchUserUsage, error) {
+	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+		return nil, newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	ids := make([]int64, 0, len(platformUserIDs))
+	seen := map[int64]struct{}{}
+	for _, raw := range platformUserIDs {
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		ids = append(ids, n)
+	}
+	out := make(map[string]Sub2APIBatchUserUsage, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	// 分批，避免单次 body 过大
+	const chunk = 100
+	for i := 0; i < len(ids); i += chunk {
+		end := i + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+		options := adminAuthOptions(session)
+		options.Method = http.MethodPost
+		options.Body = map[string]any{"user_ids": batch}
+		response, err := s.httpClient.requestJSON(session.BaseURL+"/api/v1/admin/dashboard/users-usage", options)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range parseSub2APIBatchUsersUsage(response.Payload) {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
+
+func parseSub2APIBatchUsersUsage(payload any) map[string]Sub2APIBatchUserUsage {
+	out := make(map[string]Sub2APIBatchUserUsage)
+	data := dataRecord(payload)
+	statsRaw := data["stats"]
+	if statsRaw == nil {
+		statsRaw = payload
+	}
+	statsMap, ok := statsRaw.(map[string]any)
+	if !ok {
+		return out
+	}
+	for key, raw := range statsMap {
+		record := dataRecord(raw)
+		uid := firstStringy(record, sub2APIUserIDKeys)
+		if uid == "" {
+			uid = strings.TrimSpace(key)
+		}
+		if uid == "" {
+			continue
+		}
+		usage := Sub2APIBatchUserUsage{
+			UserID:          uid,
+			TodayActualCost: floatFromRecord(record, []string{"today_actual_cost", "todayActualCost", "today_cost", "todayCost"}),
+			TotalActualCost: floatFromRecord(record, []string{"total_actual_cost", "totalActualCost", "total_cost", "totalCost"}),
+			TodayTokens:     int64FromRecord(record, []string{"today_tokens", "todayTokens", "today_total_tokens"}),
+			TotalTokens:     int64FromRecord(record, []string{"total_tokens", "totalTokens"}),
+		}
+		out[uid] = usage
+	}
+	return out
 }
 
 func parseSub2APIUserBreakdown(payload any, fallback Sub2APIUserBreakdownQuery) Sub2APIUserBreakdown {
@@ -2541,6 +2872,339 @@ func (s *PlatformService) FetchSub2APIAdminUser(session Session, userID string) 
 	return parseSub2APIAdminUser(dataRecord(response.Payload)), nil
 }
 
+// FetchSiteBalanceHistory 按站点平台自动切换接口，拉取「本账号」入账流水（尽量全量）。
+//
+// sub2api：
+//   - GET /api/v1/payment/orders/my（分页拉全）
+//   - GET /api/v1/redeem/history（服务端默认上限约 25；尽量请求大 limit）
+//
+// new-api：
+//   - GET /api/user/topup/self（分页拉全，与用户 Web 充值记录一致）
+//
+// page/pageSize 参数保留兼容，但实现会拉全量后返回全部 Items（展示分页由 ListRechargeCandidates 做）。
+// /auth/me 的 total_recharged 仅为累计数值，不附带明细。
+func (s *PlatformService) FetchSiteBalanceHistory(session Session, page int, pageSize int) (Sub2APIUserBalanceHistory, error) {
+	if !session.IsAuthenticated() {
+		return Sub2APIUserBalanceHistory{}, newRequestError(ErrorAuth, session.Platform)
+	}
+	_ = page
+	_ = pageSize
+	switch session.Platform {
+	case PlatformSub2API:
+		return s.fetchSub2APISelfBalanceHistoryAll(session)
+	case PlatformNewAPI:
+		return s.fetchNewAPISelfTopupHistoryAll(session)
+	default:
+		return Sub2APIUserBalanceHistory{Platform: session.Platform}, nil
+	}
+}
+
+const (
+	sub2APIPaymentPageSize = 100
+	sub2APIMaxPaymentPages = 200 // 安全上限：最多 2 万条支付单
+	newAPITopupPageSize    = 100
+	newAPIMaxTopupPages    = 200
+)
+
+func (s *PlatformService) fetchSub2APISelfBalanceHistoryAll(session Session) (Sub2APIUserBalanceHistory, error) {
+	authOptions := requestOptions{AccessToken: session.AccessToken, TokenType: session.TokenType}
+	history := Sub2APIUserBalanceHistory{
+		Items:    []Sub2APIBalanceHistoryItem{},
+		Platform: PlatformSub2API,
+	}
+	var anyOK bool
+	var lastErr error
+
+	// 1) 支付订单：按页拉全
+	for page := 1; page <= sub2APIMaxPaymentPages; page++ {
+		ordersURL := session.BaseURL + "/api/v1/payment/orders/my?page=" + strconvInt(int64(page)) +
+			"&page_size=" + strconvInt(int64(sub2APIPaymentPageSize))
+		ordersResp, err := s.httpClient.requestJSON(ordersURL, authOptions)
+		if err != nil {
+			lastErr = err
+			if page == 1 {
+				log.Printf("[sub2api-history] payment/orders/my failed base_url=%s err=%v", session.BaseURL, err)
+			}
+			break
+		}
+		anyOK = true
+		rawItems := dataArray(ordersResp.Payload)
+		for _, raw := range rawItems {
+			if item, ok := parseSub2APIPaymentOrderItem(raw); ok {
+				history.Items = append(history.Items, item)
+			}
+		}
+		total, hasTotal := paginationTotal(ordersResp.Payload)
+		if hasTotal && page*sub2APIPaymentPageSize >= total {
+			break
+		}
+		if len(rawItems) < sub2APIPaymentPageSize {
+			break
+		}
+	}
+
+	// 2) 兑换历史：上游 handler 常硬编码 limit=25，仍传大 limit 以兼容开放实现
+	redeemURL := session.BaseURL + "/api/v1/redeem/history?limit=1000"
+	if redeemResp, err := s.httpClient.requestJSON(redeemURL, authOptions); err != nil {
+		// 无 query 再试一次
+		if redeemResp2, err2 := s.httpClient.requestJSON(session.BaseURL+"/api/v1/redeem/history", authOptions); err2 != nil {
+			lastErr = err2
+			log.Printf("[sub2api-history] redeem/history failed base_url=%s err=%v", session.BaseURL, err2)
+		} else {
+			anyOK = true
+			for _, raw := range dataArray(redeemResp2.Payload) {
+				if item, ok := parseSub2APIRedeemHistoryItem(raw); ok {
+					history.Items = append(history.Items, item)
+				}
+			}
+		}
+	} else {
+		anyOK = true
+		for _, raw := range dataArray(redeemResp.Payload) {
+			if item, ok := parseSub2APIRedeemHistoryItem(raw); ok {
+				history.Items = append(history.Items, item)
+			}
+		}
+	}
+
+	if !anyOK {
+		if lastErr != nil {
+			return Sub2APIUserBalanceHistory{}, lastErr
+		}
+		return history, nil
+	}
+
+	sortBalanceHistoryDesc(history.Items)
+	history.Total = len(history.Items)
+	return history, nil
+}
+
+// fetchNewAPISelfTopupHistoryAll 分页拉取 GET /api/user/topup/self 全量成功充值单。
+func (s *PlatformService) fetchNewAPISelfTopupHistoryAll(session Session) (Sub2APIUserBalanceHistory, error) {
+	authOptions := newAPIAuthOptions(session)
+	history := Sub2APIUserBalanceHistory{
+		Items:    []Sub2APIBalanceHistoryItem{},
+		Platform: PlatformNewAPI,
+	}
+	qpu := session.QuotaPerUnit
+	if qpu <= 0 {
+		qpu = defaultQuotaPerUnit
+	}
+
+	for page := 1; page <= newAPIMaxTopupPages; page++ {
+		url := session.BaseURL + "/api/user/topup/self?p=" + strconvInt(int64(page)) +
+			"&page_size=" + strconvInt(int64(newAPITopupPageSize))
+		resp, err := s.httpClient.requestJSON(url, authOptions)
+		if err != nil {
+			if page == 1 {
+				// 兼容部分 fork 路径
+				alt := session.BaseURL + "/api/user/topup?p=" + strconvInt(int64(page)) +
+					"&page_size=" + strconvInt(int64(newAPITopupPageSize))
+				resp2, err2 := s.httpClient.requestJSON(alt, authOptions)
+				if err2 != nil {
+					log.Printf("[newapi-history] topup/self failed base_url=%s err=%v", session.BaseURL, err)
+					return Sub2APIUserBalanceHistory{}, err
+				}
+				resp = resp2
+			} else {
+				break
+			}
+		}
+		rawItems := dataArray(resp.Payload)
+		for _, raw := range rawItems {
+			if item, ok := parseNewAPITopupItem(raw, qpu); ok {
+				history.Items = append(history.Items, item)
+			}
+		}
+		total, hasTotal := paginationTotal(resp.Payload)
+		if hasTotal && page*newAPITopupPageSize >= total {
+			break
+		}
+		if len(rawItems) < newAPITopupPageSize {
+			break
+		}
+	}
+
+	sortBalanceHistoryDesc(history.Items)
+	history.Total = len(history.Items)
+	return history, nil
+}
+
+func sortBalanceHistoryDesc(items []Sub2APIBalanceHistoryItem) {
+	sort.SliceStable(items, func(i, j int) bool {
+		ai, aj := items[i].CreatedAt, items[j].CreatedAt
+		if ai == nil && aj == nil {
+			return false
+		}
+		if ai == nil {
+			return false
+		}
+		if aj == nil {
+			return true
+		}
+		return ai.After(*aj)
+	})
+}
+
+// parseNewAPITopupItem 解析 new-api 充值订单；仅 success 计入。
+// money 为实付金额（优先）；否则用 amount(quota)/quotaPerUnit 估 USD。
+func parseNewAPITopupItem(value any, quotaPerUnit float64) (Sub2APIBalanceHistoryItem, bool) {
+	if _, ok := value.(map[string]any); !ok {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	status := strings.ToLower(strings.TrimSpace(firstStringy(value, []string{"status"})))
+	if status != "" && status != "success" && status != "completed" && status != "complete" {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	var amount *float64
+	if money := firstNumber(value, []string{"money", "pay_amount", "payAmount"}); money != nil && *money > 0 {
+		amount = money
+	} else if quota := firstNumber(value, []string{"amount", "quota"}); quota != nil && *quota > 0 {
+		amount = quotaToUSDWithUnit(quota, quotaPerUnit)
+	}
+	if amount == nil || *amount <= 0 || !isFinite(*amount) {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	id := ""
+	if n := firstNumber(value, []string{"id"}); n != nil {
+		id = strconv.FormatInt(int64(*n), 10)
+	}
+	if id == "" {
+		id = firstStringy(value, []string{"trade_no", "tradeNo"})
+	}
+	if id == "" {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	method := firstStringy(value, []string{"payment_method", "paymentMethod", "payment_provider", "paymentProvider"})
+	tradeNo := firstStringy(value, []string{"trade_no", "tradeNo"})
+	noteParts := make([]string, 0, 2)
+	if method != "" {
+		noteParts = append(noteParts, method)
+	}
+	if tradeNo != "" {
+		noteParts = append(noteParts, tradeNo)
+	}
+	// create_time / complete_time 多为 unix 秒
+	created := parseFlexibleTime(firstAny(value, []string{"complete_time", "completeTime", "create_time", "createTime", "created_at", "createdAt"}))
+	return Sub2APIBalanceHistoryItem{
+		ID:        "topup:" + id,
+		Type:      "balance", // new-api 在线充值 → 自动标充值
+		Amount:    amount,
+		Note:      strings.Join(noteParts, " · "),
+		CreatedAt: created,
+	}, true
+}
+
+// paidOrderStatuses 与 sub2api 支付履约一致：已支付/充值中/已完成 才算入账成功。
+var paidOrderStatuses = map[string]struct{}{
+	"paid":       {},
+	"recharging": {},
+	"completed":  {},
+}
+
+func parseSub2APIPaymentOrderItem(value any) (Sub2APIBalanceHistoryItem, bool) {
+	if _, ok := value.(map[string]any); !ok {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	status := strings.ToLower(strings.TrimSpace(firstStringy(value, []string{"status"})))
+	if _, paid := paidOrderStatuses[status]; !paid {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	// 入账额度优先 amount（到账），否则 pay_amount（实付）
+	amount := firstNumber(value, []string{"amount", "pay_amount", "payAmount"})
+	if amount == nil || *amount <= 0 || !isFinite(*amount) {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	// id 常为数字；firstStringy 会优先命中字符串字段 out_trade_no，故先单独取数字 id
+	id := ""
+	if n := firstNumber(value, []string{"id"}); n != nil {
+		id = strconv.FormatInt(int64(*n), 10)
+	}
+	if id == "" {
+		id = firstStringy(value, []string{"out_trade_no", "outTradeNo"})
+	}
+	if id == "" {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	orderType := firstStringy(value, []string{"order_type", "orderType"})
+	paymentType := firstStringy(value, []string{"payment_type", "paymentType"})
+	outTradeNo := firstStringy(value, []string{"out_trade_no", "outTradeNo"})
+	noteParts := make([]string, 0, 3)
+	if orderType != "" {
+		noteParts = append(noteParts, orderType)
+	}
+	if paymentType != "" {
+		noteParts = append(noteParts, paymentType)
+	}
+	if outTradeNo != "" {
+		noteParts = append(noteParts, outTradeNo)
+	}
+	// Type 用 order_type（balance / subscription），便于自动打标；无则 payment
+	itemType := strings.ToLower(strings.TrimSpace(orderType))
+	if itemType == "" {
+		itemType = "payment"
+	}
+	created := parseFlexibleTime(firstAny(value, []string{"paid_at", "paidAt", "completed_at", "completedAt", "created_at", "createdAt"}))
+	return Sub2APIBalanceHistoryItem{
+		ID:        "pay:" + id,
+		Type:      itemType,
+		Amount:    amount,
+		Note:      strings.Join(noteParts, " · "),
+		CreatedAt: created,
+	}, true
+}
+
+func parseSub2APIRedeemHistoryItem(value any) (Sub2APIBalanceHistoryItem, bool) {
+	if _, ok := value.(map[string]any); !ok {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	codeType := strings.ToLower(strings.TrimSpace(firstStringy(value, []string{"type", "code_type", "codeType"})))
+	// 只保留会增加余额/订阅额度的类型；concurrency 等跳过
+	switch codeType {
+	case "balance", "admin_balance", "affiliate_balance", "subscription", "":
+		// ok
+	default:
+		// 未知类型若 value>0 仍展示，由用户标记
+		if codeType == "concurrency" || codeType == "admin_concurrency" {
+			return Sub2APIBalanceHistoryItem{}, false
+		}
+	}
+	amount := firstNumber(value, []string{"value", "amount", "balance"})
+	if amount == nil || *amount <= 0 || !isFinite(*amount) {
+		return Sub2APIBalanceHistoryItem{}, false
+	}
+	id := firstStringy(value, []string{"id"})
+	if id == "" {
+		code := firstStringy(value, []string{"code"})
+		if code == "" {
+			return Sub2APIBalanceHistoryItem{}, false
+		}
+		id = code
+	}
+	note := ""
+	if n := firstString(value, []string{"notes", "note", "remark"}); n != nil {
+		note = *n
+	}
+	if note == "" {
+		if code := firstStringy(value, []string{"code"}); code != "" {
+			note = "redeem:" + code
+		}
+	}
+	if codeType != "" && note != "" {
+		note = codeType + " · " + note
+	} else if codeType != "" {
+		note = codeType
+	}
+	created := parseFlexibleTime(firstAny(value, []string{"used_at", "usedAt", "created_at", "createdAt"}))
+	return Sub2APIBalanceHistoryItem{
+		ID:        "redeem:" + id,
+		Type:      codeType,
+		Amount:    amount,
+		Note:      note,
+		CreatedAt: created,
+	}, true
+}
+
 // FetchSub2APIAdminUserBalanceHistory 通过 GET /api/v1/admin/users/:id/balance-history 查询
 // 指定 Sub2API 用户的余额/充值历史。page/pageSize 非法时分别回退到 1/20；codeType 为空时不带
 // type 查询参数。
@@ -2593,6 +3257,10 @@ func parseSub2APIAdminUser(value any) Sub2APIAdminUser {
 		user.Role = *role
 	}
 	user.Status = firstStringy(value, []string{"status"})
+	// 后台用户备注：Sub2API 常见 notes；兼容 remark / memo 等别名。
+	if notes := firstString(value, []string{"notes", "note", "remark", "remarks", "memo", "description"}); notes != nil {
+		user.Notes = strings.TrimSpace(*notes)
+	}
 	user.Balance = firstNumber(value, []string{"balance"})
 	user.FrozenBalance = firstNumber(value, []string{"frozen_balance", "frozenBalance"})
 	if concurrency := firstNumber(value, []string{"concurrency"}); concurrency != nil {

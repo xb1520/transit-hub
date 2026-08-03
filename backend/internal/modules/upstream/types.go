@@ -108,8 +108,34 @@ type Metrics struct {
 	Balance         MetricValue `json:"balance"`
 	TodayConsume    MetricValue `json:"todayConsume"`
 	HistoryRecharge MetricValue `json:"historyRecharge"`
-	Group           GroupInfo   `json:"group"`
-	Groups          []GroupInfo `json:"groups"`
+	// LifetimeConsume 是平台累计实际消耗（上游原始单位，未乘 rechargeRate）。
+	// 预授信「累计消耗(成本)」= LifetimeConsume × rechargeRate。
+	LifetimeConsume MetricValue      `json:"lifetimeConsume"`
+	Group            GroupInfo        `json:"group"`
+	Groups           []GroupInfo      `json:"groups"`
+	Subscriptions    []SubscriptionInfo `json:"subscriptions,omitempty"`
+}
+
+// SubscriptionInfo 是上游订阅资产（与钱包余额分开展示）。
+type SubscriptionInfo struct {
+	ID               string   `json:"id"`
+	GroupID          string   `json:"groupId"`
+	GroupName        string   `json:"groupName"`
+	Status           string   `json:"status"`
+	StartsAt         string   `json:"startsAt,omitempty"`
+	ExpiresAt        string   `json:"expiresAt,omitempty"`
+	RateMultiplier   *float64 `json:"rateMultiplier,omitempty"`
+	DailyLimitUSD    *float64 `json:"dailyLimitUsd,omitempty"`
+	WeeklyLimitUSD   *float64 `json:"weeklyLimitUsd,omitempty"`
+	MonthlyLimitUSD  *float64 `json:"monthlyLimitUsd,omitempty"`
+	DailyUsageUSD    float64  `json:"dailyUsageUsd"`
+	WeeklyUsageUSD   float64  `json:"weeklyUsageUsd"`
+	MonthlyUsageUSD  float64  `json:"monthlyUsageUsd"`
+	DailyRemaining   *float64 `json:"dailyRemainingUsd,omitempty"`
+	WeeklyRemaining  *float64 `json:"weeklyRemainingUsd,omitempty"`
+	MonthlyRemaining *float64 `json:"monthlyRemainingUsd,omitempty"`
+	// TodayMaxConsumableUSD 今日在日/周/月限额约束下最多还能消耗的额度（取剩余的最小值）。
+	TodayMaxConsumableUSD *float64 `json:"todayMaxConsumableUsd,omitempty"`
 }
 
 type CreateRequest struct {
@@ -142,9 +168,43 @@ type UpdateRequest struct {
 	RechargeRate float64  `json:"rechargeRate"`
 }
 
-// SiteSettings 站点级预警覆盖配置。nil 表示使用全局默认值。
+// 上游结算/备付模式。
+const (
+	SettlementModePrepaidWallet = "prepaid_wallet" // 真预存，余额可计入预存备付
+	SettlementModeCreditLine    = "credit_line"    // 预授信，先用后结；账面余额仅参考
+)
+
+// SiteSettings 站点级配置：预警覆盖 + 结算模式（预存/预授信）等。
+// 指针/空字符串表示使用默认值。
 type SiteSettings struct {
 	BalanceThreshold *float64 `json:"balanceThreshold"`
+	// SettlementMode: prepaid_wallet（默认）| credit_line
+	SettlementMode string `json:"settlementMode,omitempty"`
+	// CreditLimit 预授信额度，默认按成本口径（已含充值倍率后的单位）。
+	CreditLimit *float64 `json:"creditLimit,omitempty"`
+	// SettlementCurrency 结算展示币种，默认 CNY。
+	SettlementCurrency string `json:"settlementCurrency,omitempty"`
+}
+
+// NormalizeSettlementMode 返回规范化后的结算模式。
+func NormalizeSettlementMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case SettlementModeCreditLine:
+		return SettlementModeCreditLine
+	default:
+		return SettlementModePrepaidWallet
+	}
+}
+
+// IsCreditLine 是否为预授信结算模式。
+func (s SiteSettings) IsCreditLine() bool {
+	return NormalizeSettlementMode(s.SettlementMode) == SettlementModeCreditLine
+}
+
+// CountsAsPrepaidReserve 是否计入「上游预存备付」（覆盖率分子）。
+// 预授信站点的平台账面不进入预存合计。
+func (s SiteSettings) CountsAsPrepaidReserve() bool {
+	return !s.IsCreditLine()
 }
 
 type Site struct {
@@ -182,6 +242,8 @@ type Response struct {
 	Metrics           Metrics      `json:"metrics"`
 	Settings          SiteSettings `json:"settings"`
 	LastSyncedAt      *int64       `json:"lastSyncedAt"`
+	// Settlement 预授信/结算汇总；列表接口在有 settlementRepo 时填充。
+	Settlement *SettlementSummary `json:"settlement,omitempty"`
 }
 
 type Session struct {
@@ -241,15 +303,58 @@ type GroupDailyStat struct {
 	TodayActualCost float64 `json:"todayActualCost"`
 }
 
-type AdminSiteBalance struct {
-	Balance float64 `json:"balance"`
-}
-
 // BalanceFilter 控制统计站点用户余额时的过滤条件。
 // 由仪表盘模块创建，传递给 PlatformService 在分页遍历用户时应用。
+//
+// 双口径：
+//   - CostBalance：成本/兑付压力（含赠送与返利剩余，覆盖率用这个）
+//   - RevenueBalance：营收相关负债（扣掉赠送额度等不计营收部分）
 type BalanceFilter struct {
 	ExcludeAdmin    bool      // 是否排除 admin 角色用户
 	ExcludeBalances []float64 // 需要排除的精确余额值（如 0、0.1、1 等）
+	ExcludeUserIDs  []string  // 整户排除（测试号等）：成本与营收都不计
+	// UserGiftAmounts: 用户 ID → 赠送不计营收额度。只从营收侧扣除，成本侧保留。
+	UserGiftAmounts map[string]float64
+}
+
+// AdminSiteBalance 站点用户余额汇总（双口径）。
+// Balance 与 CostBalance 相同，保留 Balance 字段兼容旧调用方。
+type AdminSiteBalance struct {
+	Balance        float64 `json:"balance"`        // = CostBalance，兼容旧字段
+	CostBalance    float64 `json:"costBalance"`    // 成本/兑付侧
+	RevenueBalance float64 `json:"revenueBalance"` // 营收侧
+}
+
+// SettlementRecord 上游站点手动结算流水。
+type SettlementRecord struct {
+	ID             string    `json:"id"`
+	UserID         string    `json:"-"`
+	AdminAccountID string    `json:"-"`
+	SiteID         string    `json:"siteId"`
+	Amount         float64   `json:"amount"` // 成本口径实付/记账金额
+	Note           string    `json:"note"`
+	SettledAt      time.Time `json:"settledAt"`
+	Status         string    `json:"status"` // active | voided
+	OperatorUserID string    `json:"operatorUserId"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+const (
+	SettlementStatusActive = "active"
+	SettlementStatusVoided = "voided"
+)
+
+// SettlementSummary 站点结算汇总（预授信）。
+type SettlementSummary struct {
+	Mode               string   `json:"mode"`
+	CreditLimit        *float64 `json:"creditLimit,omitempty"`
+	SettlementCurrency string   `json:"settlementCurrency,omitempty"`
+	ConsumedCost       float64  `json:"consumedCost"`
+	SettledCost        float64  `json:"settledCost"`
+	Outstanding        float64  `json:"outstanding"`
+	CreditRemaining    *float64 `json:"creditRemaining,omitempty"`
+	PlatformBalance    *float64 `json:"platformBalance,omitempty"` // 仅参考
 }
 
 // Sub2APIAdminUser 是 GET /api/v1/admin/users/:id 返回的用户详情中，工单模块"Sub2API 用户
@@ -261,6 +366,8 @@ type Sub2APIAdminUser struct {
 	Username      string
 	Role          string
 	Status        string
+	// Notes 是 Sub2API 后台用户备注（notes / remark 等字段）。
+	Notes         string
 	Balance       *float64
 	FrozenBalance *float64
 	Concurrency   *int
@@ -326,7 +433,27 @@ type Sub2APIUserBreakdown struct {
 	EndDate   string
 }
 
-// Sub2APIBalanceHistoryItem 是 Sub2API 用户余额/充值历史中的单条记录。
+// Sub2APIUserGroupUsage 是某用户在日期区间内按分组汇总的用量（admin dashboard/groups + user_id）。
+type Sub2APIUserGroupUsage struct {
+	GroupID      string
+	GroupName    string
+	ActualCost   float64
+	Cost         float64
+	Requests     int
+	TotalTokens  int64
+}
+
+// Sub2APIBatchUserUsage 来自 POST /api/v1/admin/dashboard/users-usage 的单用户汇总。
+// 上游主字段为今日/累计实际消费；部分版本可能附带 token 字段，解析时尽量兼容。
+type Sub2APIBatchUserUsage struct {
+	UserID          string
+	TodayActualCost float64
+	TotalActualCost float64
+	TodayTokens     int64
+	TotalTokens     int64
+}
+
+// Sub2APIBalanceHistoryItem 是上游用户侧入账流水的统一结构（sub2api / new-api 共用）。
 type Sub2APIBalanceHistoryItem struct {
 	ID        string
 	Type      string
@@ -335,11 +462,14 @@ type Sub2APIBalanceHistoryItem struct {
 	CreatedAt *time.Time
 }
 
-// Sub2APIUserBalanceHistory 是 GET /api/v1/admin/users/:id/balance-history 的解析结果。
+// Sub2APIUserBalanceHistory 是上游入账流水拉取结果（命名保留 Sub2API 前缀以兼容既有调用）。
+// Items 为全量（后端分页拉齐后合并）；Total 为条数。
+// 注意：sub2api /auth/me 的 total_recharged 只是用户表上的累计数值，不含明细。
 type Sub2APIUserBalanceHistory struct {
 	Items          []Sub2APIBalanceHistoryItem
 	Total          int
 	TotalRecharged *float64
+	Platform       Platform // 实际拉取所用平台
 }
 
 // KeyUsageTodayStat 是平台层返回的单个 key 今日消费统计（上游平台原始金额，未乘以站点 rechargeRate）。
@@ -389,12 +519,14 @@ func (e *KeyUsageCollectionError) Unwrap() error {
 // BalanceBreakdownItem 是仪表盘「上游总余额」下钻明细中单个站点的余额展示数据。
 // Balance/RawBalance 为 nil 表示该站点余额未知（未配置 rechargeRate 或尚未同步成功）。
 type BalanceBreakdownItem struct {
-	SiteID       string
-	SiteName     string
-	Platform     Platform
-	Balance      *float64
-	RawBalance   *float64
-	RechargeRate float64
-	LastSyncedAt *int64
-	Status       Status
+	SiteID         string
+	SiteName       string
+	Platform       Platform
+	Balance        *float64
+	RawBalance     *float64
+	RechargeRate   float64
+	LastSyncedAt   *int64
+	Status         Status
+	SettlementMode string
+	ReserveKind    string // prepaid | credit_reference | excluded
 }

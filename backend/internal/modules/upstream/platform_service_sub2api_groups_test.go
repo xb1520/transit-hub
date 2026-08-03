@@ -203,6 +203,8 @@ func TestFetchSub2APIMetrics_UsesOverriddenMultiplier(t *testing.T) {
 			availableGroupsFixture(w)
 		case "/api/v1/groups/rates":
 			writeJSON(w, map[string]any{"data": map[string]any{"1": 0.8}})
+		case "/api/v1/subscriptions":
+			writeJSON(w, map[string]any{"data": []any{}})
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}

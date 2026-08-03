@@ -3,14 +3,38 @@ package dashboard
 import "time"
 
 // MetricsResponse 是 GET /api/dashboard/metrics 返回的实时指标数据。
-// 所有金额均以 CNY 计价，上游指标已乘以站点的 rechargeRate。
+// 所有金额均以成本口径计价，上游指标已乘以站点的 rechargeRate。
 type MetricsResponse struct {
 	TodayProfit     float64 `json:"todayProfit"`     // 今日盈利额度：管理员站点今日总实际消费
-	SiteBalance     float64 `json:"siteBalance"`     // 站点用户总余额：所有非 admin 用户余额之和
-	TodayPurchase   float64 `json:"todayPurchase"`   // 今日进货额度：所有上游站点今日消费（CNY）之和
-	NetProfit       float64 `json:"netProfit"`       // 今日净利润：todayProfit - todayPurchase
-	UpstreamBalance float64 `json:"upstreamBalance"` // 上游总余额：所有上游站点余额（CNY）之和
-	GroupCount      int     `json:"groupCount"`      // 管理员站点分组总数，省去前端单独请求
+	SiteBalance     float64 `json:"siteBalance"`     // 站点用户成本侧需兑付余额（含赠送/返利剩余）
+	TodayPurchase   float64 `json:"todayPurchase"`   // 兼容字段 = TodayCost（历史趋势列 today_purchase）
+	TodayCost       float64 `json:"todayCost"`       // 今日成本：上游今日消耗 × 倍率之和
+	TodayInbound    float64 `json:"todayInbound"`    // 今日进货：账本 confirmed topup_* 之和
+	NetProfit       float64 `json:"netProfit"`       // 今日净利润：todayProfit - todayCost
+	UpstreamBalance float64 `json:"upstreamBalance"` // 上游预存备付（不含预授信账面）
+	GroupCount      int     `json:"groupCount"`      // 管理员站点分组总数
+
+	// MVP 扩展字段：双口径与覆盖率
+	SiteRevenueBalance       float64  `json:"siteRevenueBalance"`       // 营收侧用户余额（扣赠送等，成本/CNY）
+	UpstreamPrepaidBalance   float64  `json:"upstreamPrepaidBalance"`   // = UpstreamBalance
+	UpstreamCreditReference  float64  `json:"upstreamCreditReference"`  // 预授信站平台账面参考合计（不进覆盖率）
+	CoverageApplicable       bool     `json:"coverageApplicable"`       // 站点成本侧余额>0 时才有参考意义
+	CoverageRatio            *float64 `json:"coverageRatio,omitempty"`  // prepaid / siteCost * 100
+	// SiteRechargeRate 工作区站点充值倍率（平台用户余额 → 成本/CNY）。
+	SiteRechargeRate float64 `json:"siteRechargeRate"`
+	// SiteBalancePlatform / SiteRevenueBalancePlatform 为倍率换算前的平台单位，便于前端双币展示。
+	SiteBalancePlatform        float64 `json:"siteBalancePlatform"`
+	SiteRevenueBalancePlatform float64 `json:"siteRevenueBalancePlatform"`
+
+	// 全站用户流水标记合计（已 × 站点充值倍率 → CNY；Platform 为原始 USD）。
+	// SiteGiftTotal / SiteRebateTotal：累计赠送 / 累计返利（标记金额，不是当前剩余拆分）
+	// SiteRechargeTotal：累计充值（不含赠送+返利）
+	SiteGiftTotal              float64 `json:"siteGiftTotal"`
+	SiteRebateTotal            float64 `json:"siteRebateTotal"`
+	SiteRechargeTotal          float64 `json:"siteRechargeTotal"`
+	SiteGiftTotalPlatform      float64 `json:"siteGiftTotalPlatform"`
+	SiteRebateTotalPlatform    float64 `json:"siteRebateTotalPlatform"`
+	SiteRechargeTotalPlatform  float64 `json:"siteRechargeTotalPlatform"`
 }
 
 // TrendResponse 是 GET /api/dashboard/trends 返回的历史趋势数据。
@@ -23,7 +47,9 @@ type TrendPoint struct {
 	Date            string  `json:"date"` // 日期，格式 "2006-01-02"
 	TodayProfit     float64 `json:"todayProfit"`
 	SiteBalance     float64 `json:"siteBalance"`
-	TodayPurchase   float64 `json:"todayPurchase"`
+	TodayPurchase   float64 `json:"todayPurchase"` // = TodayCost，兼容旧前端
+	TodayCost       float64 `json:"todayCost"`
+	TodayInbound    float64 `json:"todayInbound"`
 	NetProfit       float64 `json:"netProfit"`
 	UpstreamBalance float64 `json:"upstreamBalance"`
 }
@@ -38,7 +64,8 @@ type DailySnapshot struct {
 	Date            time.Time
 	TodayProfit     float64
 	SiteBalance     float64
-	TodayPurchase   float64
+	TodayPurchase   float64 // 存库列 today_purchase，语义=今日成本
+	TodayInbound    float64 // 存库列 today_inbound，语义=今日进货
 	NetProfit       float64
 	UpstreamBalance float64
 	CreatedAt       time.Time
@@ -95,6 +122,24 @@ type UpstreamKeyUsageTodayItem struct {
 	RechargeRate float64 `json:"rechargeRate"`
 }
 
+// TodayInboundBreakdownResponse 是 GET /api/dashboard/today-inbound-breakdown 返回的
+// 「今日进货」下钻：按上游站点汇总已确认充值进货（成本口径）。
+type TodayInboundBreakdownResponse struct {
+	Date  string                      `json:"date"`
+	Total float64                     `json:"total"`
+	Sites []TodayInboundBreakdownItem `json:"sites"`
+}
+
+// TodayInboundBreakdownItem 单个上游站点的今日进货汇总。
+type TodayInboundBreakdownItem struct {
+	SiteID       string  `json:"siteId"`
+	SiteName     string  `json:"siteName"`
+	Platform     string  `json:"platform"`
+	AmountCost   float64 `json:"amountCost"`
+	EntryCount   int     `json:"entryCount"`
+	RechargeRate float64 `json:"rechargeRate"`
+}
+
 // UpstreamBalanceBreakdownResponse 是 GET /api/dashboard/upstream-balance-breakdown 返回的
 // 「上游总余额」下钻明细：当前工作区所有上游站点的缓存余额列表。
 type UpstreamBalanceBreakdownResponse struct {
@@ -105,21 +150,32 @@ type UpstreamBalanceBreakdownResponse struct {
 // UpstreamBalanceBreakdownItem 是单个上游站点的余额明细。
 // Balance/RawBalance 为 null 表示该站点余额尚未同步或未配置 rechargeRate。
 type UpstreamBalanceBreakdownItem struct {
-	SiteID       string   `json:"siteId"`
-	SiteName     string   `json:"siteName"`
-	Platform     string   `json:"platform"`
-	Balance      *float64 `json:"balance"`
-	RawBalance   *float64 `json:"rawBalance"`
-	RechargeRate float64  `json:"rechargeRate"`
-	LastSyncedAt *int64   `json:"lastSyncedAt"`
-	Status       string   `json:"status"`
+	SiteID         string   `json:"siteId"`
+	SiteName       string   `json:"siteName"`
+	Platform       string   `json:"platform"`
+	Balance        *float64 `json:"balance"`
+	RawBalance     *float64 `json:"rawBalance"`
+	RechargeRate   float64  `json:"rechargeRate"`
+	LastSyncedAt   *int64   `json:"lastSyncedAt"`
+	Status         string   `json:"status"`
+	SettlementMode string   `json:"settlementMode,omitempty"`
+	// ReserveKind: prepaid | credit_reference | excluded
+	ReserveKind string `json:"reserveKind,omitempty"`
 }
 
 // BalanceFilterConfig 是用户自定义的站点用户余额筛选条件，持久化在 dashboard_balance_filter 表中。
 // 每个 (user_id, admin_account_id) 最多一行配置，控制 LiveMetrics 计算 siteBalance 时的过滤行为。
+//
+// 双口径：
+//   - 成本侧（siteBalance）：含赠送剩余，用于覆盖率；金额 = 平台余额 × SiteRechargeRate
+//   - 营收侧（siteRevenueBalance）：扣掉 gift/rebate 标记与 userGiftAmounts
 type BalanceFilterConfig struct {
-	UserID          string    `json:"-"`
-	AdminAccountID  string    `json:"-"`
-	ExcludeAdmin    bool      `json:"excludeAdmin"`    // 是否排除 admin 角色用户（默认 true）
-	ExcludeBalances []float64 `json:"excludeBalances"` // 需要排除的精确余额值列表
+	UserID          string             `json:"-"`
+	AdminAccountID  string             `json:"-"`
+	ExcludeAdmin    bool               `json:"excludeAdmin"`    // 是否排除 admin 角色用户（默认 true）
+	ExcludeBalances []float64          `json:"excludeBalances"` // 需要排除的精确余额值列表
+	ExcludeUserIDs  []string           `json:"excludeUserIds"`  // 整户排除（成本与营收都不计）
+	UserGiftAmounts map[string]float64 `json:"userGiftAmounts"` // 用户ID → 赠送不计营收额度
+	// SiteRechargeRate 工作区站点充值倍率：平台余额单位 → 成本/CNY 口径（默认 1）。
+	SiteRechargeRate float64 `json:"siteRechargeRate"`
 }

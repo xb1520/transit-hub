@@ -25,6 +25,15 @@ type UpstreamLister interface {
 	// 由 upstream.Service 实现（持有 session/cache，能校验站点归属和当前工作区）。
 	KeyUsageToday(ctx context.Context, userID string) ([]upstream.KeyUsageTodayItem, error)
 	BalanceBreakdown(ctx context.Context, userID string) ([]upstream.BalanceBreakdownItem, error)
+	// PurchaseOnDate 按业务日回查上游实际成本（各站实际消费 × rechargeRate）。
+	// 午夜快照回填昨天必须走这里，不能读已翻日的 TodayConsume 缓存。
+	// 命名保留 Purchase 以兼容历史调用方；语义是「今日成本」不是「进货」。
+	PurchaseOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error)
+	// TodayInbound / InboundOnDate 汇总账本已确认进货（成本口径）。
+	TodayInbound(ctx context.Context, userID string) (float64, error)
+	InboundOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error)
+	// InboundBreakdownToday 按上游站点汇总今日已确认进货（下钻弹窗）。
+	InboundBreakdownToday(ctx context.Context, userID string) (upstream.InboundBreakdownResponse, error)
 }
 
 // MetricsService 负责仪表盘指标的实时计算、历史快照存储与午夜调度。
@@ -91,9 +100,10 @@ func NewMetricsService(store SessionStore, platform PlatformClient, upstreams Up
 // 计算逻辑：
 //   - todayProfit:     管理员站点今日总实际消费，通过 sub2api /api/v1/admin/usage/stats 获取
 //   - siteBalance:     管理员站点所有非 admin 用户余额之和，通过 sub2api /api/v1/admin/users 分页求和
-//   - todayPurchase:   所有上游站点今日消费 × 站点倍率之和（复用已同步的内存数据，无额外请求）
-//   - upstreamBalance: 所有上游站点余额 × 站点倍率之和（复用已同步的内存数据）
-//   - netProfit:       todayProfit - todayPurchase
+//   - todayCost / todayPurchase: 所有上游站点今日消费 × 站点倍率之和（复用缓存；语义=成本）
+//   - todayInbound:    账本 confirmed 进货合计（与成本分列）
+//   - upstreamBalance: 上游预存备付（不含预授信账面）
+//   - netProfit:       todayProfit - todayCost
 func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (MetricsResponse, error) {
 	// 获取并校验 admin 会话（平台感知：sub2api 检查 AccessToken，new-api 检查 Cookie+UserID）。
 	adminAccountID, err := s.requireCurrentAdminAccount(ctx, userID)
@@ -121,14 +131,24 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 
 	// 并行获取四项独立数据：今日盈利、站点余额、分组数量、上游指标。
 	// 各 goroutine 出错只记日志、降级为零值，不阻塞整体返回。
-	today := time.Now().Format("2006-01-02")
+	// 业务日统一使用 Asia/Shanghai，避免容器 UTC 把 00:00-08:00 的中国日切错位。
+	today := upstream.BusinessToday()
 	var (
-		todayProfit     float64
-		siteBalance     float64
-		groupCount      int
-		todayPurchase   float64
-		upstreamBalance float64
-		wg              sync.WaitGroup
+		todayProfit                float64
+		siteBalance                float64
+		siteRevenueBalance         float64
+		siteBalancePlatform        float64
+		siteRevenueBalancePlatform float64
+		siteRechargeRate           = 1.0
+		siteGiftPlat               float64
+		siteRebatePlat             float64
+		siteRechargePlat           float64
+		groupCount                 int
+		todayCost                  float64
+		todayInbound               float64
+		upstreamPrepaid            float64
+		upstreamCreditRef          float64
+		wg                         sync.WaitGroup
 	)
 
 	// goroutine 1: 今日盈利额度（平台中性）。
@@ -143,24 +163,54 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 		todayProfit = profit
 	}()
 
-	// goroutine 2: 站点用户总余额（平台中性）。
+	// goroutine 2: 站点用户余额双口径（成本侧含赠送；营收侧扣赠送/返利）。
+	// 营收扣除 = max(手动赠送额度, 流水标记 gift+rebate 合计)。
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		filterConfig, err := s.metricsRepo.GetBalanceFilter(ctx, userID, adminAccountID)
 		if err != nil {
 			log.Printf("dashboard metrics: load balance filter failed user_id=%s err=%v, using defaults", userID, err)
-			filterConfig = BalanceFilterConfig{ExcludeAdmin: true, ExcludeBalances: []float64{}}
+			filterConfig = BalanceFilterConfig{ExcludeAdmin: true, ExcludeBalances: []float64{}, ExcludeUserIDs: []string{}, UserGiftAmounts: map[string]float64{}}
+		}
+		giftAmounts := filterConfig.UserGiftAmounts
+		if marked, markErr := s.metricsRepo.SumNonRevenueByPlatformUser(ctx, userID, adminAccountID); markErr == nil {
+			giftAmounts = mergeGiftAmounts(filterConfig.UserGiftAmounts, marked)
 		}
 		balanceResult, err := s.platform.FetchAdminSiteBalanceFiltered(session, upstream.BalanceFilter{
 			ExcludeAdmin:    filterConfig.ExcludeAdmin,
 			ExcludeBalances: filterConfig.ExcludeBalances,
+			ExcludeUserIDs:  filterConfig.ExcludeUserIDs,
+			UserGiftAmounts: giftAmounts,
 		})
 		if err != nil {
 			log.Printf("dashboard metrics: fetch site balance failed user_id=%s err=%v", userID, err)
 			return
 		}
-		siteBalance = balanceResult.Balance
+		rate := filterConfig.SiteRechargeRate
+		if rate <= 0 {
+			rate = 1
+		}
+		siteRechargeRate = rate
+		costPlat := balanceResult.CostBalance
+		if costPlat == 0 && balanceResult.Balance != 0 {
+			costPlat = balanceResult.Balance
+		}
+		siteBalancePlatform = costPlat
+		siteRevenueBalancePlatform = balanceResult.RevenueBalance
+		// 平台余额 × 工作区充值倍率 → 成本/CNY 口径（与上游备付一致）
+		siteBalance = costPlat * rate
+		siteRevenueBalance = balanceResult.RevenueBalance * rate
+
+		// 全站流水标记：累计赠送 / 返利 / 充值，与兑付余额同一套排除（指定用户 + 可选 admin）
+		excludeIDs := s.collectBalanceExcludedUserIDs(ctx, session, filterConfig)
+		if gift, rebate, recharge, sumErr := s.metricsRepo.SumTagsByWorkspace(ctx, userID, adminAccountID, excludeIDs); sumErr == nil {
+			siteGiftPlat = gift
+			siteRebatePlat = rebate
+			siteRechargePlat = recharge
+		} else {
+			log.Printf("dashboard metrics: sum user topup tags failed user_id=%s err=%v", userID, sumErr)
+		}
 	}()
 
 	// goroutine 3: 管理员站点分组数量（平台中性）。
@@ -175,8 +225,8 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 		groupCount = len(groups)
 	}()
 
-	// goroutine 4: 今日进货额度与上游总余额（读取 Redis 缓存，无外部 API 调用）。
-	// 使用 List（用户请求路径，自动过滤当前工作区站点）。
+	// goroutine 4: 今日成本与上游备付（缓存）。
+	// 预存站余额计入 prepaid；预授信站账面只进 creditReference，不进覆盖率分子。
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -185,25 +235,65 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 				continue
 			}
 			if site.Metrics.TodayConsume.Value != nil {
-				todayPurchase += *site.Metrics.TodayConsume.Value * site.RechargeRate
+				todayCost += *site.Metrics.TodayConsume.Value * site.RechargeRate
 			}
-			if site.Metrics.Balance.Value != nil {
-				upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
+			if site.Metrics.Balance.Value == nil {
+				continue
+			}
+			costBal := *site.Metrics.Balance.Value * site.RechargeRate
+			if site.Settings.CountsAsPrepaidReserve() {
+				upstreamPrepaid += costBal
+			} else {
+				upstreamCreditRef += costBal
 			}
 		}
 	}()
 
+	// goroutine 5: 今日进货（账本 confirmed topup）。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		inbound, err := s.upstreams.TodayInbound(ctx, userID)
+		if err != nil {
+			log.Printf("dashboard metrics: today inbound failed user_id=%s err=%v", userID, err)
+			return
+		}
+		todayInbound = inbound
+	}()
+
 	wg.Wait()
 
-	netProfit := todayProfit - todayPurchase
+	netProfit := todayProfit - todayCost
+	coverageApplicable := siteBalance > 0
+	var coverageRatio *float64
+	if coverageApplicable {
+		ratio := (upstreamPrepaid / siteBalance) * 100
+		coverageRatio = &ratio
+	}
 
 	result := MetricsResponse{
-		TodayProfit:     todayProfit,
-		SiteBalance:     siteBalance,
-		TodayPurchase:   todayPurchase,
-		NetProfit:       netProfit,
-		UpstreamBalance: upstreamBalance,
-		GroupCount:      groupCount,
+		TodayProfit:                todayProfit,
+		SiteBalance:                siteBalance,
+		TodayPurchase:              todayCost, // 兼容：todayPurchase 现语义=今日成本
+		TodayCost:                  todayCost,
+		TodayInbound:               todayInbound,
+		NetProfit:                  netProfit,
+		UpstreamBalance:            upstreamPrepaid,
+		GroupCount:                 groupCount,
+		SiteRevenueBalance:         siteRevenueBalance,
+		UpstreamPrepaidBalance:     upstreamPrepaid,
+		UpstreamCreditReference:    upstreamCreditRef,
+		CoverageApplicable:         coverageApplicable,
+		CoverageRatio:              coverageRatio,
+		SiteRechargeRate:           siteRechargeRate,
+		SiteBalancePlatform:        siteBalancePlatform,
+		SiteRevenueBalancePlatform: siteRevenueBalancePlatform,
+		SiteGiftTotalPlatform:      siteGiftPlat,
+		SiteRebateTotalPlatform:    siteRebatePlat,
+		SiteRechargeTotalPlatform:  siteRechargePlat,
+		SiteGiftTotal:              siteGiftPlat * siteRechargeRate,
+		SiteRebateTotal:            siteRebatePlat * siteRechargeRate,
+		SiteRechargeTotal:          siteRechargePlat * siteRechargeRate,
 	}
 
 	// 将当天指标 upsert 到数据库，即使部分指标获取失败也保存已有数据，
@@ -235,6 +325,8 @@ func (s *MetricsService) Trends(ctx context.Context, userID string, days int) (T
 			TodayProfit:     snap.TodayProfit,
 			SiteBalance:     snap.SiteBalance,
 			TodayPurchase:   snap.TodayPurchase,
+			TodayCost:       snap.TodayPurchase,
+			TodayInbound:    snap.TodayInbound,
 			NetProfit:       snap.NetProfit,
 			UpstreamBalance: snap.UpstreamBalance,
 		})
@@ -269,13 +361,18 @@ func (s *MetricsService) StartScheduler(ctx context.Context) {
 	}()
 }
 
-// snapshotAll 遍历所有活跃 admin 用户，为昨天的日期保存指标快照。
-// 午夜执行时，"今天"已经翻到新的一天，因此用昨天的日期查询 sub2api 的 usage stats，
-// 而上游站点的余额取当前值（余额不按天重置）。
-// 单用户出错只记日志，不影响其他用户和调度循环（与 refreshDueSessions 相同的容错模式）。
+// snapshotAll 遍历所有活跃 admin 用户，为昨天的业务日保存终态指标快照。
+// 午夜（Asia/Shanghai）执行时：
+//   - 盈利额度：按昨天日期查询 admin usage stats（平台中性）
+//   - 进货额度：按昨天日期回查各上游站点实际消费，而不是读已翻日的 TodayConsume
+//   - 余额：取当前值（余额不按天重置）
 //
-// 注意：此方法是后台调度路径，使用 ListForAccount 显式传入 adminAccountID，
-// 不依赖当前工作区上下文（避免 fail-closed 的 List 在无 workspace 上下文时返回空）。
+// 即使白天 LiveMetrics 已写入昨天快照，午夜仍会用历史查询覆盖为终态。
+// 白天快照可能只是中午访问时的中间值；日切后 TodayConsume 也会归零，
+// 对含订阅分组的上游尤其容易把前一天成本写错。
+//
+// 注意：此方法是后台调度路径，使用 ListForAccount / PurchaseOnDate 显式传入
+// adminAccountID，不依赖当前工作区上下文。
 func (s *MetricsService) snapshotAll(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -289,25 +386,12 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 		return
 	}
 
-	loc, _ := time.LoadLocation("Asia/Shanghai")
-	if loc == nil {
-		loc = time.UTC
-	}
+	loc := upstream.BusinessLocation()
 	yesterday := time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
 
 	for _, ref := range refs {
 		userID := ref.UserID
 		adminAccountID := ref.AdminAccountID
-		yesterdayDate, _ := time.Parse("2006-01-02", yesterday)
-		exists, err := s.metricsRepo.Exists(ctx, userID, adminAccountID, yesterdayDate)
-		if err != nil {
-			log.Printf("dashboard scheduler: check exists failed user_id=%s err=%v", userID, err)
-			continue
-		}
-		// 如果昨天的快照已存在（由白天的 LiveMetrics 调用写入），跳过该用户。
-		if exists {
-			continue
-		}
 
 		record, err := s.store.Get(ctx, userID, adminAccountID)
 		if err != nil || record == nil || !record.Session.IsAuthenticated() {
@@ -320,7 +404,7 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 			continue
 		}
 
-		// 昨日盈利（平台中性）。
+		// 昨日盈利（平台中性，按业务日查询）。
 		todayProfit, err := s.platform.FetchAdminUsageStats(session, yesterday, yesterday)
 		if err != nil {
 			log.Printf("dashboard scheduler: fetch usage stats failed user_id=%s err=%v", userID, err)
@@ -337,30 +421,45 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 			siteBalance = result.Balance
 		}
 
-		// 上游指标：使用 ListForAccount 显式传入 adminAccountID，
-		// 确保后台调度路径不依赖当前工作区上下文。
-		var todayPurchase, upstreamBalance float64
+		// 昨日成本：按业务日回查上游实际消费，避免日切后 TodayConsume 归零或订阅站口径漂移。
+		// 失败时绝不能回退到 TodayConsume——午夜后缓存已是新一天，写进去会污染昨天快照。
+		todayCost, err := s.upstreams.PurchaseOnDate(ctx, userID, adminAccountID, yesterday)
+		if err != nil {
+			log.Printf("dashboard scheduler: fetch yesterday cost failed user_id=%s err=%v", userID, err)
+			todayCost = 0
+		}
+
+		// 昨日进货：账本 confirmed topup（与成本分列）。
+		todayInbound, err := s.upstreams.InboundOnDate(ctx, userID, adminAccountID, yesterday)
+		if err != nil {
+			log.Printf("dashboard scheduler: fetch yesterday inbound failed user_id=%s err=%v", userID, err)
+			todayInbound = 0
+		}
+
+		var upstreamBalance float64
 		for _, site := range s.upstreams.ListForAccount(ctx, userID, adminAccountID) {
 			if site.RechargeRate <= 0 {
 				continue
 			}
-			if site.Metrics.TodayConsume.Value != nil {
-				todayPurchase += *site.Metrics.TodayConsume.Value * site.RechargeRate
-			}
 			if site.Metrics.Balance.Value != nil {
-				upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
+				// 午夜快照上游余额：仅预存站计入（与 LiveMetrics 一致）
+				if site.Settings.CountsAsPrepaidReserve() {
+					upstreamBalance += *site.Metrics.Balance.Value * site.RechargeRate
+				}
 			}
 		}
 
 		result := MetricsResponse{
 			TodayProfit:     todayProfit,
 			SiteBalance:     siteBalance,
-			TodayPurchase:   todayPurchase,
-			NetProfit:       todayProfit - todayPurchase,
+			TodayPurchase:   todayCost,
+			TodayCost:       todayCost,
+			TodayInbound:    todayInbound,
+			NetProfit:       todayProfit - todayCost,
 			UpstreamBalance: upstreamBalance,
 		}
 		s.upsertSnapshot(ctx, userID, adminAccountID, yesterday, result)
-		log.Printf("dashboard scheduler: snapshot saved user_id=%s admin_account_id=%s date=%s", userID, adminAccountID, yesterday)
+		log.Printf("dashboard scheduler: snapshot saved user_id=%s admin_account_id=%s date=%s cost=%.6f inbound=%.6f", userID, adminAccountID, yesterday, todayCost, todayInbound)
 	}
 }
 
@@ -377,6 +476,10 @@ func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccoun
 		log.Printf("dashboard metrics: generate id failed: %v", err)
 		return
 	}
+	cost := metrics.TodayCost
+	if cost == 0 && metrics.TodayPurchase != 0 {
+		cost = metrics.TodayPurchase
+	}
 	snapshot := DailySnapshot{
 		ID:              id,
 		UserID:          userID,
@@ -384,7 +487,8 @@ func (s *MetricsService) upsertSnapshot(ctx context.Context, userID, adminAccoun
 		Date:            parsedDate,
 		TodayProfit:     metrics.TodayProfit,
 		SiteBalance:     metrics.SiteBalance,
-		TodayPurchase:   metrics.TodayPurchase,
+		TodayPurchase:   cost,
+		TodayInbound:    metrics.TodayInbound,
 		NetProfit:       metrics.NetProfit,
 		UpstreamBalance: metrics.UpstreamBalance,
 		CreatedAt:       time.Now(),
@@ -491,7 +595,7 @@ func (s *MetricsService) GroupUsageToday(ctx context.Context, userID string) (Gr
 	}
 
 	return GroupUsageTodayResponse{
-		Date:   time.Now().Format("2006-01-02"),
+		Date:   upstream.BusinessToday(),
 		Total:  total,
 		Groups: items,
 	}, nil
@@ -537,7 +641,7 @@ func (s *MetricsService) UpstreamKeyUsageToday(ctx context.Context, userID strin
 	}
 
 	return UpstreamKeyUsageTodayResponse{
-		Date:        time.Now().Format("2006-01-02"),
+		Date:        upstream.BusinessToday(),
 		Total:       total,
 		Keys:        responseItems,
 		FailedSites: failedSites,
@@ -545,9 +649,33 @@ func (s *MetricsService) UpstreamKeyUsageToday(ctx context.Context, userID strin
 	}, nil
 }
 
+// TodayInboundBreakdown 获取今日进货按上游站点汇总（仪表盘「今日进货」下钻）。
+func (s *MetricsService) TodayInboundBreakdown(ctx context.Context, userID string) (TodayInboundBreakdownResponse, error) {
+	raw, err := s.upstreams.InboundBreakdownToday(ctx, userID)
+	if err != nil {
+		return TodayInboundBreakdownResponse{}, err
+	}
+	items := make([]TodayInboundBreakdownItem, 0, len(raw.Sites))
+	for _, site := range raw.Sites {
+		items = append(items, TodayInboundBreakdownItem{
+			SiteID:       site.SiteID,
+			SiteName:     site.SiteName,
+			Platform:     site.Platform,
+			AmountCost:   site.AmountCost,
+			EntryCount:   site.EntryCount,
+			RechargeRate: site.RechargeRate,
+		})
+	}
+	return TodayInboundBreakdownResponse{
+		Date:  raw.Date,
+		Total: raw.Total,
+		Sites: items,
+	}, nil
+}
+
 // UpstreamBalanceBreakdown 获取当前工作区所有上游站点的余额明细（仪表盘「上游总余额」下钻）。
-// 直接复用已同步缓存数据，不触发外部平台请求；未知余额（rechargeRate 未配置或尚未同步成功）的站点排在列表最后，
-// total 只对已知余额求和，与 LiveMetrics 中 upstreamBalance 的计算口径一致。
+// total 只合计预存类站点（prepaid），与 LiveMetrics.upstreamBalance / 覆盖率分子一致；
+// 预授信站点单独标 credit_reference，不进 total。
 func (s *MetricsService) UpstreamBalanceBreakdown(ctx context.Context, userID string) (UpstreamBalanceBreakdownResponse, error) {
 	items, err := s.upstreams.BalanceBreakdown(ctx, userID)
 	if err != nil {
@@ -565,16 +693,18 @@ func (s *MetricsService) UpstreamBalanceBreakdown(ctx context.Context, userID st
 	var total float64
 	for _, item := range items {
 		responseItems = append(responseItems, UpstreamBalanceBreakdownItem{
-			SiteID:       item.SiteID,
-			SiteName:     item.SiteName,
-			Platform:     string(item.Platform),
-			Balance:      item.Balance,
-			RawBalance:   item.RawBalance,
-			RechargeRate: item.RechargeRate,
-			LastSyncedAt: item.LastSyncedAt,
-			Status:       string(item.Status),
+			SiteID:         item.SiteID,
+			SiteName:       item.SiteName,
+			Platform:       string(item.Platform),
+			Balance:        item.Balance,
+			RawBalance:     item.RawBalance,
+			RechargeRate:   item.RechargeRate,
+			LastSyncedAt:   item.LastSyncedAt,
+			Status:         string(item.Status),
+			SettlementMode: item.SettlementMode,
+			ReserveKind:    item.ReserveKind,
 		})
-		if item.Balance != nil {
+		if item.Balance != nil && item.ReserveKind == "prepaid" {
 			total += *item.Balance
 		}
 	}
@@ -583,6 +713,56 @@ func (s *MetricsService) UpstreamBalanceBreakdown(ctx context.Context, userID st
 		Total: total,
 		Sites: responseItems,
 	}, nil
+}
+
+// collectBalanceExcludedUserIDs 与兑付余额同一套排除：配置的整户排除 +（可选）全部 admin 用户 ID。
+func (s *MetricsService) collectBalanceExcludedUserIDs(ctx context.Context, session upstream.Session, filter BalanceFilterConfig) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(filter.ExcludeUserIDs)+8)
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	for _, id := range filter.ExcludeUserIDs {
+		add(id)
+	}
+	if !filter.ExcludeAdmin {
+		return out
+	}
+	reader, ok := s.siteUserReader()
+	if !ok || session.Platform != upstream.PlatformSub2API {
+		return out
+	}
+	// 分页拉取 role=admin，并入排除名单（与余额汇总排除 admin 对齐）
+	const pageSize = 100
+	const maxPages = 30
+	for page := 1; page <= maxPages; page++ {
+		pageData, err := reader.FetchSub2APIAdminUsersPage(session, upstream.Sub2APIAdminUsersQuery{
+			Page:      page,
+			PageSize:  pageSize,
+			Role:      "admin",
+			SortBy:    "created_at",
+			SortOrder: "desc",
+		})
+		if err != nil {
+			log.Printf("dashboard metrics: list admin users for exclude failed err=%v", err)
+			break
+		}
+		for _, u := range pageData.Items {
+			add(u.ID)
+		}
+		if len(pageData.Items) < pageSize {
+			break
+		}
+		if pageData.Total > 0 && page*pageSize >= pageData.Total {
+			break
+		}
+	}
+	return out
 }
 
 // GetBalanceFilter 读取当前用户当前工作区的余额筛选配置。

@@ -91,6 +91,109 @@ export const updateSiteSettings = async (id: string, settings: SiteSettings): Pr
   })
 )
 
+export const listSiteSettlements = async (siteId: string): Promise<{ items: import('../types/upstream').SettlementRecord[] }> => (
+  requestJson(`/upstream-sites/${siteId}/settlements`)
+)
+
+export const createSiteSettlement = async (
+  siteId: string,
+  body: { amount: number; note?: string; settledAt?: string },
+): Promise<import('../types/upstream').SettlementRecord> => (
+  requestJson(`/upstream-sites/${siteId}/settlements`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+)
+
+export const voidSiteSettlement = async (siteId: string, recordId: string): Promise<import('../types/upstream').SettlementRecord> => (
+  requestJson(`/upstream-sites/${siteId}/settlements/${recordId}/void`, { method: 'POST' })
+)
+
+export const deleteSiteSettlement = async (siteId: string, recordId: string): Promise<void> => {
+  await requestJson<{ success: boolean }>(`/upstream-sites/${siteId}/settlements/${recordId}`, { method: 'DELETE' })
+}
+
+export const getSiteSettlementSummary = async (siteId: string): Promise<import('../types/upstream').SettlementSummary> => (
+  requestJson(`/upstream-sites/${siteId}/settlement-summary`)
+)
+
+export const createSubscriptionTopup = async (
+  siteId: string,
+  body: {
+    subscriptionId: string
+    groupName?: string
+    amountCost: number
+    amountPlatform?: number
+    businessDate: string
+    note?: string
+  },
+): Promise<import('../types/upstream').LedgerRecord> => (
+  requestJson(`/upstream-sites/${siteId}/ledger/subscription-topup`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+)
+
+export interface RechargeCandidate {
+  platformId: string
+  platformType?: string
+  amountPlatform: number
+  amountCost: number
+  note?: string
+  createdAt?: string | null
+  suggestedTag?: string
+  tag?: string
+  ledgerId?: string
+  countsAsInbound: boolean
+  businessDate?: string
+}
+
+export interface RechargeCandidatesResponse {
+  items: RechargeCandidate[]
+  available: boolean
+  rechargeRate: number
+  messageKey?: string
+  platform?: string
+  page: number
+  pageSize: number
+  total: number
+  /** 卡片「历史充值」同源，成本口径，含赠送/返利累计 */
+  platformLifetimeCost?: number | null
+  /** 本次拉到的平台明细合计（成本口径） */
+  detailListCost?: number
+  /** 已标记为充值的合计（成本口径，计进货） */
+  markedRechargeCost?: number
+  markedGiftCost?: number
+  markedRebateCost?: number
+  /** 平台累计 − 已标充值 */
+  gapLifetimeVsMarked?: number | null
+}
+
+export const listSiteRechargeCandidates = async (
+  siteId: string,
+  params?: { page?: number; pageSize?: number },
+): Promise<RechargeCandidatesResponse> => {
+  const page = params?.page && params.page > 0 ? params.page : 1
+  const pageSize = params?.pageSize && params.pageSize > 0 ? params.pageSize : 20
+  return requestJson(`/upstream-sites/${siteId}/recharge-candidates?page=${page}&page_size=${pageSize}`)
+}
+
+export const markSiteRecharge = async (
+  siteId: string,
+  body: {
+    platformRecordId: string
+    tag: 'recharge' | 'gift' | 'rebate' | string
+    amountPlatform: number
+    note?: string
+    createdAt?: string
+  },
+): Promise<import('../types/upstream').LedgerRecord> => (
+  requestJson(`/upstream-sites/${siteId}/ledger/mark`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+)
+
 /** 以 SSE 流方式逐站同步，每个站点的进度通过 onEvent 回调实时推送。 */
 export const streamSyncAllUpstreamSites = async (
   onEvent: (event: SyncStreamEvent) => void,

@@ -56,6 +56,12 @@ const routes = [
         component: () => import('./modules/admin/views/UpstreamView.vue')
       },
       {
+        path: 'site-users',
+        name: 'AdminSiteUsers',
+        meta: { requiresWorkspace: true },
+        component: () => import('./modules/admin/views/SiteUsersView.vue')
+      },
+      {
         path: 'group-rates',
         name: 'AdminGroupRates',
         meta: { requiresWorkspace: true },

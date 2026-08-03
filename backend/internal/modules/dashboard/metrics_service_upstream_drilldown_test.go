@@ -32,6 +32,22 @@ func (f *fakeUpstreamLister) BalanceBreakdown(ctx context.Context, userID string
 	return f.balanceItems, f.balanceErr
 }
 
+func (f *fakeUpstreamLister) PurchaseOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error) {
+	return 0, nil
+}
+
+func (f *fakeUpstreamLister) TodayInbound(ctx context.Context, userID string) (float64, error) {
+	return 0, nil
+}
+
+func (f *fakeUpstreamLister) InboundOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error) {
+	return 0, nil
+}
+
+func (f *fakeUpstreamLister) InboundBreakdownToday(ctx context.Context, userID string) (upstream.InboundBreakdownResponse, error) {
+	return upstream.InboundBreakdownResponse{Sites: []upstream.InboundBreakdownItem{}}, nil
+}
+
 // TestUpstreamKeyUsageToday_SortsDescendingAndSumsTotal 覆盖测试要求 7、8：
 // 按 todayAmount 降序排序；total 等于所有 keys[].todayAmount 求和。
 func TestUpstreamKeyUsageToday_SortsDescendingAndSumsTotal(t *testing.T) {
@@ -102,9 +118,9 @@ func TestUpstreamBalanceBreakdown_SortsWithUnknownBalanceLastAndSumsKnownOnly(t 
 	low := 10.0
 	upstreams := &fakeUpstreamLister{
 		balanceItems: []upstream.BalanceBreakdownItem{
-			{SiteID: "site-unknown", Balance: nil},
-			{SiteID: "site-low", Balance: &low},
-			{SiteID: "site-high", Balance: &high},
+			{SiteID: "site-unknown", Balance: nil, ReserveKind: "excluded"},
+			{SiteID: "site-low", Balance: &low, ReserveKind: "prepaid"},
+			{SiteID: "site-high", Balance: &high, ReserveKind: "prepaid"},
 		},
 	}
 	service := NewMetricsService(nil, nil, upstreams, nil, nil)

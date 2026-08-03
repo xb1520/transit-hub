@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, watch, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { LayoutDashboard, Network, Settings, LogOut, Globe, Moon, Sun, Percent, Megaphone, ChevronDown, ArrowRightLeft, FolderTree, Link2, Activity, MessageSquare, Github, Mail, Menu, X, Trophy, Gift, Boxes } from 'lucide-vue-next'
+import { LayoutDashboard, Network, Settings, LogOut, Globe, Moon, Sun, Percent, Megaphone, ChevronDown, ArrowRightLeft, FolderTree, Link2, Activity, MessageSquare, Github, Mail, Menu, X, Trophy, Gift, Boxes, Users, Coins } from 'lucide-vue-next'
 import { useDark, useToggle } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
 import { useAdminAccounts } from '../composables/useAdminAccounts'
+import { useCurrencyDisplay, type CurrencyDisplayMode } from '../composables/useCurrencyDisplay'
 import { clearAccessToken } from '@/modules/auth/api/auth'
 import { getSystemVersion } from '../api/system'
 import type { SystemVersionResponse } from '../api/system'
@@ -27,6 +28,22 @@ const toggleLocale = () => {
 }
 
 const { currentAccount, noticeKey, loadCurrentAccount } = useAdminAccounts()
+const { displayMode, setDisplayMode } = useCurrencyDisplay()
+const showCurrencyMenu = ref(false)
+const currencyMenuRef = ref<HTMLElement | null>(null)
+
+const currencyModes: CurrencyDisplayMode[] = ['dual', 'cny', 'usd']
+const currencyModeLabel = (mode: CurrencyDisplayMode) => t(`admin.layout.currencyMode.${mode}`)
+
+const toggleCurrencyMenu = () => {
+  showCurrencyMenu.value = !showCurrencyMenu.value
+  if (showCurrencyMenu.value) showUserMenu.value = false
+}
+
+const pickCurrencyMode = (mode: CurrencyDisplayMode) => {
+  setDisplayMode(mode)
+  showCurrencyMenu.value = false
+}
 
 // 版本信息：开源版仅用于纯展示，不依赖授权/更新服务
 const versionInfo = ref<SystemVersionResponse | null>(null)
@@ -78,11 +95,15 @@ const closeMobileSidebar = () => {
 
 const toggleUserMenu = () => {
   showUserMenu.value = !showUserMenu.value
+  if (showUserMenu.value) showCurrencyMenu.value = false
 }
 
 const handleClickOutside = (e: MouseEvent) => {
   if (userMenuRef.value && !userMenuRef.value.contains(e.target as Node)) {
     showUserMenu.value = false
+  }
+  if (currencyMenuRef.value && !currencyMenuRef.value.contains(e.target as Node)) {
+    showCurrencyMenu.value = false
   }
 }
 
@@ -90,6 +111,7 @@ const handleKeydown = (event: KeyboardEvent) => {
   if (event.key !== 'Escape') return
   closeMobileSidebar()
   showUserMenu.value = false
+  showCurrencyMenu.value = false
 }
 
 onMounted(() => {
@@ -126,6 +148,7 @@ type MenuEntry =
 const menuItems = computed<MenuEntry[]>(() => [
   { type: 'leaf', name: t('admin.menu.dashboard'), path: '/admin', icon: LayoutDashboard },
   { type: 'leaf', name: t('admin.menu.upstream'), path: '/admin/upstream', icon: Network },
+  { type: 'leaf', name: t('admin.menu.siteUsers'), path: '/admin/site-users', icon: Users },
   {
     type: 'group',
     id: 'group-management',
@@ -356,6 +379,39 @@ watch(
               <Moon v-if="!isDark" class="h-4 w-4" />
               <Sun v-else class="h-4 w-4" />
             </button>
+
+            <!-- 金额展示：CNY / USD / 双币种 -->
+            <div ref="currencyMenuRef" class="relative">
+              <button
+                type="button"
+                class="flex h-9 items-center gap-1 rounded-full px-2 text-muted-foreground transition-colors hover:bg-surface-elevated hover:text-foreground sm:px-2.5"
+                :title="t('admin.layout.currencyMode.title')"
+                :aria-label="t('admin.layout.currencyMode.title')"
+                :aria-expanded="showCurrencyMenu"
+                @click="toggleCurrencyMenu"
+              >
+                <Coins class="h-4 w-4 shrink-0" />
+                <span class="hidden text-xs font-medium sm:inline">{{ currencyModeLabel(displayMode) }}</span>
+                <ChevronDown class="hidden h-3 w-3 sm:inline" />
+              </button>
+              <transition name="dropdown">
+                <div
+                  v-if="showCurrencyMenu"
+                  class="absolute right-0 top-full z-[60] mt-2 w-44 rounded-xl border border-border/60 bg-surface-elevated py-1 shadow-lg"
+                >
+                  <button
+                    v-for="m in currencyModes"
+                    :key="m"
+                    type="button"
+                    class="flex w-full items-center px-3 py-2 text-left text-sm transition-colors"
+                    :class="displayMode === m ? 'bg-primary/10 font-medium text-foreground' : 'text-muted-foreground hover:bg-surface-line hover:text-foreground'"
+                    @click="pickCurrencyMode(m)"
+                  >
+                    {{ currencyModeLabel(m) }}
+                  </button>
+                </div>
+              </transition>
+            </div>
           </div>
 
           <div ref="userMenuRef" class="relative">

@@ -41,6 +41,8 @@ type Service struct {
 	repository      SiteRepository
 	cache           SiteCache
 	accounts        AdminAccountResolver
+	settlementRepo  *SettlementRepository
+	ledgerRepo      *LedgerRepository
 	refreshConfig   RefreshConfig
 	timers          map[string]*time.Timer
 	deletedSites    map[string]struct{}
@@ -157,12 +159,30 @@ func (s *Service) List(ctx context.Context, userID string) []Response {
 		log.Printf("upstream list: cache read failed user_id=%s err=%v", userID, err)
 		return nil
 	}
+	siteIDs := make([]string, 0, len(sites))
+	for _, site := range sites {
+		if site.AdminAccountID == adminAccountID {
+			siteIDs = append(siteIDs, site.ID)
+		}
+	}
+	settledBySite := map[string]float64{}
+	if s.settlementRepo != nil && len(siteIDs) > 0 {
+		if totals, sumErr := s.settlementRepo.SumActiveBySites(ctx, userID, adminAccountID, siteIDs); sumErr == nil {
+			settledBySite = totals
+		} else {
+			log.Printf("upstream list: settlement sum failed user_id=%s err=%v", userID, sumErr)
+		}
+	}
 	responses := make([]Response, 0, len(sites))
 	for _, site := range sites {
 		if site.AdminAccountID != adminAccountID {
 			continue
 		}
-		responses = append(responses, toResponse(site))
+		resp := toResponse(site)
+		if summary, sumErr := s.buildSettlementSummary(ctx, userID, adminAccountID, site, settledBySite); sumErr == nil {
+			resp.Settlement = &summary
+		}
+		responses = append(responses, resp)
 	}
 	return responses
 }
@@ -229,6 +249,87 @@ func (s *Service) FetchGroupDailyStats(ctx context.Context, userID string, id st
 		_ = s.saveSite(ctx, site)
 	}
 	return stats, nil
+}
+
+// PurchaseOnDate 汇总指定工作区在业务日 date（2006-01-02）的上游成本：
+// 各站点实际消费 × rechargeRate。只统计有 session 且 rechargeRate > 0 的站点，
+// 与 LiveMetrics 的 todayCost / todayPurchase 过滤口径一致。
+// 命名保留 Purchase 兼容历史调用方；语义是「成本」而非「进货」（进货见 InboundOnDate）。
+//
+// 午夜快照必须调用本方法回填昨天，而不能读取已翻日的 TodayConsume 缓存；
+// 订阅站（如含 subscription 分组的 sub2api）在日切后 TodayConsume 会归零，
+// 用缓存回填会把前一天成本写错。
+func (s *Service) PurchaseOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error) {
+	if strings.TrimSpace(date) == "" {
+		return 0, errors.New("upstream: purchase date is required")
+	}
+	sites, err := s.cache.ListByUser(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+
+	targets := make([]*Site, 0, len(sites))
+	for _, site := range sites {
+		if site.AdminAccountID != adminAccountID || site.Session == nil || site.RechargeRate <= 0 {
+			continue
+		}
+		targets = append(targets, site)
+	}
+	if len(targets) == 0 {
+		return 0, nil
+	}
+
+	const maxSiteConcurrency = 4
+	sem := make(chan struct{}, maxSiteConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var total float64
+	var firstErr error
+
+	for _, site := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(site *Site) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			session := *site.Session
+			refreshedSession, refreshErr := s.platformService.RefreshSession(session)
+			if refreshErr != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = refreshErr
+				}
+				mu.Unlock()
+				return
+			}
+			if refreshedSession.Platform == PlatformNewAPI && refreshedSession.QuotaPerUnit <= 0 {
+				refreshedSession.QuotaPerUnit = s.platformService.fetchNewAPIQuotaPerUnit(refreshedSession)
+			}
+
+			cost, fetchErr := s.platformService.FetchSiteUsageActualCost(refreshedSession, date, date)
+			if fetchErr != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fetchErr
+				}
+				mu.Unlock()
+				return
+			}
+
+			if cached, cacheErr := s.cache.Get(ctx, site.ID); cacheErr == nil && cached != nil && cached.UserID == site.UserID {
+				cached.Session = &refreshedSession
+				_ = s.setCachedSite(ctx, cached)
+				_ = s.saveSite(ctx, cached)
+			}
+
+			mu.Lock()
+			total += cost * site.RechargeRate
+			mu.Unlock()
+		}(site)
+	}
+	wg.Wait()
+	return total, firstErr
 }
 
 // KeyUsageToday 返回当前工作区所有上游站点中，今天有消费的 key 明细（仪表盘「今日成本」下钻数据源）。
@@ -352,13 +453,24 @@ func (s *Service) BalanceBreakdown(ctx context.Context, userID string) ([]Balanc
 		if site.AdminAccountID != adminAccountID {
 			continue
 		}
+		mode := NormalizeSettlementMode(site.Settings.SettlementMode)
+		kind := "excluded"
+		if site.RechargeRate > 0 {
+			if site.Settings.CountsAsPrepaidReserve() {
+				kind = "prepaid"
+			} else {
+				kind = "credit_reference"
+			}
+		}
 		item := BalanceBreakdownItem{
-			SiteID:       site.ID,
-			SiteName:     site.Name,
-			Platform:     site.Platform,
-			RechargeRate: site.RechargeRate,
-			LastSyncedAt: site.LastSyncedAt,
-			Status:       site.Status,
+			SiteID:         site.ID,
+			SiteName:       site.Name,
+			Platform:       site.Platform,
+			RechargeRate:   site.RechargeRate,
+			LastSyncedAt:   site.LastSyncedAt,
+			Status:         site.Status,
+			SettlementMode: mode,
+			ReserveKind:    kind,
 		}
 		if site.RechargeRate > 0 && site.Metrics.Balance.Value != nil {
 			raw := *site.Metrics.Balance.Value
@@ -644,7 +756,7 @@ func (s *Service) SyncAll(ctx context.Context, userID string) ([]Response, error
 			continue
 		}
 		if site.Session == nil {
-			responses = append(responses, toResponse(site))
+			responses = append(responses, s.toResponseWithSettlement(ctx, site))
 			continue
 		}
 		ids = append(ids, site.ID)
@@ -660,7 +772,7 @@ func (s *Service) SyncAll(ctx context.Context, userID string) ([]Response, error
 			if err != nil {
 				// 同步失败时返回缓存中的当前状态。
 				if cached, cacheErr := s.cache.Get(ctx, id); cacheErr == nil && cached != nil {
-					response = toResponse(cached)
+					response = s.toResponseWithSettlement(ctx, cached)
 				}
 				results[index] = response
 				return
@@ -706,7 +818,7 @@ func (s *Service) SyncAllStream(ctx context.Context, userID string, emit SyncEve
 			continue
 		}
 		if site.Session == nil {
-			resp := toResponse(site)
+			resp := s.toResponseWithSettlement(ctx, site)
 			safeEmit(SyncEvent{Event: SyncEventDone, SiteID: site.ID, Site: &resp})
 			continue
 		}
@@ -735,7 +847,7 @@ func (s *Service) SyncAllStream(ctx context.Context, userID string, emit SyncEve
 			if syncErr != nil {
 				log.Printf("[upstream-stream] 同步失败 id=%s err=%v", id, syncErr)
 				if cached, cacheErr := s.cache.Get(ctx, id); cacheErr == nil && cached != nil {
-					response = toResponse(cached)
+					response = s.toResponseWithSettlement(ctx, cached)
 				}
 				key := errorKey(syncErr)
 				safeEmit(SyncEvent{Event: SyncEventError, SiteID: id, ErrorKey: key, Site: &response})
@@ -802,7 +914,7 @@ func (s *Service) sync(ctx context.Context, id string) (Response, error) {
 	s.scheduleSyncLocked(id, site)
 	s.mu.Unlock()
 
-	response := toResponse(site)
+	response := s.toResponseWithSettlement(ctx, site)
 	if saveErr := s.saveSite(ctx, site); saveErr != nil {
 		return response, saveErr
 	}
@@ -813,6 +925,19 @@ func (s *Service) sync(ctx context.Context, id string) (Response, error) {
 		}
 	}
 	return response, nil
+}
+
+// toResponseWithSettlement 在 toResponse 基础上附带结算汇总，保证同步/刷新路径
+// 与 List 一致，避免前端刷新后丢失待结算卡片。
+func (s *Service) toResponseWithSettlement(ctx context.Context, site *Site) Response {
+	if site == nil {
+		return Response{}
+	}
+	resp := toResponse(site)
+	if summary, err := s.buildSettlementSummary(ctx, site.UserID, site.AdminAccountID, site, nil); err == nil {
+		resp.Settlement = &summary
+	}
+	return resp
 }
 
 func (s *Service) saveSnapshot(ctx context.Context, site *Site) {
@@ -1031,7 +1156,7 @@ func validateUpdate(dto UpdateRequest) error {
 	return nil
 }
 
-// UpdateSettings 更新站点级预警覆盖配置，不触发重新登录或同步。
+// UpdateSettings 更新站点级配置（预警阈值、结算模式等），不触发重新登录或同步。
 func (s *Service) UpdateSettings(ctx context.Context, userID string, siteID string, dto SiteSettings) (Response, error) {
 	site, err := s.cache.Get(ctx, siteID)
 	if err != nil {
@@ -1048,12 +1173,23 @@ func (s *Service) UpdateSettings(ctx context.Context, userID string, siteID stri
 	if site.AdminAccountID != aid {
 		return Response{}, newRequestError(ErrorNotFound, "")
 	}
+	dto.SettlementMode = NormalizeSettlementMode(dto.SettlementMode)
+	if dto.SettlementCurrency == "" {
+		dto.SettlementCurrency = "CNY"
+	}
+	if dto.CreditLimit != nil && (*dto.CreditLimit < 0 || !isFinite(*dto.CreditLimit)) {
+		return Response{}, invalidBodyError("creditLimit")
+	}
 	site.Settings = dto
 	_ = s.setCachedSite(ctx, site)
 	if saveErr := s.saveSite(ctx, site); saveErr != nil {
 		return Response{}, saveErr
 	}
-	return toResponse(site), nil
+	resp := toResponse(site)
+	if summary, sumErr := s.buildSettlementSummary(ctx, userID, aid, site, nil); sumErr == nil {
+		resp.Settlement = &summary
+	}
+	return resp, nil
 }
 
 // GetSite 根据 ID 获取站点（供 alert 逻辑读取站点级配置）。

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"transithub/backend/internal/shared/authctx"
@@ -28,9 +29,10 @@ func RegisterRoutes(mux *http.ServeMux, service *Service, accounts HandlerAccoun
 	mux.HandleFunc("POST /api/upstream-sites", handler.create)
 	mux.HandleFunc("POST /api/upstream-sites/sync-all", handler.syncAll)
 	mux.HandleFunc("GET /api/upstream-sites/sync-stream", handler.syncStream)
+	mux.HandleFunc("GET /api/upstream-sites/", handler.getSubroutes)
 	mux.HandleFunc("PUT /api/upstream-sites/", handler.update)
 	mux.HandleFunc("PATCH /api/upstream-sites/", handler.update)
-	mux.HandleFunc("POST /api/upstream-sites/", handler.sync)
+	mux.HandleFunc("POST /api/upstream-sites/", handler.postSubroutes)
 	mux.HandleFunc("DELETE /api/upstream-sites/", handler.remove)
 }
 
@@ -138,7 +140,7 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PATCH /api/upstream-sites/{id}/settings → 站点级预警覆盖设置
+	// PATCH /api/upstream-sites/{id}/settings → 站点级配置
 	if id, ok := pathID(r.URL.Path, "/api/upstream-sites/", "/settings"); ok && r.Method == http.MethodPatch {
 		h.updateSettings(w, r, userID, id)
 		return
@@ -177,7 +179,7 @@ func (h *Handler) updateSettings(w http.ResponseWriter, r *http.Request, userID,
 	httpjson.Write(w, http.StatusOK, response)
 }
 
-func (h *Handler) sync(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) getSubroutes(w http.ResponseWriter, r *http.Request) {
 	userID, ok := authctx.UserID(r.Context())
 	if !ok {
 		httpjson.WriteError(w, http.StatusUnauthorized, "auth.errors.unauthorized")
@@ -187,17 +189,201 @@ func (h *Handler) sync(w http.ResponseWriter, r *http.Request) {
 		writeWorkspaceError(w, err)
 		return
 	}
-	id, ok := pathID(r.URL.Path, "/api/upstream-sites/", "/sync")
+	id, rest, ok := pathIDWithRest(r.URL.Path, "/api/upstream-sites/")
 	if !ok {
 		httpjson.WriteError(w, http.StatusNotFound, "Not Found")
 		return
 	}
-	response, err := h.service.Sync(r.Context(), userID, id)
+	switch rest {
+	case "settlements":
+		h.listSettlements(w, r, userID, id)
+	case "settlement-summary":
+		h.settlementSummary(w, r, userID, id)
+	case "ledger":
+		h.listLedger(w, r, userID, id)
+	case "recharge-candidates":
+		h.listRechargeCandidates(w, r, userID, id)
+	default:
+		httpjson.WriteError(w, http.StatusNotFound, "Not Found")
+	}
+}
+
+func (h *Handler) postSubroutes(w http.ResponseWriter, r *http.Request) {
+	userID, ok := authctx.UserID(r.Context())
+	if !ok {
+		httpjson.WriteError(w, http.StatusUnauthorized, "auth.errors.unauthorized")
+		return
+	}
+	if _, err := h.requireWorkspace(r.Context(), userID); err != nil {
+		writeWorkspaceError(w, err)
+		return
+	}
+	// 兼容旧路径：POST .../sync
+	if id, ok := pathID(r.URL.Path, "/api/upstream-sites/", "/sync"); ok {
+		response, err := h.service.Sync(r.Context(), userID, id)
+		if err != nil {
+			writeUpstreamError(w, err)
+			return
+		}
+		httpjson.Write(w, http.StatusCreated, response)
+		return
+	}
+	id, rest, ok := pathIDWithRest(r.URL.Path, "/api/upstream-sites/")
+	if !ok {
+		httpjson.WriteError(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	if rest == "settlements" {
+		h.createSettlement(w, r, userID, id)
+		return
+	}
+	if strings.HasPrefix(rest, "settlements/") && strings.HasSuffix(rest, "/void") {
+		recordID := strings.TrimSuffix(strings.TrimPrefix(rest, "settlements/"), "/void")
+		recordID = strings.Trim(recordID, "/")
+		h.voidSettlement(w, r, userID, id, recordID)
+		return
+	}
+	if rest == "ledger/mark" {
+		h.markRecharge(w, r, userID, id)
+		return
+	}
+	if rest == "ledger/subscription-topup" {
+		h.createSubscriptionTopup(w, r, userID, id)
+		return
+	}
+	httpjson.WriteError(w, http.StatusNotFound, "Not Found")
+}
+
+func (h *Handler) listSettlements(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	items, err := h.service.ListSettlements(r.Context(), userID, siteID, 50)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
 	}
-	httpjson.Write(w, http.StatusCreated, response)
+	httpjson.Write(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (h *Handler) createSettlement(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	var input CreateSettlementInput
+	if err := httpjson.Decode(r, &input); err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	item, err := h.service.CreateSettlement(r.Context(), userID, siteID, input)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusCreated, item)
+}
+
+func (h *Handler) voidSettlement(w http.ResponseWriter, r *http.Request, userID, siteID, recordID string) {
+	item, err := h.service.VoidSettlement(r.Context(), userID, siteID, recordID)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, item)
+}
+
+func (h *Handler) deleteSettlement(w http.ResponseWriter, r *http.Request, userID, siteID, recordID string) {
+	if err := h.service.DeleteSettlement(r.Context(), userID, siteID, recordID); err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+func (h *Handler) createSubscriptionTopup(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	var input CreateSubscriptionTopupInput
+	if err := httpjson.Decode(r, &input); err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	item, err := h.service.CreateSubscriptionTopup(r.Context(), userID, siteID, input)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusCreated, item)
+}
+
+func (h *Handler) settlementSummary(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	summary, err := h.service.SettlementSummaryForSite(r.Context(), userID, siteID)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, summary)
+}
+
+func (h *Handler) listLedger(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	items, err := h.service.ListLedger(r.Context(), userID, siteID, 50)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (h *Handler) listRechargeCandidates(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	page := 1
+	pageSize := 20
+	if v := strings.TrimSpace(r.URL.Query().Get("page")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("page_size")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	} else if v := strings.TrimSpace(r.URL.Query().Get("pageSize")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	}
+	resp, err := h.service.ListRechargeCandidates(r.Context(), userID, siteID, page, pageSize)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, resp)
+}
+
+func (h *Handler) markRecharge(w http.ResponseWriter, r *http.Request, userID, siteID string) {
+	var input MarkRechargeInput
+	if err := httpjson.Decode(r, &input); err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	item, err := h.service.MarkRecharge(r.Context(), userID, siteID, input)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, item)
+}
+
+// pathIDWithRest 解析 /prefix/{id}/{rest...}，rest 不含前导斜杠。
+func pathIDWithRest(path string, prefix string) (id string, rest string, ok bool) {
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	trimmed := strings.TrimPrefix(path, prefix)
+	trimmed = strings.Trim(trimmed, "/")
+	if trimmed == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(trimmed, "/", 2)
+	id = parts[0]
+	if id == "" || id == "sync-all" || id == "sync-stream" {
+		return "", "", false
+	}
+	if len(parts) == 1 {
+		return id, "", true
+	}
+	return id, parts[1], true
 }
 
 func (h *Handler) remove(w http.ResponseWriter, r *http.Request) {
@@ -210,16 +396,30 @@ func (h *Handler) remove(w http.ResponseWriter, r *http.Request) {
 		writeWorkspaceError(w, err)
 		return
 	}
-	id, ok := pathID(r.URL.Path, "/api/upstream-sites/", "")
+	id, rest, ok := pathIDWithRest(r.URL.Path, "/api/upstream-sites/")
 	if !ok {
 		httpjson.WriteError(w, http.StatusNotFound, "Not Found")
 		return
 	}
-	if err := h.service.Remove(r.Context(), userID, id); err != nil {
-		writeUpstreamError(w, err)
+	if rest == "" {
+		if err := h.service.Remove(r.Context(), userID, id); err != nil {
+			writeUpstreamError(w, err)
+			return
+		}
+		httpjson.Write(w, http.StatusOK, map[string]bool{"success": true})
 		return
 	}
-	httpjson.Write(w, http.StatusOK, map[string]bool{"success": true})
+	if strings.HasPrefix(rest, "settlements/") {
+		recordID := strings.TrimPrefix(rest, "settlements/")
+		recordID = strings.Trim(recordID, "/")
+		if recordID == "" || strings.Contains(recordID, "/") {
+			httpjson.WriteError(w, http.StatusNotFound, "Not Found")
+			return
+		}
+		h.deleteSettlement(w, r, userID, id, recordID)
+		return
+	}
+	httpjson.WriteError(w, http.StatusNotFound, "Not Found")
 }
 
 func pathID(path string, prefix string, suffix string) (string, bool) {

@@ -22,6 +22,7 @@ const METRIC_CONFIGS: { key: DashboardMetricKey; color: DashboardColorToken }[] 
   { key: 'todayProfit', color: 'primary' },
   { key: 'siteBalance', color: 'accent' },
   { key: 'todayPurchase', color: 'warning' },
+  { key: 'todayInbound', color: 'accent' },
   { key: 'netProfit', color: 'signal' },
   { key: 'upstreamBalance', color: 'primary' },
 ]
@@ -36,18 +37,32 @@ function todayLabel(): string {
   return `${now.getMonth() + 1}/${now.getDate()}`
 }
 
+function metricValue(source: DashboardMetricsResponse | DashboardTrendPoint, key: DashboardMetricKey): number {
+  if (key === 'todayCost') {
+    return source.todayCost ?? source.todayPurchase ?? 0
+  }
+  if (key === 'todayPurchase') {
+    return source.todayCost ?? source.todayPurchase ?? 0
+  }
+  if (key === 'todayInbound') {
+    return source.todayInbound ?? 0
+  }
+  const value = source[key as keyof typeof source]
+  return typeof value === 'number' ? value : 0
+}
+
 function buildMetricData(
   key: DashboardMetricKey,
   color: DashboardColorToken,
   live: DashboardMetricsResponse,
   trendPoints: DashboardTrendPoint[],
 ): DashboardMetricData {
-  const current = live[key]
+  const current = metricValue(live, key)
   const label = todayLabel()
 
   const monthPoints: TrendPoint[] = trendPoints.map((p) => ({
     label: dateLabel(p.date),
-    value: p[key],
+    value: metricValue(p, key),
   }))
   monthPoints.push({ label, value: current })
 

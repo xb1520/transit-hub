@@ -42,12 +42,87 @@ export interface UpstreamGroupInfo {
   hasDedicatedMultiplier?: boolean
 }
 
+export interface UpstreamSubscriptionInfo {
+  id: string
+  groupId: string
+  groupName: string
+  status: string
+  startsAt?: string
+  expiresAt?: string
+  rateMultiplier?: number | null
+  dailyLimitUsd?: number | null
+  weeklyLimitUsd?: number | null
+  monthlyLimitUsd?: number | null
+  dailyUsageUsd: number
+  weeklyUsageUsd: number
+  monthlyUsageUsd: number
+  dailyRemainingUsd?: number | null
+  weeklyRemainingUsd?: number | null
+  monthlyRemainingUsd?: number | null
+  /** 今日在日/周/月限额下最多还能消耗的额度 */
+  todayMaxConsumableUsd?: number | null
+}
+
 export interface UpstreamMetrics {
   balance: UpstreamMetricValue
   todayConsume: UpstreamMetricValue
   historyRecharge: UpstreamMetricValue
+  lifetimeConsume?: UpstreamMetricValue
   group: UpstreamGroupInfo
   groups: UpstreamGroupInfo[]
+  subscriptions?: UpstreamSubscriptionInfo[]
+}
+
+export type SettlementMode = 'prepaid_wallet' | 'credit_line'
+
+export interface SettlementSummary {
+  mode: SettlementMode | string
+  creditLimit?: number | null
+  settlementCurrency?: string
+  consumedCost: number
+  settledCost: number
+  outstanding: number
+  creditRemaining?: number | null
+  platformBalance?: number | null
+}
+
+export interface SettlementRecord {
+  id: string
+  siteId: string
+  amount: number
+  note: string
+  settledAt: string
+  status: 'active' | 'voided' | string
+  operatorUserId: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type LedgerKind =
+  | 'consume'
+  | 'topup_balance'
+  | 'topup_subscription'
+  | 'topup_manual'
+  | 'adjust'
+  | string
+
+export type LedgerStatus = 'confirmed' | 'pending' | 'voided' | string
+
+export interface LedgerRecord {
+  id: string
+  siteId: string
+  kind: LedgerKind
+  amountCost: number
+  amountPlatform?: number | null
+  source: 'auto' | 'manual' | 'hybrid' | string
+  status: LedgerStatus
+  businessDate: string
+  ref: string
+  note: string
+  operatorUserId: string
+  rechargeRateSnapshot?: number | null
+  createdAt: string
+  updatedAt: string
 }
 
 export interface NewApiSession {
@@ -68,6 +143,9 @@ export type UpstreamSession = NewApiSession | Sub2ApiSession
 
 export interface SiteSettings {
   balanceThreshold: number | null
+  settlementMode?: SettlementMode | string
+  creditLimit?: number | null
+  settlementCurrency?: string
 }
 
 export interface UpstreamSite {
@@ -85,6 +163,7 @@ export interface UpstreamSite {
   errorKey: string | null
   metrics: UpstreamMetrics
   settings: SiteSettings
+  settlement?: SettlementSummary | null
   session?: UpstreamSession | null
   lastSyncedAt: number | null
 }

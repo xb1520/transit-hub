@@ -7,6 +7,8 @@ import { DELTA_TEXT_CLASSES, METRIC_ICON_CLASSES, type DeltaDirection } from '..
 const props = defineProps<{
   label: string
   value: string
+  /** 双币种时的副金额（如 $…） */
+  secondaryValue?: string
   icon: Component
   color: DashboardColorToken
   deltaDirection: DeltaDirection
@@ -48,6 +50,12 @@ const deltaIcon = computed(() => {
       <div class="min-w-0">
         <p class="text-xs font-medium leading-5 text-muted-foreground sm:text-sm">{{ label }}</p>
         <p class="mt-2 break-words text-lg font-bold leading-tight tabular-nums text-foreground sm:text-xl xl:text-2xl">{{ value }}</p>
+        <p
+          v-if="secondaryValue"
+          class="mt-0.5 break-words text-xs font-medium tabular-nums text-muted-foreground sm:text-sm"
+        >
+          {{ secondaryValue }}
+        </p>
       </div>
       <div :class="['shrink-0 rounded-lg p-2 sm:p-2.5', iconClass]">
         <component :is="icon" class="h-4 w-4 sm:h-5 sm:w-5" aria-hidden="true" />

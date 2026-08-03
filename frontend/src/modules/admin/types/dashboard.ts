@@ -4,11 +4,13 @@
 /** 趋势图统计周期：周（最近 7 天）/ 月（最近 30 天）。 */
 export type DashboardPeriod = 'week' | 'month'
 
-/** 仪表盘的五个核心指标。 */
+/** 仪表盘核心指标。 */
 export type DashboardMetricKey =
   | 'todayProfit' // 今日营收
   | 'siteBalance' // 站点用户总余额
-  | 'todayPurchase' // 今日成本
+  | 'todayPurchase' // 今日成本（兼容字段，语义同 todayCost）
+  | 'todayCost' // 今日成本
+  | 'todayInbound' // 今日进货
   | 'netProfit' // 今日净利润
   | 'upstreamBalance' // 上游总余额
 

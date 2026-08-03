@@ -43,8 +43,9 @@ const (
 )
 
 // PriorityMode 控制策略是否同步上游账号/渠道的调度优先级。空值和 none 都保持旧行为；
-// multiplier 表示在健康状态优先的前提下，按 admin 分组原始倍率从低到高排序，并把排序结果
-// 映射为上游平台的 priority。使用字符串常量是为了兼容数据库中未来扩展其它排序模式。
+// multiplier 表示在健康状态优先的前提下，按上游成本倍率从低到高排序，并把排序结果
+// 映射为上游平台的 priority。成本倍率优先取 real_connections 绑定的上游 API Key 当前
+// 分组倍率；无法解析时回退到 admin 分组倍率。使用字符串常量是为了兼容数据库中未来扩展。
 const (
 	PriorityModeNone       = "none"
 	PriorityModeMultiplier = "multiplier"

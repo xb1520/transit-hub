@@ -21,7 +21,7 @@ func TestFetchSub2APIAdminUser_RequestPathAndAuthHeader(t *testing.T) {
 			"data": map[string]any{
 				"id": "42", "email": "sub2api@example.com", "username": "alice", "role": "member",
 				"status": "active", "balance": 12.5, "frozen_balance": 1.5,
-				"concurrency": 3, "rpm_limit": 60, "created_at": "2025-01-02T03:04:05Z",
+				"concurrency": 3, "rpm_limit": 60, "notes": "VIP 客户", "created_at": "2025-01-02T03:04:05Z",
 			},
 		})
 	}))
@@ -42,6 +42,9 @@ func TestFetchSub2APIAdminUser_RequestPathAndAuthHeader(t *testing.T) {
 	}
 	if user.ID != "42" || user.Email != "sub2api@example.com" || user.Username != "alice" || user.Role != "member" || user.Status != "active" {
 		t.Fatalf("unexpected parsed identity fields: %+v", user)
+	}
+	if user.Notes != "VIP 客户" {
+		t.Fatalf("expected notes 'VIP 客户', got %q", user.Notes)
 	}
 	if user.Balance == nil || *user.Balance != 12.5 {
 		t.Fatalf("expected balance 12.5, got %+v", user.Balance)

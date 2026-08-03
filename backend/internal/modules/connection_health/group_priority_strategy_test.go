@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"transithub/backend/internal/modules/my_sites"
 	"transithub/backend/internal/modules/upstream"
 )
 
@@ -481,6 +482,86 @@ func TestMultiplierPrioritySync_MissingConflictedTargetIsNotOverwritten(t *testi
 	}
 	if _, exists := repo.priorityStates["user1|ws1|"+stored.TargetID]; exists {
 		t.Fatal("unmanaged conflicted target should release its stale checkpoint without a remote write")
+	}
+}
+
+func TestMultiplierPrioritySync_UsesUpstreamKeyCostMultiplierWithinSameAdminGroup(t *testing.T) {
+	// 同一 admin 售卖分组下两条上游，售卖倍率都是 0.2，但上游 Key 成本分别是 0.1 / 0.2。
+	// 倍率排序必须按上游成本拉开 priority，不能因为 admin 分组倍率相同而并列。
+	repo := newFakeRepository()
+	priorityActions := &fakeTargetPriorityActioner{}
+	cheapPriority := 7
+	expensivePriority := 8
+	adminGroupMultiplier := 0.2
+	cheapUpstream := 0.1
+	expensiveUpstream := 0.2
+	mySites := fakeAdminGroupKeyReader{
+		fakeMySitesReader: fakeMySitesReader{
+			session: upstream.Session{Platform: upstream.PlatformSub2API},
+			connections: []my_sites.RealConnection{{
+				UserID: "user1", WorkspaceAdminAccountID: "ws1", UpstreamSiteID: "site-1",
+				UpstreamKeyID: "key-cheap", AdminAccountID: "100", AdminPlatform: string(upstream.PlatformSub2API),
+			}, {
+				UserID: "user1", WorkspaceAdminAccountID: "ws1", UpstreamSiteID: "site-1",
+				UpstreamKeyID: "key-expensive", AdminAccountID: "200", AdminPlatform: string(upstream.PlatformSub2API),
+			}},
+		},
+		keysBySite: map[string][]upstream.Sub2APIKeyItem{
+			"site-1": {
+				{ID: "key-cheap", GroupID: "up-cheap", GroupName: "cheap"},
+				{ID: "key-expensive", GroupID: "up-expensive", GroupName: "expensive"},
+			},
+		},
+	}
+	reader := fakePlatformGroupReader{
+		groups: []upstream.AdminGroupInfo{{ID: "g1", Name: "vip", Multiplier: &adminGroupMultiplier}},
+		accountsByGrp: map[string][]upstream.AdminGroupAccountInfo{
+			"g1": {
+				{ID: "100", Name: "cheap", Priority: &cheapPriority, Models: "gpt-4o"},
+				{ID: "200", Name: "expensive", Priority: &expensivePriority, Models: "gpt-4o"},
+			},
+		},
+	}
+	service := &Service{
+		repo: repo, mySites: mySites, platformGroups: reader, priorityActions: priorityActions,
+		sites: fakeSiteLookup{site: &upstream.Site{
+			ID: "site-1",
+			Metrics: upstream.Metrics{Groups: []upstream.GroupInfo{
+				{ID: "up-cheap", Name: "cheap", Multiplier: &cheapUpstream},
+				{ID: "up-expensive", Name: "expensive", Multiplier: &expensiveUpstream},
+			}},
+		}},
+	}
+	policy := Policy{
+		ID: "p1", UserID: "user1", AdminAccountID: "ws1", Enabled: true, PriorityMode: PriorityModeMultiplier,
+		ModelTargets: []ModelTarget{{ModelName: "gpt-4o", Enabled: true}},
+	}
+	assignment := GroupPolicyAssignment{UserID: "user1", AdminAccountID: "ws1", AdminGroupID: "g1", PolicyID: policy.ID}
+	// 两条目标都健康，确保只比价格档。
+	repo.states["sub2api:ws1:100"] = map[string]ConnectionHealthState{
+		"gpt-4o": {ConnectionID: "sub2api:ws1:100", ModelName: "gpt-4o", State: StateHealthy, CurrentWeight: 100, UserID: "user1", AdminAccountID: "ws1"},
+	}
+	repo.states["sub2api:ws1:200"] = map[string]ConnectionHealthState{
+		"gpt-4o": {ConnectionID: "sub2api:ws1:200", ModelName: "gpt-4o", State: StateHealthy, CurrentWeight: 100, UserID: "user1", AdminAccountID: "ws1"},
+	}
+
+	service.syncMultiplierPriorities(context.Background(), []Policy{policy}, nil, []GroupPolicyAssignment{assignment}, nil, nil)
+	if len(priorityActions.calls) != 2 {
+		t.Fatalf("expected both targets to receive managed priorities, calls=%+v", priorityActions.calls)
+	}
+	priorityByTarget := map[string]int{}
+	for _, call := range priorityActions.calls {
+		priorityByTarget[call.targetID] = call.priority
+	}
+	// Sub2API：数值越小越优先。0.1x 必须严格小于 0.2x。
+	if priorityByTarget["100"] >= priorityByTarget["200"] {
+		t.Fatalf("cheaper upstream must get better (smaller) Sub2API priority: cheap=%d expensive=%d calls=%+v",
+			priorityByTarget["100"], priorityByTarget["200"], priorityActions.calls)
+	}
+	cheapState := repo.priorityStates["user1|ws1|sub2api:ws1:100"]
+	expensiveState := repo.priorityStates["user1|ws1|sub2api:ws1:200"]
+	if cheapState.EffectiveMultiplier != cheapUpstream || expensiveState.EffectiveMultiplier != expensiveUpstream {
+		t.Fatalf("effective multipliers must come from upstream key groups: cheap=%+v expensive=%+v", cheapState, expensiveState)
 	}
 }
 

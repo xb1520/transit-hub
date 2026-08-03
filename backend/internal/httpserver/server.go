@@ -86,6 +86,16 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	upstreamCache := upstream.NewRedisSiteCache(redisClient)
 	upstreamService := upstream.NewService(platformService, upstreamRepository, groupRateSnapshotWriter{service: groupRatesService}, upstreamCache)
 	upstreamService.SetAdminAccountResolver(adminAccountsService)
+	settlementRepo := upstream.NewSettlementRepository(db)
+	if err := settlementRepo.EnsureSchema(context.Background()); err != nil {
+		panic(err)
+	}
+	upstreamService.SetSettlementRepository(settlementRepo)
+	ledgerRepo := upstream.NewLedgerRepository(db)
+	if err := ledgerRepo.EnsureSchema(context.Background()); err != nil {
+		panic(err)
+	}
+	upstreamService.SetLedgerRepository(ledgerRepo)
 	upstream.RegisterRoutes(server.mux, upstreamService, adminAccountsService)
 	mySitesService := my_sites.NewService(my_sites.NewRepository(db), platformService, upstreamService)
 	if err := mySitesService.EnsureSchema(context.Background()); err != nil {
@@ -259,8 +269,11 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 		applyRefreshConfig(strategy)
 	}
 
-	// 站点同步成功后检查余额预警和倍率变更，按配置发送通知。
+	// 站点同步成功后：进货/成本账本、余额预警、倍率变更通知、自动调价。
 	upstreamService.AfterSync = func(ctx context.Context, userID, adminAccountID, siteID, siteName string, oldMetrics, newMetrics upstream.Metrics) {
+		// 账本优先：与通知配置无关，始终记账。
+		upstreamService.ProcessLedgerAfterSync(ctx, userID, adminAccountID, siteID, oldMetrics, newMetrics)
+
 		strategy, err := settingsService.GetFirstStrategy(ctx)
 		if err != nil {
 			return
@@ -577,9 +590,13 @@ func checkBalanceWarning(ctx context.Context, svc *settings.Service, uSvc *upstr
 	newBalCNY := *newMetrics.Balance.Value * rechargeRate
 
 	// 站点级阈值覆盖：有值则用站点配置，否则使用全局默认（均为 CNY）。
+	// 阈值为负数（如 -1）表示该站关闭余额预警（弃用站等场景）。
 	threshold := strategy.DefaultBalanceThreshold
 	if site.Settings.BalanceThreshold != nil {
 		threshold = *site.Settings.BalanceThreshold
+	}
+	if threshold < 0 {
+		return
 	}
 
 	if newBalCNY >= threshold {

@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Search, Plus, CheckCircle2, XCircle, X, Loader2, AlertCircle, Trash2, Edit2, LayoutGrid, List, RefreshCw, Settings2 } from 'lucide-vue-next'
+import { Search, Plus, CheckCircle2, XCircle, X, Loader2, AlertCircle, Trash2, Edit2, LayoutGrid, List, RefreshCw, Settings2, Receipt, PackagePlus } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tooltip } from '@/components/ui/tooltip'
 import { getStrategySettings } from '../api/settings'
 import { useUpstreamSites } from '../composables/useUpstreamSites'
 import SiteSettingsModal from '../components/upstream/SiteSettingsModal.vue'
-import type { UpstreamGroupInfo, UpstreamMetricValue, UpstreamSite, UpstreamSiteForm, UpstreamStatus } from '../types/upstream'
+import SettlementModal from '../components/upstream/SettlementModal.vue'
+import LedgerModal from '../components/upstream/LedgerModal.vue'
+import SubscriptionTopupModal from '../components/upstream/SubscriptionTopupModal.vue'
+import type { UpstreamGroupInfo, UpstreamMetricValue, UpstreamSite, UpstreamSiteForm, UpstreamStatus, UpstreamSubscriptionInfo } from '../types/upstream'
 
 const { t, locale } = useI18n()
 
@@ -22,8 +25,26 @@ const refreshIntervalSeconds = ref<number | null>(null)
 const remainingSeconds = ref(0)
 let countdownTimer: ReturnType<typeof window.setInterval> | null = null
 const nextRefreshAtStorageKey = 'transit-hub:upstream-next-refresh-at'
+const viewModeStorageKey = 'transit-hub:upstream-view-mode'
 
-const viewMode = ref<'card' | 'list'>('card')
+type ViewMode = 'card' | 'list'
+const readStoredViewMode = (): ViewMode => {
+  try {
+    const raw = window.localStorage.getItem(viewModeStorageKey)
+    return raw === 'list' ? 'list' : 'card'
+  } catch {
+    return 'card'
+  }
+}
+const viewMode = ref<ViewMode>(readStoredViewMode())
+const setViewMode = (mode: ViewMode) => {
+  viewMode.value = mode
+  try {
+    window.localStorage.setItem(viewModeStorageKey, mode)
+  } catch {
+    // 隐私模式等写失败时忽略
+  }
+}
 
 const countdownDisplay = computed(() => {
   if (!refreshIntervalSeconds.value) return t('admin.upstream.refresh.disabled')
@@ -167,13 +188,97 @@ const confirmDeleteSite = async () => {
   }
 }
 
+type SortKey = 'default' | 'balance' | 'todayConsume' | 'historyRecharge'
+type SortDir = 'asc' | 'desc'
+
+const sortStorageKey = 'transit-hub:upstream-sort'
+const validSortKeys: SortKey[] = ['default', 'balance', 'todayConsume', 'historyRecharge']
+
+const readStoredSort = (): { key: SortKey; dir: SortDir } => {
+  try {
+    const raw = window.localStorage.getItem(sortStorageKey)
+    if (!raw) return { key: 'default', dir: 'desc' }
+    const parsed = JSON.parse(raw) as { key?: string; dir?: string }
+    const key = validSortKeys.includes(parsed.key as SortKey) ? (parsed.key as SortKey) : 'default'
+    const dir: SortDir = parsed.dir === 'asc' ? 'asc' : 'desc'
+    return { key, dir }
+  } catch {
+    return { key: 'default', dir: 'desc' }
+  }
+}
+
+const storedSort = readStoredSort()
+const sortKey = ref<SortKey>(storedSort.key)
+const sortDir = ref<SortDir>(storedSort.dir)
+
+const persistSort = () => {
+  try {
+    window.localStorage.setItem(sortStorageKey, JSON.stringify({ key: sortKey.value, dir: sortDir.value }))
+  } catch {
+    // 隐私模式等写失败时忽略，不影响当前会话排序。
+  }
+}
+
+/** 成本口径 CNY：平台原始 value × rechargeRate；无效时返回 null 排后。 */
+const costCnyValue = (site: UpstreamSite, metric: UpstreamMetricValue): number | null => {
+  if (metric.value === null || !Number.isFinite(metric.value)) return null
+  if (site.rechargeRate <= 0 || !Number.isFinite(site.rechargeRate)) return null
+  return metric.value * site.rechargeRate
+}
+
+const toggleSort = (key: Exclude<SortKey, 'default'>) => {
+  if (sortKey.value === key) {
+    sortDir.value = sortDir.value === 'desc' ? 'asc' : 'desc'
+  } else {
+    sortKey.value = key
+    sortDir.value = 'desc'
+  }
+  persistSort()
+}
+
 const filteredSites = computed(() => {
-  if (!searchQuery.value) return upstreamSites.value
-  return upstreamSites.value.filter(site =>
-    site.name.toLowerCase().includes(searchQuery.value.toLowerCase())
-    || site.baseUrl.toLowerCase().includes(searchQuery.value.toLowerCase())
-  )
+  const q = searchQuery.value.trim().toLowerCase()
+  let list = upstreamSites.value
+  if (q) {
+    list = list.filter(site =>
+      site.name.toLowerCase().includes(q) || site.baseUrl.toLowerCase().includes(q),
+    )
+  }
+  if (sortKey.value === 'default') return list
+
+  const metricOf = (site: UpstreamSite): UpstreamMetricValue => {
+    if (sortKey.value === 'todayConsume') return site.metrics.todayConsume
+    if (sortKey.value === 'historyRecharge') return site.metrics.historyRecharge
+    return site.metrics.balance
+  }
+  const dir = sortDir.value === 'asc' ? 1 : -1
+  return [...list].sort((a, b) => {
+    const av = costCnyValue(a, metricOf(a))
+    const bv = costCnyValue(b, metricOf(b))
+    if (av == null && bv == null) return 0
+    if (av == null) return 1
+    if (bv == null) return -1
+    if (av === bv) return 0
+    return av > bv ? dir : -dir
+  })
 })
+
+const subscriptionSummary = (site: UpstreamSite): string => {
+  const subs = site.metrics.subscriptions ?? []
+  if (!subs.length) return '—'
+  const active = subs.filter(s => s.status === 'active')
+  const first = active[0] ?? subs[0]
+  const max = first.todayMaxConsumableUsd
+  if (max != null) {
+    return t('admin.upstream.subscriptions.listSummaryMax', {
+      count: subs.length,
+      max: max.toFixed(1),
+    })
+  }
+  return t('admin.upstream.subscriptions.listSummary', { count: subs.length })
+}
+
+const isCreditLine = (site: UpstreamSite) => site.settings.settlementMode === 'credit_line'
 
 const statusClasses: Record<UpstreamStatus, string> = {
   connecting: 'bg-primary/10 text-primary border-primary/20',
@@ -213,11 +318,56 @@ const closeSiteSettings = () => {
   selectedSiteForSettings.value = null
 }
 
-const onSiteSettingsSaved = (siteId: string, settings: { balanceThreshold: number | null }) => {
+const onSiteSettingsSaved = (siteId: string, settings: UpstreamSite['settings']) => {
   const site = upstreamSites.value.find(s => s.id === siteId)
   if (site) {
-    site.settings = settings
+    site.settings = { ...site.settings, ...settings }
   }
+}
+
+const isSettlementOpen = ref(false)
+const selectedSiteForSettlement = ref<UpstreamSite | null>(null)
+const openSettlement = (site: UpstreamSite) => {
+  selectedSiteForSettlement.value = site
+  isSettlementOpen.value = true
+}
+const closeSettlement = () => {
+  isSettlementOpen.value = false
+  selectedSiteForSettlement.value = null
+}
+const onSettlementUpdated = async () => {
+  await streamRefreshSites()
+}
+
+const isLedgerOpen = ref(false)
+const selectedSiteForLedger = ref<UpstreamSite | null>(null)
+const openLedger = (site: UpstreamSite) => {
+  selectedSiteForLedger.value = site
+  isLedgerOpen.value = true
+}
+const closeLedger = () => {
+  isLedgerOpen.value = false
+  selectedSiteForLedger.value = null
+}
+const onLedgerUpdated = async () => {
+  // 进货流水不强制全量同步，关闭后由仪表盘下次刷新体现
+}
+
+const isSubscriptionTopupOpen = ref(false)
+const selectedSiteForSubscriptionTopup = ref<UpstreamSite | null>(null)
+const selectedSubscriptionForTopup = ref<UpstreamSubscriptionInfo | null>(null)
+const openSubscriptionTopup = (site: UpstreamSite, sub: UpstreamSubscriptionInfo) => {
+  selectedSiteForSubscriptionTopup.value = site
+  selectedSubscriptionForTopup.value = sub
+  isSubscriptionTopupOpen.value = true
+}
+const closeSubscriptionTopup = () => {
+  isSubscriptionTopupOpen.value = false
+  selectedSiteForSubscriptionTopup.value = null
+  selectedSubscriptionForTopup.value = null
+}
+const onSubscriptionTopupUpdated = () => {
+  // 进货记入开通/续费日；仪表盘下次刷新即可看到对应日进货
 }
 
 const groupedGroups = computed<Record<string, UpstreamGroupInfo[]>>(() => {
@@ -284,7 +434,7 @@ onBeforeUnmount(() => {
         <div class="flex shrink-0 items-center rounded-lg border border-border/50 bg-surface p-1" role="group" :aria-label="t('admin.upstream.viewMode.list')">
           <button
             type="button"
-            @click="viewMode = 'list'"
+            @click="setViewMode('list')"
             :class="{'bg-card shadow-sm text-foreground': viewMode === 'list', 'text-muted-foreground hover:text-foreground': viewMode !== 'list'}"
             class="rounded-md p-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             :title="t('admin.upstream.viewMode.list')"
@@ -295,7 +445,7 @@ onBeforeUnmount(() => {
           </button>
           <button
             type="button"
-            @click="viewMode = 'card'"
+            @click="setViewMode('card')"
             :class="{'bg-card shadow-sm text-foreground': viewMode === 'card', 'text-muted-foreground hover:text-foreground': viewMode !== 'card'}"
             class="rounded-md p-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             :title="t('admin.upstream.viewMode.card')"
@@ -303,6 +453,20 @@ onBeforeUnmount(() => {
             :aria-pressed="viewMode === 'card'"
           >
             <LayoutGrid class="w-4 h-4" />
+          </button>
+        </div>
+        <div class="flex h-10 items-center gap-1 rounded-xl border border-border/50 bg-surface px-2 text-xs">
+          <span class="px-1 text-muted-foreground whitespace-nowrap">{{ t('admin.upstream.sort.label') }}</span>
+          <button
+            v-for="key in (['balance', 'todayConsume', 'historyRecharge'] as const)"
+            :key="key"
+            type="button"
+            class="rounded-md px-2 py-1 transition-colors whitespace-nowrap"
+            :class="sortKey === key ? 'bg-card text-foreground shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground'"
+            @click="toggleSort(key)"
+          >
+            {{ t(`admin.upstream.sort.${key}`) }}
+            <span v-if="sortKey === key" class="ml-0.5">{{ sortDir === 'desc' ? '↓' : '↑' }}</span>
           </button>
         </div>
         <div class="hidden md:flex h-10 items-center rounded-xl border border-border/50 bg-surface px-3 text-xs text-muted-foreground whitespace-nowrap">
@@ -362,9 +526,17 @@ onBeforeUnmount(() => {
                 <a :href="site.baseUrl" target="_blank" rel="noopener noreferrer" class="font-semibold text-lg text-foreground hover:text-primary transition-colors cursor-pointer truncate" :title="site.name">
                   {{ site.name }}
                 </a>
-                <span class="px-2 py-0.5 mt-1 rounded-md bg-primary/10 text-primary border border-primary/20 text-[10px] font-bold uppercase tracking-wider w-fit">
-                  {{ t(`admin.upstream.modal.form.platforms.${site.platform}`) }}
-                </span>
+                <div class="mt-1 flex flex-wrap items-center gap-1">
+                  <span class="px-2 py-0.5 rounded-md bg-primary/10 text-primary border border-primary/20 text-[10px] font-bold uppercase tracking-wider w-fit">
+                    {{ t(`admin.upstream.modal.form.platforms.${site.platform}`) }}
+                  </span>
+                  <span
+                    v-if="site.settings.settlementMode === 'credit_line'"
+                    class="px-2 py-0.5 rounded-md bg-warning/10 text-warning border border-warning/20 text-[10px] font-bold tracking-wider w-fit"
+                  >
+                    {{ t('admin.upstream.badges.creditLine') }}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -382,46 +554,76 @@ onBeforeUnmount(() => {
 
         <!-- Card Body (Stats) -->
         <div class="space-y-4">
-          <div class="grid grid-cols-3 gap-3">
-            <div class="flex flex-col items-center justify-center p-3 rounded-xl bg-surface/50 border border-border/40">
-              <span class="text-xs text-muted-foreground mb-1">{{ t('admin.upstream.fields.balance') }}</span>
-              <span v-if="cnyMetricDisplay(site, site.metrics.balance)" class="font-bold text-primary text-sm text-center">
+          <!--
+            指标区用固定高度 + nowrap：大额（如 9818 CNY）换行会把格子撑高，
+            导致同行「查看可用分组」Y 轴错位。
+          -->
+          <div class="grid h-[6.25rem] grid-cols-3 gap-3">
+            <div class="flex h-full flex-col items-center justify-center overflow-hidden rounded-xl border border-border/40 bg-surface/50 px-1.5 py-2">
+              <span class="mb-0.5 max-w-full truncate text-[11px] text-muted-foreground">
+                {{ isCreditLine(site) ? t('admin.upstream.fields.platformBalance') : t('admin.upstream.fields.balance') }}
+              </span>
+              <span
+                v-if="cnyMetricDisplay(site, site.metrics.balance)"
+                class="max-w-full truncate text-center text-xs font-bold leading-tight text-primary sm:text-sm"
+              >
                 {{ cnyMetricDisplay(site, site.metrics.balance) }}
               </span>
-              <span :class="[cnyMetricDisplay(site, site.metrics.balance) ? 'text-[10px] font-medium text-primary/70 mt-0.5' : 'font-bold text-primary text-sm', 'text-center']">
+              <span
+                class="mt-0.5 max-w-full truncate text-center text-[10px] font-medium leading-tight"
+                :class="cnyMetricDisplay(site, site.metrics.balance) ? 'text-primary/70' : 'text-sm font-bold text-primary'"
+              >
                 {{ usdMetricDisplay(site.metrics.balance) }}
               </span>
+              <span class="mt-0.5 h-3 max-w-full truncate text-center text-[10px] leading-3 text-muted-foreground">
+                {{ isCreditLine(site) ? t('admin.upstream.fields.platformBalanceHint') : '\u00a0' }}
+              </span>
             </div>
-            <div class="flex flex-col items-center justify-center p-3 rounded-xl bg-surface/50 border border-border/40">
-              <span class="text-xs text-muted-foreground mb-1">{{ t('admin.upstream.fields.todayConsume') }}</span>
-              <span v-if="cnyMetricDisplay(site, site.metrics.todayConsume)" :class="['font-bold text-sm text-center', site.metrics.todayConsume.value && site.metrics.todayConsume.value > 0 ? 'text-orange-500' : 'text-foreground']">
+            <div class="flex h-full flex-col items-center justify-center overflow-hidden rounded-xl border border-border/40 bg-surface/50 px-1.5 py-2">
+              <span class="mb-0.5 max-w-full truncate text-[11px] text-muted-foreground">{{ t('admin.upstream.fields.todayConsume') }}</span>
+              <span
+                v-if="cnyMetricDisplay(site, site.metrics.todayConsume)"
+                class="max-w-full truncate text-center text-xs font-bold leading-tight sm:text-sm"
+                :class="site.metrics.todayConsume.value && site.metrics.todayConsume.value > 0 ? 'text-orange-500' : 'text-foreground'"
+              >
                 {{ cnyMetricDisplay(site, site.metrics.todayConsume) }}
               </span>
-              <span :class="[cnyMetricDisplay(site, site.metrics.todayConsume) ? 'text-[10px] font-medium mt-0.5' : 'font-bold text-sm', site.metrics.todayConsume.value && site.metrics.todayConsume.value > 0 ? (cnyMetricDisplay(site, site.metrics.todayConsume) ? 'text-orange-500/70' : 'text-orange-500') : (cnyMetricDisplay(site, site.metrics.todayConsume) ? 'text-muted-foreground' : 'text-foreground'), 'text-center']">
+              <span
+                class="mt-0.5 max-w-full truncate text-center text-[10px] font-medium leading-tight"
+                :class="site.metrics.todayConsume.value && site.metrics.todayConsume.value > 0 ? 'text-orange-500/70' : 'text-muted-foreground'"
+              >
                 {{ usdMetricDisplay(site.metrics.todayConsume) }}
               </span>
+              <span class="mt-0.5 h-3 text-[10px] leading-3">&nbsp;</span>
             </div>
-            <div class="flex flex-col items-center justify-center p-3 rounded-xl bg-surface/50 border border-border/40">
-              <span class="text-xs text-muted-foreground mb-1">{{ t('admin.upstream.fields.historyRecharge') }}</span>
-              <span v-if="cnyMetricDisplay(site, site.metrics.historyRecharge)" class="font-bold text-foreground text-sm text-center">
+            <div class="flex h-full flex-col items-center justify-center overflow-hidden rounded-xl border border-border/40 bg-surface/50 px-1.5 py-2">
+              <span class="mb-0.5 max-w-full truncate text-[11px] text-muted-foreground">{{ t('admin.upstream.fields.historyRecharge') }}</span>
+              <span
+                v-if="cnyMetricDisplay(site, site.metrics.historyRecharge)"
+                class="max-w-full truncate text-center text-xs font-bold leading-tight text-foreground sm:text-sm"
+              >
                 {{ cnyMetricDisplay(site, site.metrics.historyRecharge) }}
               </span>
-              <span :class="[cnyMetricDisplay(site, site.metrics.historyRecharge) ? 'text-[10px] font-medium text-muted-foreground mt-0.5' : 'font-bold text-foreground text-sm', 'text-center']">
+              <span class="mt-0.5 max-w-full truncate text-center text-[10px] font-medium leading-tight text-muted-foreground">
                 {{ usdMetricDisplay(site.metrics.historyRecharge) }}
               </span>
+              <span class="mt-0.5 h-3 text-[10px] leading-3">&nbsp;</span>
             </div>
           </div>
 
-          <Button
-            v-if="site.metrics.groups.length > 0"
-            variant="secondary"
-            class="w-full h-9 text-xs font-medium bg-surface hover:bg-surface-elevated border-border/50 border"
-            @click="openGroupsModal(site)"
-          >
-            {{ t('admin.upstream.fields.viewAvailableGroups') }}
-          </Button>
+          <!-- 固定高度槽，保证同行卡片按钮同一 Y -->
+          <div class="h-9 shrink-0">
+            <Button
+              v-if="site.metrics.groups.length > 0"
+              variant="secondary"
+              class="h-9 w-full border border-border/50 bg-surface text-xs font-medium hover:bg-surface-elevated"
+              @click="openGroupsModal(site)"
+            >
+              {{ t('admin.upstream.fields.viewAvailableGroups') }}
+            </Button>
+          </div>
 
-          <!-- Card Actions (Edit/Delete) -->
+          <!-- Card Actions -->
           <div class="flex items-center justify-between gap-3 pt-4 mt-2 border-t border-border/40">
             <div class="min-w-0 text-left text-[11px] leading-5 text-muted-foreground">
               <span class="block truncate">{{ t('admin.upstream.fields.lastUpdated') }}</span>
@@ -448,6 +650,15 @@ onBeforeUnmount(() => {
                   <Settings2 class="h-4 w-4" />
                 </button>
               </Tooltip>
+              <Tooltip :text="t('admin.upstream.ledger.open')">
+                <button
+                  type="button"
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border/60 text-muted-foreground transition-colors hover:border-primary/60 hover:bg-primary/10 hover:text-primary"
+                  @click="openLedger(site)"
+                >
+                  <PackagePlus class="h-4 w-4" />
+                </button>
+              </Tooltip>
               <Tooltip :text="t('admin.upstream.action.edit')">
                 <button
                   type="button"
@@ -468,6 +679,91 @@ onBeforeUnmount(() => {
               </Tooltip>
             </div>
           </div>
+
+          <!-- 扩展槽：固定在操作栏下方，有内容才显示，结构统一 -->
+          <div
+            v-if="isCreditLine(site) || (site.metrics.subscriptions?.length ?? 0) > 0"
+            class="mt-3 space-y-2 border-t border-border/30 pt-3"
+          >
+            <div
+              v-if="isCreditLine(site)"
+              class="rounded-xl border border-warning/30 bg-warning/5 px-3 py-2 text-xs"
+            >
+              <template v-if="site.settlement">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-medium text-warning">{{ t('admin.upstream.settlement.outstanding') }}</span>
+                  <span class="font-semibold text-foreground">{{ site.settlement.outstanding.toFixed(2) }}</span>
+                </div>
+                <div class="mt-1 flex justify-between text-muted-foreground">
+                  <span>{{ t('admin.upstream.settlement.settled') }} {{ site.settlement.settledCost.toFixed(2) }}</span>
+                  <span>{{ t('admin.upstream.settlement.consumed') }} {{ site.settlement.consumedCost.toFixed(2) }}</span>
+                </div>
+              </template>
+              <p v-else class="text-muted-foreground">{{ t('admin.upstream.settlement.loadingSummary') }}</p>
+              <Button variant="secondary" class="mt-2 h-8 w-full text-xs" @click="openSettlement(site)">
+                <Receipt class="mr-1 h-3.5 w-3.5" />
+                {{ t('admin.upstream.settlement.open') }}
+              </Button>
+            </div>
+
+            <div
+              v-if="site.metrics.subscriptions?.length"
+              class="rounded-xl border border-border/50 bg-surface/40 px-3 py-2 text-xs space-y-2"
+            >
+              <div class="font-medium text-foreground">{{ t('admin.upstream.subscriptions.title') }}</div>
+              <div v-for="sub in site.metrics.subscriptions" :key="sub.id" class="border-t border-border/30 pt-2 first:border-0 first:pt-0">
+                <div class="flex justify-between gap-2">
+                  <span class="font-medium truncate">{{ sub.groupName }}</span>
+                  <span class="shrink-0 text-muted-foreground">{{ sub.status }}</span>
+                </div>
+                <div
+                  v-if="sub.todayMaxConsumableUsd != null"
+                  class="mt-1.5 rounded-lg bg-primary/10 px-2 py-1 font-medium text-primary"
+                >
+                  {{ t('admin.upstream.subscriptions.todayMax') }}:
+                  {{ sub.todayMaxConsumableUsd.toFixed(2) }} USD
+                  <span class="ml-1 font-normal opacity-80">（{{ t('admin.upstream.subscriptions.todayMaxHint') }}）</span>
+                </div>
+                <div class="mt-1 space-y-0.5 text-muted-foreground">
+                  <div v-if="sub.dailyLimitUsd != null">
+                    {{ t('admin.upstream.subscriptions.daily') }}:
+                    {{ t('admin.upstream.subscriptions.usedOfLimit', { used: sub.dailyUsageUsd.toFixed(2), limit: sub.dailyLimitUsd }) }}
+                    <template v-if="sub.dailyRemainingUsd != null">
+                      · {{ t('admin.upstream.subscriptions.remaining') }} {{ sub.dailyRemainingUsd.toFixed(2) }}
+                    </template>
+                  </div>
+                  <div v-if="sub.weeklyLimitUsd != null">
+                    {{ t('admin.upstream.subscriptions.weekly') }}:
+                    {{ t('admin.upstream.subscriptions.usedOfLimit', { used: sub.weeklyUsageUsd.toFixed(2), limit: sub.weeklyLimitUsd }) }}
+                    <template v-if="sub.weeklyRemainingUsd != null">
+                      · {{ t('admin.upstream.subscriptions.remaining') }} {{ sub.weeklyRemainingUsd.toFixed(2) }}
+                    </template>
+                  </div>
+                  <div v-if="sub.monthlyLimitUsd != null">
+                    {{ t('admin.upstream.subscriptions.monthly') }}:
+                    {{ t('admin.upstream.subscriptions.usedOfLimit', { used: sub.monthlyUsageUsd.toFixed(2), limit: sub.monthlyLimitUsd }) }}
+                    <template v-if="sub.monthlyRemainingUsd != null">
+                      · {{ t('admin.upstream.subscriptions.remaining') }} {{ sub.monthlyRemainingUsd.toFixed(2) }}
+                    </template>
+                  </div>
+                </div>
+                <div v-if="sub.startsAt" class="mt-1 text-muted-foreground">
+                  {{ t('admin.upstream.subscriptions.starts') }}: {{ new Date(sub.startsAt).toLocaleDateString() }}
+                </div>
+                <div v-if="sub.expiresAt" class="mt-1 text-muted-foreground">
+                  {{ t('admin.upstream.subscriptions.expires') }}: {{ new Date(sub.expiresAt).toLocaleDateString() }}
+                </div>
+                <Button
+                  variant="secondary"
+                  class="mt-2 h-7 w-full text-[11px]"
+                  @click="openSubscriptionTopup(site, sub)"
+                >
+                  <PackagePlus class="mr-1 h-3.5 w-3.5" />
+                  {{ t('admin.upstream.subscriptions.topup') }}
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div v-if="site.errorKey" class="mt-4 flex items-start gap-2 rounded-xl border border-warning/20 bg-warning/10 px-3 py-2 text-xs text-warning">
@@ -483,18 +779,30 @@ onBeforeUnmount(() => {
         <table class="w-full text-sm text-left">
           <thead class="bg-surface/50 text-muted-foreground border-b border-border/40">
             <tr>
-              <th class="px-6 py-4 font-medium">{{ t('admin.upstream.fields.siteName') }}</th>
-              <th class="px-6 py-4 font-medium">{{ t('admin.upstream.fields.platform') }}</th>
-              <th class="px-6 py-4 font-medium">{{ t('admin.upstream.status.connected') }}</th>
-              <th class="px-6 py-4 font-medium">{{ t('admin.upstream.fields.balance') }}</th>
-              <th class="px-6 py-4 font-medium">{{ t('admin.upstream.fields.todayConsume') }}</th>
-              <th class="px-6 py-4 font-medium">{{ t('admin.upstream.fields.historyRecharge') }}</th>
-              <th class="px-6 py-4 font-medium text-right">{{ t('admin.upstream.action.actions') }}</th>
+              <th class="px-4 py-4 font-medium">{{ t('admin.upstream.fields.siteName') }}</th>
+              <th class="px-4 py-4 font-medium">{{ t('admin.upstream.fields.platform') }}</th>
+              <th class="px-4 py-4 font-medium">{{ t('admin.upstream.status.connected') }}</th>
+              <th class="px-4 py-4 font-medium cursor-pointer select-none hover:text-foreground" @click="toggleSort('balance')">
+                {{ t('admin.upstream.fields.balance') }}
+                <span v-if="sortKey === 'balance'">{{ sortDir === 'desc' ? '↓' : '↑' }}</span>
+              </th>
+              <th class="px-4 py-4 font-medium cursor-pointer select-none hover:text-foreground" @click="toggleSort('todayConsume')">
+                {{ t('admin.upstream.fields.todayConsume') }}
+                <span v-if="sortKey === 'todayConsume'">{{ sortDir === 'desc' ? '↓' : '↑' }}</span>
+              </th>
+              <th class="px-4 py-4 font-medium cursor-pointer select-none hover:text-foreground" @click="toggleSort('historyRecharge')">
+                {{ t('admin.upstream.fields.historyRecharge') }}
+                <span v-if="sortKey === 'historyRecharge'">{{ sortDir === 'desc' ? '↓' : '↑' }}</span>
+              </th>
+              <th class="px-4 py-4 font-medium">{{ t('admin.upstream.fields.settlementModeCol') }}</th>
+              <th class="px-4 py-4 font-medium">{{ t('admin.upstream.settlement.outstanding') }}</th>
+              <th class="px-4 py-4 font-medium">{{ t('admin.upstream.subscriptions.title') }}</th>
+              <th class="px-4 py-4 font-medium text-right">{{ t('admin.upstream.action.actions') }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-border/40">
             <tr v-for="site in filteredSites" :key="site.id" class="hover:bg-surface/30 transition-colors">
-              <td class="px-6 py-4">
+              <td class="px-4 py-4">
                 <div class="flex items-center gap-3">
                   <div :class="['w-8 h-8 rounded-lg flex items-center justify-center font-bold text-sm shrink-0', site.logoBg]">
                     {{ site.logo }}
@@ -504,7 +812,7 @@ onBeforeUnmount(() => {
                   </a>
                 </div>
               </td>
-              <td class="px-6 py-4">
+              <td class="px-4 py-4">
                 <span class="px-2 py-1 rounded-md bg-primary/10 text-primary border border-primary/20 text-xs font-semibold uppercase tracking-wider">
                   {{ t(`admin.upstream.modal.form.platforms.${site.platform}`) }}
                 </span>
@@ -557,7 +865,7 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
               </td>
-              <td class="px-6 py-4">
+              <td class="px-4 py-4">
                 <div class="flex flex-col gap-0.5">
                   <span v-if="cnyMetricDisplay(site, site.metrics.historyRecharge)" class="font-medium text-muted-foreground">
                     {{ cnyMetricDisplay(site, site.metrics.historyRecharge) }}
@@ -567,7 +875,35 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
               </td>
-              <td class="px-6 py-4 text-right">
+              <td class="px-4 py-4">
+                <span
+                  class="inline-flex rounded-md border px-2 py-0.5 text-[11px] font-medium"
+                  :class="isCreditLine(site) ? 'border-warning/30 bg-warning/10 text-warning' : 'border-border/50 text-muted-foreground'"
+                >
+                  {{ isCreditLine(site) ? t('admin.upstream.badges.creditLine') : t('admin.upstream.siteSettings.modePrepaid') }}
+                </span>
+              </td>
+              <td class="px-4 py-4">
+                <template v-if="isCreditLine(site)">
+                  <button
+                    type="button"
+                    class="text-left hover:text-primary"
+                    @click="openSettlement(site)"
+                  >
+                    <div class="font-medium text-warning">
+                      {{ site.settlement ? site.settlement.outstanding.toFixed(2) : '—' }}
+                    </div>
+                    <div v-if="site.settlement" class="text-[11px] text-muted-foreground">
+                      {{ t('admin.upstream.settlement.settled') }} {{ site.settlement.settledCost.toFixed(2) }}
+                    </div>
+                  </button>
+                </template>
+                <span v-else class="text-muted-foreground">—</span>
+              </td>
+              <td class="px-4 py-4 text-xs text-muted-foreground max-w-[160px]">
+                {{ subscriptionSummary(site) }}
+              </td>
+              <td class="px-4 py-4 text-right">
                 <div class="flex items-center justify-end gap-2">
                   <Button
                     v-if="site.metrics.groups.length > 0"
@@ -595,6 +931,14 @@ onBeforeUnmount(() => {
                       <Settings2 class="w-4 h-4" />
                     </button>
                   </Tooltip>
+                  <Tooltip :text="t('admin.upstream.ledger.open')">
+                    <button
+                      class="p-1.5 rounded-md text-muted-foreground hover:bg-primary/10 hover:text-primary transition-colors"
+                      @click="openLedger(site)"
+                    >
+                      <PackagePlus class="w-4 h-4" />
+                    </button>
+                  </Tooltip>
                   <Tooltip :text="t('admin.upstream.action.edit')">
                     <button
                       class="p-1.5 rounded-md text-muted-foreground hover:bg-primary/10 hover:text-primary transition-colors"
@@ -615,7 +959,7 @@ onBeforeUnmount(() => {
               </td>
             </tr>
             <tr v-if="filteredSites.length === 0">
-              <td colspan="7" class="px-6 py-12 text-center text-muted-foreground">
+              <td colspan="10" class="px-6 py-12 text-center text-muted-foreground">
                 {{ t('admin.upstream.empty.description') }}
               </td>
             </tr>
@@ -1025,6 +1369,25 @@ onBeforeUnmount(() => {
       :site="selectedSiteForSettings"
       @close="closeSiteSettings"
       @saved="onSiteSettingsSaved"
+    />
+    <SettlementModal
+      :open="isSettlementOpen"
+      :site="selectedSiteForSettlement"
+      @close="closeSettlement"
+      @updated="onSettlementUpdated"
+    />
+    <LedgerModal
+      :open="isLedgerOpen"
+      :site="selectedSiteForLedger"
+      @close="closeLedger"
+      @updated="onLedgerUpdated"
+    />
+    <SubscriptionTopupModal
+      :open="isSubscriptionTopupOpen"
+      :site="selectedSiteForSubscriptionTopup"
+      :subscription="selectedSubscriptionForTopup"
+      @close="closeSubscriptionTopup"
+      @updated="onSubscriptionTopupUpdated"
     />
   </div>
 </template>

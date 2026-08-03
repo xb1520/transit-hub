@@ -1,0 +1,320 @@
+{
+  "backend/internal/modules/connection_health/types.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 0,
+    "source": "after_snapshots",
+    "len": 11872
+  },
+  "backend/internal/modules/upstream/platform_service.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 111905
+  },
+  "frontend/src/locales/zh-CN.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 91547
+  },
+  "backend/internal/modules/dashboard/metrics_service.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 15,
+    "source": "after_snapshots",
+    "len": 26217
+  },
+  "frontend/src/locales/en-US.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 135431
+  },
+  "backend/internal/modules/dashboard/metrics_service_upstream_drilldown_test.go": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 2,
+    "source": "after_snapshots",
+    "len": 5708
+  },
+  "backend/internal/modules/upstream/service.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 35855
+  },
+  "backend/internal/modules/connection_health/priority_strategy.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 0,
+    "source": "after_snapshots",
+    "len": 18008
+  },
+  "backend/internal/modules/connection_health/group_priority_strategy_test.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 0,
+    "source": "after_snapshots",
+    "len": 36721
+  },
+  "backend/internal/modules/upstream/business_time_test.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 0,
+    "source": "after_snapshots",
+    "len": 1647
+  },
+  "backend/internal/modules/upstream/business_time.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 0,
+    "source": "after_snapshots",
+    "len": 1814
+  },
+  "scripts/local_docker_override.py": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 18930
+  },
+  "scripts/repair_dashboard_daily_stats.py": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 2,
+    "source": "after_snapshots",
+    "len": 16315
+  },
+  "frontend/src/modules/admin/components/upstream/SiteSettingsModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 9312
+  },
+  "frontend/src/modules/admin/api/dashboardAdmin.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 14,
+    "source": "after_snapshots",
+    "len": 7540
+  },
+  "frontend/src/modules/admin/views/UpstreamView.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 70581
+  },
+  "frontend/src/modules/admin/views/DashboardView.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 14,
+    "source": "after_snapshots",
+    "len": 48363
+  },
+  "backend/internal/modules/dashboard/metrics_types.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 14,
+    "source": "after_snapshots",
+    "len": 7471
+  },
+  "frontend/src/modules/admin/types/upstream.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 4771
+  },
+  "backend/internal/modules/upstream/types.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 16928
+  },
+  "backend/internal/modules/upstream/platform_service_sub2api_groups_test.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 12,
+    "source": "after_snapshots",
+    "len": 9838
+  },
+  "frontend/src/modules/admin/composables/useUpstreamSites.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 7393
+  },
+  "backend/internal/modules/upstream/handler.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 13932
+  },
+  "backend/internal/modules/dashboard/metrics_repository.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 4,
+    "source": "after_snapshots",
+    "len": 10434
+  },
+  "frontend/src/modules/admin/components/dashboard/BalanceFilterModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 2,
+    "source": "after_snapshots",
+    "len": 16408
+  },
+  "frontend/src/modules/admin/api/upstream.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 7491
+  },
+  "backend/internal/httpserver/server.go": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 26364
+  },
+  "frontend/src/modules/admin/components/upstream/SettlementModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 9377
+  },
+  "backend/internal/modules/upstream/balance_filter_test.go": {
+    "session": "019fc06a-e753-7ae0-860e-f51fe43849d0",
+    "prompt_index": 13,
+    "source": "after_snapshots",
+    "len": 1574
+  },
+  "backend/internal/modules/upstream/settlement.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 10828
+  },
+  "frontend/src/modules/admin/types/dashboard.ts": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 1013
+  },
+  "frontend/src/modules/admin/composables/useDashboardMetrics.ts": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 3116
+  },
+  "frontend/src/modules/admin/components/upstream/LedgerModal.vue": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 8,
+    "source": "after_snapshots",
+    "len": 13632
+  },
+  "backend/internal/modules/upstream/ledger_test.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 22,
+    "source": "after_snapshots",
+    "len": 3861
+  },
+  "backend/internal/modules/upstream/ledger.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 22,
+    "source": "after_snapshots",
+    "len": 37470
+  },
+  "backend/internal/modules/dashboard/handler.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 23,
+    "source": "after_snapshots",
+    "len": 12641
+  },
+  "frontend/src/modules/admin/components/dashboard/TodayInboundBreakdownModal.vue": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 2,
+    "source": "after_snapshots",
+    "len": 4740
+  },
+  "backend/internal/modules/upstream/normalizers.go": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 3,
+    "source": "after_snapshots",
+    "len": 11027
+  },
+  "backend/internal/modules/upstream/platform_service_balance_history_test.go": {
+    "session": "019fc0e4-359f-7050-9d8a-662fee61c56f",
+    "prompt_index": 6,
+    "source": "after_snapshots",
+    "len": 4641
+  },
+  "frontend/src/modules/admin/components/upstream/SubscriptionTopupModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 1,
+    "source": "after_snapshots",
+    "len": 5866
+  },
+  "frontend/src/modules/admin/layout/AdminLayout.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 11,
+    "source": "after_snapshots",
+    "len": 21057
+  },
+  "frontend/src/router.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 2,
+    "source": "after_snapshots",
+    "len": 4507
+  },
+  "frontend/src/modules/admin/views/SiteUsersView.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 39598
+  },
+  "backend/internal/modules/dashboard/site_users_test.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 3002
+  },
+  "backend/internal/modules/dashboard/site_user_marks.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 14,
+    "source": "after_snapshots",
+    "len": 8896
+  },
+  "frontend/src/modules/admin/api/siteUsers.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 6010
+  },
+  "backend/internal/modules/dashboard/site_users.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 25,
+    "source": "after_snapshots",
+    "len": 40141
+  },
+  "frontend/src/modules/admin/components/dashboard/SiteBalanceModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 23,
+    "source": "after_snapshots",
+    "len": 23888
+  },
+  "frontend/src/modules/admin/components/dashboard/SiteUserTopupModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 22,
+    "source": "after_snapshots",
+    "len": 17531
+  },
+  "backend/internal/modules/upstream/platform_service_sub2api_admin_user_test.go": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 10,
+    "source": "after_snapshots",
+    "len": 18502
+  },
+  "frontend/src/modules/admin/components/dashboard/StatCard.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 11,
+    "source": "after_snapshots",
+    "len": 2904
+  },
+  "frontend/src/modules/admin/composables/useCurrencyDisplay.ts": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 12,
+    "source": "after_snapshots",
+    "len": 4408
+  },
+  "frontend/src/modules/admin/components/dashboard/SiteUserUsageModal.vue": {
+    "session": "019fc1c7-df8f-7113-8141-b2f5da8f6333",
+    "prompt_index": 24,
+    "source": "after_snapshots",
+    "len": 8827
+  }
+}

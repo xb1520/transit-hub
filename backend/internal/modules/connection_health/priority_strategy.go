@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sort"
+	"strings"
 
 	"transithub/backend/internal/modules/upstream"
 )
@@ -166,6 +167,10 @@ func (s *Service) syncWorkspacePriorities(
 		}
 	}
 
+	// 上游 API Key 真实成本倍率优先于 admin 售卖分组倍率。同一售卖分组里常有 0.1x / 0.2x
+	// 等多条上游；若只按 admin 分组倍率排序，健康目标会全部落到同一 priority。
+	upstreamKeyGroups := s.upstreamKeyGroupsByAdminAccount(ctx, userID, adminAccountID, string(session.Platform))
+
 	managed := make(map[string]*priorityTargetInventory)
 	missingMultiplier := make(map[string]struct{})
 	distinctMultipliers := make([]float64, 0)
@@ -174,13 +179,13 @@ func (s *Service) syncWorkspacePriorities(
 		if !hasMultiplierPriorityPolicy(item.policies) {
 			continue
 		}
-		if len(item.multipliers) == 0 {
-			// 分组没有返回倍率时进入等待态：既不猜测 1x，也不把已接管目标恢复成旧优先级。
-			// 保留同步快照后，倍率恢复可见时下一轮会从原状态继续安全同步。
+		multiplier, ok := resolvePriorityMultiplier(item, upstreamKeyGroups)
+		if !ok {
+			// 分组没有返回倍率、且也无法解析上游 Key 倍率时进入等待态：既不猜测 1x，
+			// 也不把已接管目标恢复成旧优先级。保留同步快照后，倍率恢复可见时下一轮继续。
 			missingMultiplier[targetID] = struct{}{}
 			continue
 		}
-		multiplier := minFloat(item.multipliers)
 		item.multipliers = []float64{multiplier}
 		managed[targetID] = item
 		if _, exists := seenMultipliers[multiplier]; !exists {
@@ -406,6 +411,23 @@ func hasMultiplierPriorityPolicy(policies []Policy) bool {
 	return false
 }
 
+// resolvePriorityMultiplier 决定倍率排序使用的成本倍率：
+//  1. 优先使用 real_connections 绑定的上游 API Key 当前分组倍率（真实进货成本）；
+//  2. 无法可靠解析时回退到 admin 分组倍率中的最低值（目标跨多分组时取 min）。
+// 返回 ok=false 表示本轮没有可用倍率，调用方应保持等待态而不是猜测 1x。
+func resolvePriorityMultiplier(item *priorityTargetInventory, upstreamKeyGroups map[string]upstreamKeyGroupInfo) (float64, bool) {
+	if item == nil {
+		return 0, false
+	}
+	if info, ok := upstreamKeyGroups[strings.TrimSpace(item.target.AccountID)]; ok && info.multiplier != nil {
+		return *info.multiplier, true
+	}
+	if len(item.multipliers) == 0 {
+		return 0, false
+	}
+	return minFloat(item.multipliers), true
+}
+
 // hasMultiplierOnlyPolicy 让明确的仅倍率策略成为同一目标的优先级依据。即使目标还叠加了
 // 一条负责记录健康状态的探活策略，健康状态也不会重新参与 priority 排名。
 func hasMultiplierOnlyPolicy(policies []Policy) bool {
@@ -429,7 +451,7 @@ func minFloat(values []float64) float64 {
 
 // desiredManagedPriority 计算平台无关的路由分数，并使用互不重叠的区间保证健康状态始终压过价格：
 // healthy > recovering > degraded/observing > unconfigured > suspended/disabled。
-// 同一健康层级内，倍率排名越靠前（倍率越低）分数越大；平台数值方向由上层映射。
+// 同一健康层级内，上游成本倍率排名越靠前（倍率越低）分数越大；平台数值方向由上层映射。
 func desiredManagedPriority(states []ConnectionHealthState, multiplierRank int) int {
 	priceScore := 999 - multiplierRank
 	if priceScore < 0 {

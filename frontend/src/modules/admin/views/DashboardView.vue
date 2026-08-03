@@ -15,6 +15,7 @@ import {
   Layers3,
   Loader2,
   Lock,
+  PackagePlus,
   PiggyBank,
   RefreshCw,
   ShieldCheck,
@@ -23,12 +24,13 @@ import {
   Wallet,
 } from 'lucide-vue-next'
 import AdminLoginModal from '../components/dashboard/AdminLoginModal.vue'
-import BalanceFilterModal from '../components/dashboard/BalanceFilterModal.vue'
+import SiteBalanceModal from '../components/dashboard/SiteBalanceModal.vue'
 import DashboardEChart from '../components/dashboard/DashboardEChart.vue'
 import GroupUsageTodayModal from '../components/dashboard/GroupUsageTodayModal.vue'
 import StatCard from '../components/dashboard/StatCard.vue'
 import UpstreamBalanceBreakdownModal from '../components/dashboard/UpstreamBalanceBreakdownModal.vue'
 import UpstreamKeyUsageTodayModal from '../components/dashboard/UpstreamKeyUsageTodayModal.vue'
+import TodayInboundBreakdownModal from '../components/dashboard/TodayInboundBreakdownModal.vue'
 import {
   getDashboardMetrics,
   getDashboardTrends,
@@ -51,7 +53,8 @@ import { useAdminAccounts } from '../composables/useAdminAccounts'
 import type { ConnectionHealthStoredSummary } from '../types/connectionHealth'
 import type { DashboardColorToken, DashboardMetricData, DashboardMetricKey, DashboardPeriod } from '../types/dashboard'
 import type { DashboardAdminPlatform, Sub2apiAuthMethod } from '../types/dashboardAdmin'
-import { computeDelta, formatCny, formatDateTime } from '../utils/dashboard'
+import { computeDelta, formatDateTime } from '../utils/dashboard'
+import { useCurrencyDisplay } from '../composables/useCurrencyDisplay'
 
 const { t, locale } = useI18n()
 const router = useRouter()
@@ -60,6 +63,23 @@ const { theme: chartTheme } = useDashboardChartTheme()
 const isNarrowScreen = useMediaQuery('(max-width: 639px)')
 const { currentAccount } = useAdminAccounts()
 const workspaceID = computed(() => currentAccount.value?.id ?? '')
+/** 最近一次 live metrics，用于覆盖率扩展字段。 */
+const lastLiveMetrics = ref<import('../api/dashboardAdmin').DashboardMetricsResponse | null>(null)
+const { displayMode, formatMoneyParts, formatMoneyCompact } = useCurrencyDisplay()
+
+/** 工作区站点充值倍率：CNY = USD × rate（中转倍率） */
+const siteRate = computed(() => {
+  const r = lastLiveMetrics.value?.siteRechargeRate
+  return r != null && r > 0 ? r : 1
+})
+
+/**
+ * 仪表盘业务金额默认是 **USD**（中转口径）。
+ * - money(usd) → 按倍率换算 CNY
+ * - money(usd, cny) → 同时有后端已换算的 CNY 时用双值（如站点余额）
+ */
+const money = (usd: number | null | undefined, cny?: number | null) =>
+  formatMoneyParts({ usd, cny: cny ?? null, rate: siteRate.value })
 
 const {
   status: adminStatus,
@@ -82,20 +102,23 @@ const adminLoginInitialValue = computed(() => ({
   email: adminStatus.value.identity || '',
 }))
 
-const balanceFilterOpen = ref(false)
+const siteBalanceOpen = ref(false)
 const groupUsageTodayOpen = ref(false)
 const upstreamKeyUsageTodayOpen = ref(false)
 const upstreamBalanceBreakdownOpen = ref(false)
+const todayInboundBreakdownOpen = ref(false)
 
-const openBalanceFilter = () => { balanceFilterOpen.value = true }
-const closeBalanceFilter = () => { balanceFilterOpen.value = false }
-const onBalanceFilterSaved = () => { void loadAllData({ skipStatusCheck: true }) }
+const openSiteBalance = () => { siteBalanceOpen.value = true }
+const closeSiteBalance = () => { siteBalanceOpen.value = false }
+const onSiteBalanceUpdated = () => { void loadAllData({ skipStatusCheck: true }) }
 const openGroupUsageToday = () => { groupUsageTodayOpen.value = true }
 const closeGroupUsageToday = () => { groupUsageTodayOpen.value = false }
 const openUpstreamKeyUsageToday = () => { upstreamKeyUsageTodayOpen.value = true }
 const closeUpstreamKeyUsageToday = () => { upstreamKeyUsageTodayOpen.value = false }
 const openUpstreamBalanceBreakdown = () => { upstreamBalanceBreakdownOpen.value = true }
 const closeUpstreamBalanceBreakdown = () => { upstreamBalanceBreakdownOpen.value = false }
+const openTodayInboundBreakdown = () => { todayInboundBreakdownOpen.value = true }
+const closeTodayInboundBreakdown = () => { todayInboundBreakdownOpen.value = false }
 const openGroupList = () => { void router.push({ name: 'AdminGroupAssociations' }) }
 
 const handleMetricCardClick = (key: string) => {
@@ -106,11 +129,14 @@ const handleMetricCardClick = (key: string) => {
     case 'todayPurchase':
       openUpstreamKeyUsageToday()
       break
+    case 'todayInbound':
+      openTodayInboundBreakdown()
+      break
     case 'upstreamBalance':
       openUpstreamBalanceBreakdown()
       break
     case 'siteBalance':
-      openBalanceFilter()
+      openSiteBalance()
       break
   }
 }
@@ -193,6 +219,7 @@ const loadAllData = async (options: { skipStatusCheck?: boolean } = {}) => {
       getDashboardTrends(30),
     ])
     groupCount.value = liveData.groupCount ?? null
+    lastLiveMetrics.value = liveData
     applyRawData(liveData, trendsData)
     const updatedAt = Date.now()
     lastUpdatedAt.value = updatedAt
@@ -256,6 +283,8 @@ const METRIC_META: Record<DashboardMetricKey, { icon: Component; labelKey: strin
   todayProfit: { icon: TrendingUp, labelKey: 'admin.dashboard.metrics.todayProfit', color: 'primary' },
   siteBalance: { icon: Wallet, labelKey: 'admin.dashboard.metrics.siteBalance', color: 'accent' },
   todayPurchase: { icon: ShoppingCart, labelKey: 'admin.dashboard.metrics.todayPurchase', color: 'warning' },
+  todayCost: { icon: ShoppingCart, labelKey: 'admin.dashboard.metrics.todayCost', color: 'warning' },
+  todayInbound: { icon: PackagePlus, labelKey: 'admin.dashboard.metrics.todayInbound', color: 'accent' },
   netProfit: { icon: PiggyBank, labelKey: 'admin.dashboard.metrics.netProfit', color: 'signal' },
   upstreamBalance: { icon: Landmark, labelKey: 'admin.dashboard.metrics.upstreamBalance', color: 'primary' },
 }
@@ -288,6 +317,7 @@ interface DashboardCoreCard {
   icon: Component
   color: DashboardColorToken
   value: string
+  secondaryValue?: string
   deltaDirection: ReturnType<typeof computeDelta>['direction']
   deltaText: string
   clickable: boolean
@@ -295,20 +325,27 @@ interface DashboardCoreCard {
 }
 
 const cards = computed<DashboardCoreCard[]>(() => {
-  const result: DashboardCoreCard[] = (['todayProfit', 'todayPurchase', 'netProfit'] as DashboardMetricKey[]).flatMap((key) => {
+  // displayMode 依赖：切换币种时重算卡片
+  void displayMode.value
+  void siteRate.value
+  // 同一行五卡：营收 → 成本 → 净利润 → 进货 → 利润率
+  const result: DashboardCoreCard[] = (['todayProfit', 'todayPurchase', 'netProfit', 'todayInbound'] as DashboardMetricKey[]).flatMap((key) => {
     const current = metric(key)
     if (!current) return []
     const delta = computeDelta(current.series.month.map(point => point.value))
+    const parts = money(current.current)
+    const deltaParts = money(Math.abs(delta.amount))
     return [{
       key,
       label: t(METRIC_META[key].labelKey),
       icon: METRIC_META[key].icon,
       color: METRIC_META[key].color,
-      value: formatCny(current.current),
+      value: parts.primary,
+      secondaryValue: parts.secondary,
       deltaDirection: delta.direction,
-      deltaText: formatCny(Math.abs(delta.amount)),
-      clickable: key === 'todayProfit' || key === 'todayPurchase',
-      negativeWhenUp: key === 'todayPurchase',
+      deltaText: deltaParts.primary,
+      clickable: key === 'todayProfit' || key === 'todayPurchase' || key === 'todayInbound',
+      negativeWhenUp: key === 'todayPurchase' || key === 'todayInbound',
     }]
   })
   const marginDelta = computeDelta(marginSeries.value)
@@ -337,14 +374,12 @@ const periodTotals = computed(() => ({
   profit: sumSeries('netProfit'),
 }))
 
-const compactCurrency = (value: number) => {
-  const absolute = Math.abs(value)
-  if (absolute >= 1_000_000) return `¥${numberFormatter.value.format(value / 1_000_000)}M`
-  if (absolute >= 1_000) return `¥${numberFormatter.value.format(value / 1_000)}K`
-  return `¥${numberFormatter.value.format(value)}`
-}
+const compactCurrency = (value: number) =>
+  formatMoneyCompact(value, siteRate.value, numberFormatter.value)
 
 const performanceChartOption = computed<EChartsCoreOption>(() => {
+  void displayMode.value
+  void siteRate.value
   const revenue = selectedSeries('todayProfit')
   const cost = selectedSeries('todayPurchase')
   const profit = selectedSeries('netProfit')
@@ -353,7 +388,12 @@ const performanceChartOption = computed<EChartsCoreOption>(() => {
     name,
     data,
     itemStyle: { color },
-    tooltip: { valueFormatter: (value: number) => formatCny(value) },
+    tooltip: {
+      valueFormatter: (value: number) => {
+        const p = money(value)
+        return p.secondary ? `${p.primary} (${p.secondary})` : p.primary
+      },
+    },
   })
   return {
     animationDuration: 350,
@@ -419,7 +459,8 @@ const groupTooltipContent = (params: unknown, mutedColor: string, foregroundColo
   if (!point) return ''
   const name = escapeTooltipHtml(String(point.name ?? ''))
   const amount = Number(point.value)
-  const value = escapeTooltipHtml(formatCny(Number.isFinite(amount) ? amount : 0))
+  const parts = money(Number.isFinite(amount) ? amount : 0)
+  const value = escapeTooltipHtml(parts.secondary ? `${parts.primary} (${parts.secondary})` : parts.primary)
   const label = escapeTooltipHtml(t('admin.dashboard.groups.amount'))
   return `<div style="margin-bottom:6px;color:${foregroundColor};font-weight:600">${name}</div>`
     + `<div style="display:flex;min-width:160px;justify-content:space-between;gap:20px;color:${mutedColor}">`
@@ -427,6 +468,8 @@ const groupTooltipContent = (params: unknown, mutedColor: string, foregroundColo
 }
 
 const groupChartOption = computed<EChartsCoreOption>(() => {
+  void displayMode.value
+  void siteRate.value
   const theme = chartTheme.value
   return {
     animationDuration: 350,
@@ -471,7 +514,13 @@ const groupChartOption = computed<EChartsCoreOption>(() => {
 
 const siteBalance = computed(() => metric('siteBalance')?.current ?? 0)
 const upstreamBalance = computed(() => metric('upstreamBalance')?.current ?? 0)
-const coverageRatio = computed(() => siteBalance.value > 0 ? (upstreamBalance.value / siteBalance.value) * 100 : null)
+// 覆盖率：预存备付 / 成本侧用户余额；无用户余额（中转站）时不适用。
+const coverageRatio = computed(() => {
+  const live = lastLiveMetrics.value
+  if (live?.coverageApplicable === false) return null
+  if (live?.coverageRatio != null) return live.coverageRatio
+  return siteBalance.value > 0 ? (upstreamBalance.value / siteBalance.value) * 100 : null
+})
 const averageDailyCost = computed(() => {
   const values = selectedSeries('todayPurchase').map(point => point.value)
   return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : 0
@@ -484,6 +533,34 @@ const coverageTone = computed(() => {
   if (coverageRatio.value >= 40) return 'bg-warning'
   return 'bg-destructive'
 })
+const upstreamCreditReference = computed(() => lastLiveMetrics.value?.upstreamCreditReference ?? 0)
+const siteBalancePlatform = computed(() => lastLiveMetrics.value?.siteBalancePlatform ?? null)
+
+/** 站点用户余额：后端已给出 USD 平台值与乘倍率后的 CNY */
+const siteBalanceMoney = computed(() => {
+  const usd = siteBalancePlatform.value
+    ?? (siteRate.value > 0 ? siteBalance.value / siteRate.value : siteBalance.value)
+  return money(usd, siteBalance.value)
+})
+
+const siteGiftMoney = computed(() =>
+  money(
+    lastLiveMetrics.value?.siteGiftTotalPlatform ?? 0,
+    lastLiveMetrics.value?.siteGiftTotal ?? 0,
+  ),
+)
+const siteRebateMoney = computed(() =>
+  money(
+    lastLiveMetrics.value?.siteRebateTotalPlatform ?? 0,
+    lastLiveMetrics.value?.siteRebateTotal ?? 0,
+  ),
+)
+const siteRechargeMoney = computed(() =>
+  money(
+    lastLiveMetrics.value?.siteRechargeTotalPlatform ?? 0,
+    lastLiveMetrics.value?.siteRechargeTotal ?? 0,
+  ),
+)
 
 const upstreamIssueCount = computed(() => (balanceBreakdown.value?.sites ?? []).filter(
   site => site.balance == null || site.status === 'error',
@@ -619,9 +696,9 @@ const lastProbeLabel = computed(() => {
       role="status"
       :aria-label="t('admin.dashboard.loading')"
     >
-      <div class="grid grid-cols-2 gap-3 xl:grid-cols-4">
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
         <div
-          v-for="item in 4"
+          v-for="item in 5"
           :key="item"
           class="min-h-[132px] animate-pulse rounded-lg border border-border/60 bg-card p-4 sm:min-h-[142px] sm:p-5"
         >
@@ -668,12 +745,13 @@ const lastProbeLabel = computed(() => {
       </div>
 
       <template v-else-if="metrics.length > 0">
-        <section class="grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <section class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
           <StatCard
             v-for="card in cards"
             :key="card.key"
             :label="card.label"
             :value="card.value"
+            :secondary-value="card.secondaryValue"
             :icon="card.icon"
             :color="card.color"
             :delta-direction="card.deltaDirection"
@@ -714,15 +792,30 @@ const lastProbeLabel = computed(() => {
             <dl class="mt-5 grid grid-cols-3 divide-x divide-border/60 border-y border-border/60 py-3">
               <div class="min-w-0 px-2 first:pl-0 sm:px-4">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodRevenue') }}</dt>
-                <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-foreground sm:text-base">{{ formatCny(periodTotals.revenue) }}</dd>
+                <dd class="mt-1 text-sm font-semibold tabular-nums text-foreground sm:text-base">
+                  <div class="truncate">{{ money(periodTotals.revenue).primary }}</div>
+                  <div v-if="money(periodTotals.revenue).secondary" class="truncate text-xs font-medium text-muted-foreground">
+                    {{ money(periodTotals.revenue).secondary }}
+                  </div>
+                </dd>
               </div>
               <div class="min-w-0 px-2 sm:px-4">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodCost') }}</dt>
-                <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-foreground sm:text-base">{{ formatCny(periodTotals.cost) }}</dd>
+                <dd class="mt-1 text-sm font-semibold tabular-nums text-foreground sm:text-base">
+                  <div class="truncate">{{ money(periodTotals.cost).primary }}</div>
+                  <div v-if="money(periodTotals.cost).secondary" class="truncate text-xs font-medium text-muted-foreground">
+                    {{ money(periodTotals.cost).secondary }}
+                  </div>
+                </dd>
               </div>
               <div class="min-w-0 px-2 pr-0 sm:px-4 sm:pr-0">
                 <dt class="truncate text-xs text-muted-foreground">{{ t('admin.dashboard.performance.periodProfit') }}</dt>
-                <dd class="mt-1 truncate text-sm font-semibold tabular-nums text-signal sm:text-base">{{ formatCny(periodTotals.profit) }}</dd>
+                <dd class="mt-1 text-sm font-semibold tabular-nums text-signal sm:text-base">
+                  <div class="truncate">{{ money(periodTotals.profit).primary }}</div>
+                  <div v-if="money(periodTotals.profit).secondary" class="truncate text-xs font-medium text-muted-foreground">
+                    {{ money(periodTotals.profit).secondary }}
+                  </div>
+                </dd>
               </div>
             </dl>
 
@@ -744,13 +837,44 @@ const lastProbeLabel = computed(() => {
             </div>
 
             <div class="mt-6 divide-y divide-border/60 border-y border-border/60">
-              <button type="button" class="flex w-full items-center justify-between gap-4 py-4 text-left" @click="openBalanceFilter">
-                <dt class="text-sm text-muted-foreground">{{ t('admin.dashboard.capital.siteBalance') }}</dt>
-                <dd class="font-semibold tabular-nums text-foreground">{{ formatCny(siteBalance) }}</dd>
+              <button type="button" class="flex w-full items-center justify-between gap-4 py-3.5 text-left" @click="openSiteBalance">
+                <dt class="text-sm text-muted-foreground">{{ t('admin.dashboard.capital.payoutBalance') }}</dt>
+                <dd class="text-right">
+                  <div class="font-semibold tabular-nums text-foreground">{{ siteBalanceMoney.primary }}</div>
+                  <div v-if="siteBalanceMoney.secondary" class="mt-0.5 text-[11px] font-normal tabular-nums text-muted-foreground">
+                    {{ siteBalanceMoney.secondary }}
+                  </div>
+                </dd>
               </button>
-              <button type="button" class="flex w-full items-center justify-between gap-4 py-4 text-left" @click="openUpstreamBalanceBreakdown">
+              <div class="flex items-center justify-between gap-4 py-3.5">
+                <dt class="text-sm text-muted-foreground">{{ t('admin.dashboard.capital.giftTotal') }}</dt>
+                <dd class="text-right">
+                  <div class="font-semibold tabular-nums text-emerald-700 dark:text-emerald-300">{{ siteGiftMoney.primary }}</div>
+                  <div v-if="siteGiftMoney.secondary" class="mt-0.5 text-[11px] tabular-nums text-muted-foreground">{{ siteGiftMoney.secondary }}</div>
+                </dd>
+              </div>
+              <div class="flex items-center justify-between gap-4 py-3.5">
+                <dt class="text-sm text-muted-foreground">{{ t('admin.dashboard.capital.rebateTotal') }}</dt>
+                <dd class="text-right">
+                  <div class="font-semibold tabular-nums text-amber-700 dark:text-amber-300">{{ siteRebateMoney.primary }}</div>
+                  <div v-if="siteRebateMoney.secondary" class="mt-0.5 text-[11px] tabular-nums text-muted-foreground">{{ siteRebateMoney.secondary }}</div>
+                </dd>
+              </div>
+              <div class="flex items-center justify-between gap-4 py-3.5">
+                <dt class="text-sm text-muted-foreground">{{ t('admin.dashboard.capital.rechargeTotal') }}</dt>
+                <dd class="text-right">
+                  <div class="font-semibold tabular-nums text-sky-700 dark:text-sky-300">{{ siteRechargeMoney.primary }}</div>
+                  <div v-if="siteRechargeMoney.secondary" class="mt-0.5 text-[11px] tabular-nums text-muted-foreground">{{ siteRechargeMoney.secondary }}</div>
+                </dd>
+              </div>
+              <button type="button" class="flex w-full items-center justify-between gap-4 py-3.5 text-left" @click="openUpstreamBalanceBreakdown">
                 <dt class="text-sm text-muted-foreground">{{ t('admin.dashboard.capital.upstreamBalance') }}</dt>
-                <dd class="font-semibold tabular-nums text-foreground">{{ formatCny(upstreamBalance) }}</dd>
+                <dd class="text-right">
+                  <div class="font-semibold tabular-nums text-foreground">{{ money(upstreamBalance).primary }}</div>
+                  <div v-if="money(upstreamBalance).secondary" class="mt-0.5 text-[11px] font-normal tabular-nums text-muted-foreground">
+                    {{ money(upstreamBalance).secondary }}
+                  </div>
+                </dd>
               </button>
             </div>
 
@@ -765,6 +889,11 @@ const lastProbeLabel = computed(() => {
                 <div class="h-full rounded-full transition-[width]" :class="coverageTone" :style="{ width: coverageWidth }" />
               </div>
               <p class="mt-2 text-xs leading-5 text-muted-foreground">{{ t('admin.dashboard.capital.coverageHint') }}</p>
+              <p v-if="upstreamCreditReference > 0" class="mt-1 text-xs text-muted-foreground">
+                {{ t('admin.dashboard.capital.creditReferenceHint', {
+                  value: money(upstreamCreditReference).primary,
+                }) }}
+              </p>
             </div>
 
             <div class="mt-6 flex items-center justify-between border-t border-border/60 pt-5">
@@ -920,9 +1049,10 @@ const lastProbeLabel = computed(() => {
       @submit="submitAdminLogin"
       @close="closeAdminModal"
     />
-    <BalanceFilterModal :open="balanceFilterOpen" @close="closeBalanceFilter" @saved="onBalanceFilterSaved" />
+    <SiteBalanceModal :open="siteBalanceOpen" @close="closeSiteBalance" @updated="onSiteBalanceUpdated" />
     <GroupUsageTodayModal :open="groupUsageTodayOpen" @close="closeGroupUsageToday" />
     <UpstreamKeyUsageTodayModal :open="upstreamKeyUsageTodayOpen" @close="closeUpstreamKeyUsageToday" />
+    <TodayInboundBreakdownModal :open="todayInboundBreakdownOpen" @close="closeTodayInboundBreakdown" />
     <UpstreamBalanceBreakdownModal :open="upstreamBalanceBreakdownOpen" @close="closeUpstreamBalanceBreakdown" />
   </div>
 </template>

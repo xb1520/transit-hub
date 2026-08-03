@@ -30,14 +30,27 @@ const normalizeMetrics = (metrics: UpstreamSiteResponse['metrics'] | null | unde
   balance: metrics?.balance ?? emptyMetric(),
   todayConsume: metrics?.todayConsume ?? emptyMetric(),
   historyRecharge: metrics?.historyRecharge ?? emptyMetric(),
+  lifetimeConsume: metrics?.lifetimeConsume,
   group: metrics?.group ?? { id: '', name: '-', platform: null, multiplier: null, multiplierDisplay: '-' },
   groups: Array.isArray(metrics?.groups) ? metrics.groups : [],
+  subscriptions: Array.isArray(metrics?.subscriptions) ? metrics.subscriptions : [],
 })
 
-const normalizeSite = (site: UpstreamSiteResponse, logoBg: string): UpstreamSite => ({
+const normalizeSite = (
+  site: UpstreamSiteResponse,
+  logoBg: string,
+  previous?: UpstreamSite | null,
+): UpstreamSite => ({
   ...site,
   metrics: normalizeMetrics(site.metrics),
-  settings: site.settings ?? { balanceThreshold: null },
+  settings: {
+    balanceThreshold: site.settings?.balanceThreshold ?? null,
+    settlementMode: site.settings?.settlementMode || previous?.settings?.settlementMode || 'prepaid_wallet',
+    creditLimit: site.settings?.creditLimit ?? previous?.settings?.creditLimit ?? null,
+    settlementCurrency: site.settings?.settlementCurrency || previous?.settings?.settlementCurrency || 'CNY',
+  },
+  // 同步响应偶发不带 settlement 时保留旧汇总，避免待结算卡片闪没。
+  settlement: site.settlement ?? previous?.settlement ?? null,
   logo: siteLogo(site.name),
   logoBg,
 })
@@ -77,7 +90,7 @@ export const useUpstreamSites = () => {
       const nextSite = await updateUpstreamSite(id, form)
       const index = sites.value.findIndex((site) => site.id === id)
       if (index >= 0) {
-        sites.value[index] = normalizeSite(nextSite, sites.value[index].logoBg)
+        sites.value[index] = normalizeSite(nextSite, sites.value[index].logoBg, sites.value[index])
       }
       return true
     } catch (error) {
@@ -92,7 +105,7 @@ export const useUpstreamSites = () => {
     const site = sites.value.find((item) => item.id === id)
     if (!site) return
     const nextSite = await syncUpstreamSite(id)
-    Object.assign(site, normalizeSite(nextSite, site.logoBg))
+    Object.assign(site, normalizeSite(nextSite, site.logoBg, site))
   }
 
   const refreshSites = async () => {
@@ -102,7 +115,7 @@ export const useUpstreamSites = () => {
       const remoteSites = await syncAllUpstreamSites()
       sites.value = remoteSites.map((site, index) => {
         const current = sites.value.find((item) => item.id === site.id)
-        return normalizeSite(site, current?.logoBg ?? logoClasses[index % logoClasses.length])
+        return normalizeSite(site, current?.logoBg ?? logoClasses[index % logoClasses.length], current)
       })
     } finally {
       isRefreshing.value = false
@@ -141,7 +154,7 @@ export const useUpstreamSites = () => {
             if (event.site) {
               const index = sites.value.findIndex((s) => s.id === id)
               if (index >= 0) {
-                sites.value[index] = normalizeSite(event.site, sites.value[index].logoBg)
+                sites.value[index] = normalizeSite(event.site, sites.value[index].logoBg, sites.value[index])
               }
             }
             siteSyncStates.value.set(id, { phase: 'done' })
@@ -155,7 +168,7 @@ export const useUpstreamSites = () => {
             if (event.site) {
               const index = sites.value.findIndex((s) => s.id === id)
               if (index >= 0) {
-                sites.value[index] = normalizeSite(event.site, sites.value[index].logoBg)
+                sites.value[index] = normalizeSite(event.site, sites.value[index].logoBg, sites.value[index])
               }
             }
             siteSyncStates.value.set(id, { phase: 'error', errorKey: event.errorKey })
