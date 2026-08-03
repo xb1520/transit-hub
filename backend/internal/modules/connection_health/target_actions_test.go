@@ -117,7 +117,9 @@ func TestReconcileTargetRemoteAction_ScalesNewAPIWeightFromOriginal(t *testing.T
 	}
 }
 
-func TestReconcileTargetRemoteAction_DoesNotRestoreWithUnprobedControlledModel(t *testing.T) {
+func TestReconcileTargetRemoteAction_RestoresWhenPeerHealthyDespiteUnprobedModel(t *testing.T) {
+	// 产品语义：只要存在健康的有效模型且未阻塞，就应恢复账号 active。
+	// 未探活的兄弟模型不再把账号永久钉死在 inactive（否则摘除暂停模型后也无法恢复）。
 	repo := newFakeRepository()
 	platform := &fakePlatformActioner{}
 	service := &Service{repo: repo, dispatcher: newRemoteActionDispatcher(nil, nil, platform)}
@@ -137,8 +139,8 @@ func TestReconcileTargetRemoteAction_DoesNotRestoreWithUnprobedControlledModel(t
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != "" || len(platform.sub2APICalls) != 0 {
-		t.Fatalf("missing model state must keep the managed target inactive: action=%q calls=%+v", action, platform.sub2APICalls)
+	if action != RemoteActionSub2APIStatusActive || len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("healthy peer must restore account active, action=%q calls=%+v", action, platform.sub2APICalls)
 	}
 }
 

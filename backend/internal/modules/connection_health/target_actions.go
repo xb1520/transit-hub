@@ -87,29 +87,35 @@ func (s *Service) reconcileTargetRemoteAction(
 		statusAggStates = nil
 	}
 	allHealthy, blocked, minWeight := aggregateTargetStates(statusAggStates)
+	hasHealthyEffective := hasHealthyEffectiveModel(statusAggStates)
 	if len(statusModels) == 0 {
 		allHealthy = true
 		blocked = false
-	} else {
-		allHealthy = allHealthy && statesComplete
+		hasHealthyEffective = false
 	}
+	// fullyHealthy：所有受控模型都有状态且有效模型全健康（用于清理快照）。
+	// 不完整状态时仍可根据 hasHealthyEffective 恢复账号启停，避免「有健康模型却永久停用」。
+	fullyHealthy := allHealthy && (len(statusModels) == 0 || statesComplete)
 	// 模型限制摘除即使不阻塞账号启停，也需要 reconcile（可与启停路径独立）。
 	needsModelLimits := target.Platform == string(upstream.PlatformSub2API) && len(modelLimitModels) > 0 &&
 		(hasModelLimitExclusion(modelLimitStates) || (stored != nil && (strings.TrimSpace(stored.OriginalModels) != "" || strings.TrimSpace(stored.LastAppliedModels) != "")))
-	// 账号启停：普通 degraded 只记健康；只有接管中 / 阻塞 / 恢复中才改上游启停。
-	needsStatusAction := len(statusModels) > 0 && (blocked || hasRecoveringState(statusAggStates) || (stored != nil && (stored.OriginalStatus != "" || stored.LastAppliedStatus != "")))
+	// 账号启停：阻塞 / 恢复中 / 已有快照 / 当前停用但已有健康有效模型（需要拉回 active）。
+	currentStatusPreview := normalizeTargetStatus(target.Platform, target.AccountStatus)
+	needsStatusAction := len(statusModels) > 0 && (blocked || hasRecoveringState(statusAggStates) ||
+		(stored != nil && (stored.OriginalStatus != "" || stored.LastAppliedStatus != "")) ||
+		(!targetStatusEnabled(target.Platform, currentStatusPreview) && hasHealthyEffective))
 	if stored != nil && (strings.TrimSpace(stored.OriginalModels) != "" || strings.TrimSpace(stored.LastAppliedModels) != "") {
 		// 已建立模型限制快照时也算「已接管」，避免丢失快照。
 		needsStatusAction = needsStatusAction || len(statusModels) > 0
 	}
-	if !statesComplete && !blocked && !needsModelLimits {
+	if !statesComplete && !blocked && !needsModelLimits && !needsStatusAction {
 		return "", nil
 	}
 	if stored == nil && !needsStatusAction && !needsModelLimits {
 		return "", nil
 	}
-	// 已接管但状态不完整：仅在 blocked 或模型限制需要时继续。
-	if stored != nil && !statesComplete && !blocked && !needsModelLimits {
+	// 已接管但状态不完整：仅在 blocked / 模型限制 / 需要恢复启停时继续。
+	if stored != nil && !statesComplete && !blocked && !needsModelLimits && !needsStatusAction {
 		return "", nil
 	}
 
@@ -172,7 +178,15 @@ func (s *Service) reconcileTargetRemoteAction(
 		return RemoteActionSkippedTargetConflict, nil
 	}
 	if stored.Conflict {
-		return RemoteActionSkippedTargetConflict, nil
+		// 若上游当前值仍等于系统最后写入值，说明并非用户手动改动后的残留冲突，
+		// 允许继续恢复（避免历史误标 conflict 导致永久无法启用）。
+		if targetStateEqual(target, currentStatus, currentWeight, stored.LastAppliedStatus, stored.LastAppliedWeight) {
+			log.Printf("[connection-health] clear stale target conflict target_id=%s current=%s lastApplied=%s",
+				target.TargetID, currentStatus, stored.LastAppliedStatus)
+			stored.Conflict = false
+		} else {
+			return RemoteActionSkippedTargetConflict, nil
+		}
 	}
 
 	// 先处理 sub2api 模型限制摘除/恢复；动作标签可能与账号启停叠加。
@@ -193,19 +207,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		return modelsAction, modelsErr
 	}
 
-	// 仅模型限制场景且当前不需要改启停：保持原启停，不强制 active。
-	if !blocked && !hasRecoveringState(statusAggStates) && !allHealthy {
-		// 没有账号级阻塞时不要把用户手动 inactive 的账号改回 active。
-		if !targetStatusEnabled(target.Platform, currentStatus) &&
-			normalizeTargetStatus(target.Platform, stored.OriginalStatus) == currentStatus {
-			if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
-				return modelsAction, err
-			}
-			return modelsAction, modelsErr
-		}
-	}
-
-	desiredStatus, desiredWeight := desiredTargetState(target.Platform, allHealthy, blocked, minWeight, *stored)
+	desiredStatus, desiredWeight := desiredTargetState(target.Platform, fullyHealthy, blocked, hasHealthyEffective, minWeight, *stored)
 	statusEqual := targetStateEqual(target, currentStatus, currentWeight, desiredStatus, desiredWeight)
 	if statusEqual {
 		stored.LastAppliedStatus = desiredStatus
@@ -213,7 +215,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		stored.PendingStatus = ""
 		stored.PendingWeight = nil
 		// 全部健康且模型限制也已恢复到原始列表时，才能删除接管快照。
-		if allHealthy && !hasManagedModelLimits(stored) {
+		if fullyHealthy && !hasManagedModelLimits(stored) {
 			if modelsAction != "" {
 				_ = s.repo.DeleteTargetActionState(ctx, userID, adminAccountID, target.TargetID)
 				return modelsAction, modelsErr
@@ -233,6 +235,8 @@ func (s *Service) reconcileTargetRemoteAction(
 	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 		return modelsAction, err
 	}
+	log.Printf("[connection-health] apply account status target_id=%s account_id=%s current=%s desired=%s fullyHealthy=%v blocked=%v hasHealthy=%v original=%s lastApplied=%s",
+		target.TargetID, target.AccountID, currentStatus, desiredStatus, fullyHealthy, blocked, hasHealthyEffective, stored.OriginalStatus, stored.LastAppliedStatus)
 	action, actionErr := s.dispatcher.ApplyTargetState(ctx, session, target, desiredWeight, desiredStatus)
 	if actionErr != nil {
 		log.Printf("[connection-health] aggregate target action failed target_id=%s action=%s err=%v", target.TargetID, action, actionErr)
@@ -242,7 +246,7 @@ func (s *Service) reconcileTargetRemoteAction(
 	stored.LastAppliedWeight = cloneIntPointer(desiredWeight)
 	stored.PendingStatus = ""
 	stored.PendingWeight = nil
-	if allHealthy && !hasManagedModelLimits(stored) {
+	if fullyHealthy && !hasManagedModelLimits(stored) {
 		return joinRemoteActions(modelsAction, action), s.repo.DeleteTargetActionState(ctx, userID, adminAccountID, target.TargetID)
 	}
 	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
@@ -699,28 +703,40 @@ func hasRecoveringState(states []ConnectionHealthState) bool {
 	return false
 }
 
-func desiredTargetState(platform string, allHealthy bool, blocked bool, minWeight int, stored TargetActionState) (string, *int) {
-	if allHealthy {
-		// 有效模型已全部健康：恢复接管前的启停。若快照缺失，默认启用。
-		orig := strings.TrimSpace(stored.OriginalStatus)
-		if orig == "" {
-			return legacyOriginalTargetState(platform)
-		}
-		return stored.OriginalStatus, cloneIntPointer(stored.OriginalWeight)
-	}
-	if platform == string(upstream.PlatformNewAPI) {
-		if blocked {
+func desiredTargetState(platform string, fullyHealthy bool, blocked bool, hasHealthyEffective bool, minWeight int, stored TargetActionState) (string, *int) {
+	if blocked {
+		if platform == string(upstream.PlatformNewAPI) {
 			weight := 0
 			return "2", &weight
 		}
+		return "inactive", nil
+	}
+	// 未阻塞：只要存在健康的有效模型（或全部有效模型健康），账号应保持/恢复启用。
+	// 这样可修复「系统曾写入 inactive，或 Original 误记为 inactive」导致的永久停用。
+	// 用户手动改状态会走 conflict 路径，不会进入这里覆盖。
+	if fullyHealthy || hasHealthyEffective {
+		if targetStatusEnabled(platform, stored.OriginalStatus) {
+			return stored.OriginalStatus, cloneIntPointer(stored.OriginalWeight)
+		}
+		return legacyOriginalTargetState(platform)
+	}
+	if platform == string(upstream.PlatformNewAPI) {
 		weight := scaledTargetWeight(stored.OriginalWeight, minWeight)
 		return "1", &weight
 	}
-	if blocked {
-		return "inactive", nil
-	}
-	// 未全健康但也未阻塞（例如仅有模型白名单摘除）：保持账号可调度，让健康模型继续服务。
 	return "active", nil
+}
+
+func hasHealthyEffectiveModel(states []ConnectionHealthState) bool {
+	for _, state := range states {
+		if isModelLimitExclusionState(state) {
+			continue
+		}
+		if state.State == StateHealthy {
+			return true
+		}
+	}
+	return false
 }
 
 // scaledTargetWeight converts the state machine's 0-100 recovery percentage into the

@@ -77,6 +77,26 @@ func TestAggregateTargetStates_AllExcludedBlocks(t *testing.T) {
 	}
 }
 
+func TestDesiredTargetState_RestoresActiveWhenHealthyPeers(t *testing.T) {
+	stored := TargetActionState{OriginalStatus: "inactive", LastAppliedStatus: "inactive"}
+	// 有健康有效模型且未阻塞：即使 Original 误记为 inactive，也应恢复 active
+	status, _ := desiredTargetState(string(upstream.PlatformSub2API), true, false, true, 100, stored)
+	if status != "active" {
+		t.Fatalf("desired status = %q, want active", status)
+	}
+	// Original 为 active 时优先恢复 Original
+	stored.OriginalStatus = "active"
+	status, _ = desiredTargetState(string(upstream.PlatformSub2API), true, false, true, 100, stored)
+	if status != "active" {
+		t.Fatalf("desired status = %q, want active from original", status)
+	}
+	// 阻塞时仍 inactive
+	status, _ = desiredTargetState(string(upstream.PlatformSub2API), false, true, false, 0, stored)
+	if status != "inactive" {
+		t.Fatalf("blocked desired = %q, want inactive", status)
+	}
+}
+
 func TestReconcileTargetModelLimits_RemovesAndRestores(t *testing.T) {
 	platform := &fakePlatformActioner{}
 	repo := newFakeRepository()
