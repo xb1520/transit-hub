@@ -57,8 +57,9 @@ func TestAggregateTargetStates_PartialModelExclusionDoesNotBlock(t *testing.T) {
 		{ModelName: "bad", State: StateSuspended, CurrentWeight: 0, LastErrorKey: string(ResultModelNotFound)},
 	}
 	allHealthy, blocked, _ := aggregateTargetStates(states)
-	if allHealthy {
-		t.Fatal("expected not all healthy")
+	// 摘除暂停模型不计入 allHealthy：有效模型全部健康时应可恢复账号
+	if !allHealthy {
+		t.Fatal("expected allHealthy when only excluded models are unhealthy")
 	}
 	if blocked {
 		t.Fatal("partial model_not_found exclusion must not block whole account")

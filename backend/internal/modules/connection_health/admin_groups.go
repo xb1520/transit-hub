@@ -268,13 +268,16 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 					effectivePolicies = append(effectivePolicies, policy)
 				}
 			}
-			activeSpecs := candidateModelSpecs(splitModelList(acc.Models), effectivePolicies)
-			hasProbePolicy := hasEnabledProbePolicy(effectivePolicies)
 			var actionState *TargetActionState
 			if st, ok := actionByTarget[targetID]; ok {
 				copy := st
 				actionState = &copy
 			}
+			// 展示/监控必须包含「已从上游白名单摘除」的模型：用 OriginalModels + 本地健康状态补全，
+			// 不能只用当前 acc.Models（摘除后上游列表变短，否则监控里模型会消失）。
+			displayModels := modelsForHealthDisplay(acc.Models, actionState, stateIndex[targetID])
+			activeSpecs := candidateModelSpecs(displayModels, effectivePolicies)
+			hasProbePolicy := hasEnabledProbePolicy(effectivePolicies)
 			modelHealth, unprobedModels := modelHealthForSpecs(stateIndex[targetID], activeSpecs, actionState)
 			if credentialReason := latestCredentialUnavailableReason(modelHealth); credentialReason != "" {
 				available = false
@@ -580,6 +583,38 @@ func modelHealthForConnection(byModel map[string]ConnectionHealthState) []ModelH
 		models = append(models, toModelHealth(modelName, st))
 	}
 	return models
+}
+
+// modelsForHealthDisplay 合并：当前上游白名单、OriginalModels 快照、本地已有健康状态的模型名。
+// 保证被摘除的模型仍出现在分组监控 UI 中（带「已摘除」标记），并能继续被探活恢复。
+func modelsForHealthDisplay(liveModels string, actionState *TargetActionState, byModel map[string]ConnectionHealthState) []string {
+	target := AdminProbeTarget{Models: splitModelList(liveModels)}
+	target = expandTargetModelsForProbe(target, actionState)
+	seen := make(map[string]struct{}, len(target.Models)+len(byModel))
+	out := make([]string, 0, len(target.Models)+len(byModel))
+	for _, name := range target.Models {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	for name := range byModel {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
 }
 
 // modelHealthForSpecs 只展开当前有效策略仍启用的模型。历史状态继续留库用于审计，但模型被

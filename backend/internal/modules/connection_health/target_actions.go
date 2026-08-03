@@ -404,29 +404,36 @@ func legacyOriginalTargetState(platform string) (string, *int) {
 }
 
 func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blocked bool, minWeight int) {
+	// 账号级健康/阻塞只看「未走模型限制摘除」的模型。
+	// 已 suspended 的模型会从白名单摘除，不得再把 allHealthy 打成 false，
+	// 否则同账号其它健康模型也无法把账号从 inactive 恢复。
 	allHealthy = true
 	minWeight = 100
-	exclusionOnly := len(states) > 0
+	effectiveCount := 0
+	exclusionCount := 0
 	for _, state := range states {
+		if isModelLimitExclusionState(state) {
+			exclusionCount++
+			continue
+		}
+		effectiveCount++
 		if state.State != StateHealthy {
 			allHealthy = false
 		}
 		if state.CurrentWeight < minWeight {
 			minWeight = state.CurrentWeight
 		}
-		// 已暂停模型走「模型限制」摘除，不单独把整账号 inactive，避免同账号健康模型被连带停用。
-		// observing（冷却后观察）/ disabled / 权重 0 的非暂停态仍按原规则阻塞账号。
-		if isModelLimitExclusionState(state) {
-			continue
-		}
-		exclusionOnly = false
+		// observing / disabled / 权重 0 仍阻塞账号（这些不靠模型白名单摘除解决）。
 		if state.State == StateObserving || state.State == StateDisabled || state.CurrentWeight <= 0 {
 			blocked = true
 		}
 	}
-	// 全部受控模型都处于探活暂停时，仍阻塞账号，避免 models 被清空后继续接流量。
-	if exclusionOnly {
-		blocked = true
+	if effectiveCount == 0 {
+		// 没有任何有效模型：若全是摘除暂停则阻塞；若完全无状态则视为健康空集。
+		allHealthy = exclusionCount == 0
+		if exclusionCount > 0 {
+			blocked = true
+		}
 	}
 	return allHealthy, blocked, minWeight
 }
@@ -694,6 +701,11 @@ func hasRecoveringState(states []ConnectionHealthState) bool {
 
 func desiredTargetState(platform string, allHealthy bool, blocked bool, minWeight int, stored TargetActionState) (string, *int) {
 	if allHealthy {
+		// 有效模型已全部健康：恢复接管前的启停。若快照缺失，默认启用。
+		orig := strings.TrimSpace(stored.OriginalStatus)
+		if orig == "" {
+			return legacyOriginalTargetState(platform)
+		}
 		return stored.OriginalStatus, cloneIntPointer(stored.OriginalWeight)
 	}
 	if platform == string(upstream.PlatformNewAPI) {
@@ -707,6 +719,7 @@ func desiredTargetState(platform string, allHealthy bool, blocked bool, minWeigh
 	if blocked {
 		return "inactive", nil
 	}
+	// 未全健康但也未阻塞（例如仅有模型白名单摘除）：保持账号可调度，让健康模型继续服务。
 	return "active", nil
 }
 
@@ -736,7 +749,9 @@ func normalizeTargetStatus(platform string, status string) string {
 		}
 		return "2"
 	}
-	if normalized == "inactive" || normalized == "disabled" || normalized == "2" {
+	// Sub2API 管理端「停用」可能对应 inactive / error / disabled 等枚举。
+	if normalized == "inactive" || normalized == "disabled" || normalized == "2" ||
+		normalized == "error" || normalized == "stopped" || normalized == "ban" || normalized == "banned" {
 		return "inactive"
 	}
 	return "active"
@@ -746,7 +761,7 @@ func targetStatusEnabled(platform string, status string) bool {
 	if platform == string(upstream.PlatformNewAPI) {
 		return status == "1"
 	}
-	return status == "active"
+	return normalizeTargetStatus(platform, status) == "active"
 }
 
 func normalizedTargetWeight(target AdminProbeTarget) *int {
