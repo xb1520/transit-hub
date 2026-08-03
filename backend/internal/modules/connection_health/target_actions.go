@@ -23,13 +23,22 @@ func (s *Service) reconcileTargetRemoteAction(
 	target AdminProbeTarget,
 	specs []probeModelSpec,
 ) (string, error) {
-	controlledModels := make(map[string]struct{})
+	// 模型限制：只要策略开启自动降级且支持探活即可写入上游 models（不强制开远端启停）。
+	// 账号启停：仍要求 AutoRemoteActionEnabled。
+	modelLimitModels := make(map[string]struct{})
+	statusModels := make(map[string]struct{})
 	for _, spec := range specs {
-		if spec.policy.Enabled && policyRemoteActionEnabled(spec.policy) {
-			controlledModels[spec.modelName] = struct{}{}
+		if !spec.policy.Enabled {
+			continue
+		}
+		if policySupportsProbing(spec.policy) && spec.policy.AutoDegradeEnabled {
+			modelLimitModels[spec.modelName] = struct{}{}
+		}
+		if policyRemoteActionEnabled(spec.policy) {
+			statusModels[spec.modelName] = struct{}{}
 		}
 	}
-	if len(controlledModels) == 0 {
+	if len(modelLimitModels) == 0 && len(statusModels) == 0 {
 		return "", nil
 	}
 
@@ -37,31 +46,61 @@ func (s *Service) reconcileTargetRemoteAction(
 	if err != nil {
 		return "", err
 	}
-	states := make([]ConnectionHealthState, 0, len(controlledModels))
+	// 聚合用：模型限制看 modelLimitModels；启停看 statusModels。两者并集用于读状态。
+	unionModels := make(map[string]struct{}, len(modelLimitModels)+len(statusModels))
+	for name := range modelLimitModels {
+		unionModels[name] = struct{}{}
+	}
+	for name := range statusModels {
+		unionModels[name] = struct{}{}
+	}
+	states := make([]ConnectionHealthState, 0, len(unionModels))
+	statusStates := make([]ConnectionHealthState, 0, len(statusModels))
+	modelLimitStates := make([]ConnectionHealthState, 0, len(modelLimitModels))
 	for _, state := range allStates {
-		if _, active := controlledModels[state.ModelName]; active {
+		if _, ok := unionModels[state.ModelName]; ok {
 			states = append(states, state)
+		}
+		if _, ok := statusModels[state.ModelName]; ok {
+			statusStates = append(statusStates, state)
+		}
+		if _, ok := modelLimitModels[state.ModelName]; ok {
+			modelLimitStates = append(modelLimitStates, state)
 		}
 	}
 	if len(states) == 0 {
 		return "", nil
 	}
-	statesComplete := len(states) == len(controlledModels)
+	statesComplete := len(statusStates) == len(statusModels) && len(statusModels) > 0
+	if len(statusModels) == 0 {
+		// 仅模型限制路径：不要求 status 完整。
+		statesComplete = len(modelLimitStates) == len(modelLimitModels)
+	}
 
 	stored, err := s.repo.GetTargetActionState(ctx, userID, adminAccountID, target.TargetID)
 	if err != nil {
 		return "", err
 	}
-	allHealthy, blocked, minWeight := aggregateTargetStates(states)
-	allHealthy = allHealthy && statesComplete
+	// 启停决策只看 statusModels 对应状态；模型限制单独用 modelLimitStates。
+	statusAggStates := statusStates
+	if len(statusModels) == 0 {
+		statusAggStates = nil
+	}
+	allHealthy, blocked, minWeight := aggregateTargetStates(statusAggStates)
+	if len(statusModels) == 0 {
+		allHealthy = true
+		blocked = false
+	} else {
+		allHealthy = allHealthy && statesComplete
+	}
 	// 模型限制摘除即使不阻塞账号启停，也需要 reconcile（可与启停路径独立）。
-	needsModelLimits := target.Platform == string(upstream.PlatformSub2API) &&
-		(hasModelLimitExclusion(states) || (stored != nil && strings.TrimSpace(stored.OriginalModels) != ""))
+	needsModelLimits := target.Platform == string(upstream.PlatformSub2API) && len(modelLimitModels) > 0 &&
+		(hasModelLimitExclusion(modelLimitStates) || (stored != nil && (strings.TrimSpace(stored.OriginalModels) != "" || strings.TrimSpace(stored.LastAppliedModels) != "")))
 	// 账号启停：普通 degraded 只记健康；只有接管中 / 阻塞 / 恢复中才改上游启停。
-	needsStatusAction := blocked || hasRecoveringState(states) || (stored != nil && (stored.OriginalStatus != "" || stored.LastAppliedStatus != ""))
-	if stored != nil && strings.TrimSpace(stored.OriginalModels) != "" {
+	needsStatusAction := len(statusModels) > 0 && (blocked || hasRecoveringState(statusAggStates) || (stored != nil && (stored.OriginalStatus != "" || stored.LastAppliedStatus != "")))
+	if stored != nil && (strings.TrimSpace(stored.OriginalModels) != "" || strings.TrimSpace(stored.LastAppliedModels) != "") {
 		// 已建立模型限制快照时也算「已接管」，避免丢失快照。
-		needsStatusAction = true
+		needsStatusAction = needsStatusAction || len(statusModels) > 0
 	}
 	if !statesComplete && !blocked && !needsModelLimits {
 		return "", nil
@@ -78,7 +117,7 @@ func (s *Service) reconcileTargetRemoteAction(
 	currentWeight := normalizedTargetWeight(target)
 
 	// —— 仅模型限制、尚未接管启停：用轻量快照，绝不改账号 active/inactive ——
-	if stored == nil && needsModelLimits && !blocked && !hasRecoveringState(states) {
+	if stored == nil && needsModelLimits && !needsStatusAction {
 		stored = &TargetActionState{
 			UserID: userID, AdminAccountID: adminAccountID, TargetID: target.TargetID,
 			OriginalStatus: currentStatus, OriginalWeight: cloneIntPointer(currentWeight),
@@ -87,7 +126,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 			return "", err
 		}
-		return s.reconcileTargetModelLimits(ctx, session, target, states, stored)
+		return s.reconcileTargetModelLimits(ctx, session, target, modelLimitStates, stored)
 	}
 
 	if stored == nil {
@@ -95,7 +134,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		originalWeight := cloneIntPointer(currentWeight)
 		// 用户原本就在上游暂停的账号不属于自动恢复对象，探活可以继续，但绝不替用户启用。
 		if !targetStatusEnabled(target.Platform, currentStatus) {
-			if !legacyTargetWasManaged(states) {
+			if !legacyTargetWasManaged(statusAggStates) {
 				// 仍可尝试模型限制（账号本来就停用，改 models 无害）。
 				if needsModelLimits {
 					stored = &TargetActionState{
@@ -106,7 +145,7 @@ func (s *Service) reconcileTargetRemoteAction(
 					if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 						return "", err
 					}
-					return s.reconcileTargetModelLimits(ctx, session, target, states, stored)
+					return s.reconcileTargetModelLimits(ctx, session, target, modelLimitStates, stored)
 				}
 				return RemoteActionSkippedTargetInitiallyDisabled, nil
 			}
@@ -122,7 +161,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 			return "", err
 		}
-	} else if targetActionCheckpointConflicted(target, stored, currentStatus, currentWeight) {
+	} else if len(statusModels) > 0 && targetActionCheckpointConflicted(target, stored, currentStatus, currentWeight) {
 		stored.Conflict = true
 		stored.PendingStatus = ""
 		stored.PendingWeight = nil
@@ -137,16 +176,25 @@ func (s *Service) reconcileTargetRemoteAction(
 	}
 
 	// 先处理 sub2api 模型限制摘除/恢复；动作标签可能与账号启停叠加。
-	modelsAction, modelsErr := s.reconcileTargetModelLimits(ctx, session, target, states, stored)
-	if modelsErr != nil {
-		log.Printf("[connection-health] reconcile model limits failed target_id=%s action=%s err=%v", target.TargetID, modelsAction, modelsErr)
-		if modelsAction == "" {
-			modelsAction = RemoteActionSub2APIModelsUpdateFailed
+	var modelsAction string
+	var modelsErr error
+	if needsModelLimits {
+		modelsAction, modelsErr = s.reconcileTargetModelLimits(ctx, session, target, modelLimitStates, stored)
+		if modelsErr != nil {
+			log.Printf("[connection-health] reconcile model limits failed target_id=%s action=%s err=%v", target.TargetID, modelsAction, modelsErr)
+			if modelsAction == "" {
+				modelsAction = RemoteActionSub2APIModelsUpdateFailed
+			}
 		}
 	}
 
+	// 无远端启停权限时，只做模型限制。
+	if len(statusModels) == 0 {
+		return modelsAction, modelsErr
+	}
+
 	// 仅模型限制场景且当前不需要改启停：保持原启停，不强制 active。
-	if !blocked && !hasRecoveringState(states) && !allHealthy {
+	if !blocked && !hasRecoveringState(statusAggStates) && !allHealthy {
 		// 没有账号级阻塞时不要把用户手动 inactive 的账号改回 active。
 		if !targetStatusEnabled(target.Platform, currentStatus) &&
 			normalizeTargetStatus(target.Platform, stored.OriginalStatus) == currentStatus {

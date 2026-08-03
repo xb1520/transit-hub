@@ -276,9 +276,9 @@ func TestProbeTargetOnce_Sub2APIRealPlatformServiceComboDegradeSucceeds(t *testi
 	}
 }
 
-// TestProbeTargetOnce_Sub2APIRemoteActionDisabledSkipsUpstream 验证 AutoRemoteActionEnabled=false
-// 时，即使状态机触发远端动作，也绝不调用 sub2api PUT 接口，只记录 skipped_independent_probe。
-func TestProbeTargetOnce_Sub2APIRemoteActionDisabledSkipsUpstream(t *testing.T) {
+// TestProbeTargetOnce_Sub2APIRemoteActionDisabledStillUpdatesModelLimits 验证
+// AutoRemoteActionEnabled=false 时：不改账号 status，但仍摘除暂停模型的模型限制。
+func TestProbeTargetOnce_Sub2APIRemoteActionDisabledStillUpdatesModelLimits(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -304,10 +304,13 @@ func TestProbeTargetOnce_Sub2APIRemoteActionDisabledSkipsUpstream(t *testing.T) 
 		t.Fatalf("expected hard failure to suspend, got %+v", results)
 	}
 	if len(platform.sub2APICalls) != 0 {
-		t.Fatalf("expected no upstream call when AutoRemoteActionEnabled=false, got %+v", platform.sub2APICalls)
+		t.Fatalf("expected no account status call when AutoRemoteActionEnabled=false, got %+v", platform.sub2APICalls)
+	}
+	if len(platform.sub2APIModelCalls) != 1 {
+		t.Fatalf("expected model limits update even when remote status action disabled, got %+v", platform.sub2APIModelCalls)
 	}
 	st := repo.states[targetID]["gpt-4o"]
-	if st.LastRemoteAction != RemoteActionSkippedIndependentProbe {
-		t.Fatalf("expected LastRemoteAction=%s, got %q", RemoteActionSkippedIndependentProbe, st.LastRemoteAction)
+	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APIModelsUpdated) {
+		t.Fatalf("expected LastRemoteAction to include models update, got %q", st.LastRemoteAction)
 	}
 }

@@ -108,17 +108,62 @@ func parseSub2APIAccount(record map[string]any) AdminGroupAccountInfo {
 	if p := firstString(record, []string{"platform"}); p != nil {
 		account.Platform = *p
 	}
-	// models 可能是逗号字符串，也可能是 JSON 数组（不同 sub2api 版本不一致）。
-	account.Models = parseModelsField(record, "models")
+	// Sub2API 模型限制优先来自 credentials.model_mapping 的 key（白名单恒等映射）；
+	// 兼容顶层 models 字符串/数组（旧分支或其它平台）。
+	account.Models = parseSub2APIAccountModels(record)
 	return account
 }
 
-// parseModelsField 读取账号/渠道的模型限制字段，兼容 string 与 []string/[]any。
+// parseSub2APIAccountModels 解析账号的模型白名单，兼容多种上游表示。
+func parseSub2APIAccountModels(record map[string]any) string {
+	if m := parseModelsField(record, "models"); m != "" {
+		return m
+	}
+	if m := extractModelMappingKeys(record["model_mapping"]); m != "" {
+		return m
+	}
+	if creds, ok := record["credentials"].(map[string]any); ok {
+		if m := extractModelMappingKeys(creds["model_mapping"]); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// parseModelsField 读取模型限制字段，兼容 string 与 []string/[]any。
 func parseModelsField(record map[string]any, key string) string {
 	raw, ok := record[key]
 	if !ok || raw == nil {
 		return ""
 	}
+	return coerceModelsValue(raw)
+}
+
+// extractModelMappingKeys 从 model_mapping 对象取出 key 列表（白名单模型名）。
+func extractModelMappingKeys(raw any) string {
+	switch v := raw.(type) {
+	case map[string]any:
+		parts := make([]string, 0, len(v))
+		for key := range v {
+			if trimmed := strings.TrimSpace(key); trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+		return strings.Join(parts, ",")
+	case map[string]string:
+		parts := make([]string, 0, len(v))
+		for key := range v {
+			if trimmed := strings.TrimSpace(key); trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+		return strings.Join(parts, ",")
+	default:
+		return coerceModelsValue(raw)
+	}
+}
+
+func coerceModelsValue(raw any) string {
 	switch v := raw.(type) {
 	case string:
 		return strings.TrimSpace(v)

@@ -69,6 +69,43 @@ func TestUpdateAdminTargetPriority_Sub2APIUsesFieldOnlyBulkUpdate(t *testing.T) 
 	}
 }
 
+func TestUpdateSub2APIAdminAccountModels_WritesModelMappingCredentials(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/bulk-update" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var err error
+		body, err = readJSONBody(r)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		writeJSON(w, map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	service := NewPlatformService(NewHTTPClient(server.Client()))
+	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
+	if err := service.UpdateSub2APIAdminAccountModels(session, "1515", "gpt-5.4,gpt-5.5"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSub2APIBulkAccountIDs(t, body, 1515)
+	creds, ok := body["credentials"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected credentials object, got %+v", body)
+	}
+	mapping, ok := creds["model_mapping"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected model_mapping, got %+v", creds)
+	}
+	if mapping["gpt-5.4"] != "gpt-5.4" || mapping["gpt-5.5"] != "gpt-5.5" {
+		t.Fatalf("identity mapping mismatch: %+v", mapping)
+	}
+	if _, hasModels := body["models"]; hasModels {
+		t.Fatalf("must not write top-level models field: %+v", body)
+	}
+}
+
 // TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback 验证旧版接口不支持时直接失败，
 // 不再尝试危险的 GET+PUT 整对象回写。
 func TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback(t *testing.T) {

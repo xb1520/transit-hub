@@ -2494,15 +2494,15 @@ func (s *PlatformService) updateSub2APIAdminAccountPriority(session Session, acc
 
 // sub2APIAdminAccountBulkUpdate 对应 Sub2API 的账号批量局部更新请求。指针字段配合
 // omitempty 保证请求体只包含本次明确要修改的字段，不会把详情接口缺失的 rate_multiplier、
-// credentials、group_ids 等字段用零值覆盖。
+// group_ids 等字段用零值覆盖。
 //
-// Models 使用指针：nil 表示本次不改模型限制；非 nil 时即使字符串为空也写入，
-// 以支持「清空模型限制」语义（与 status/priority 一致，字段级局部更新）。
+// Credentials 为部分合并写入（Sub2API merge 进现有 credentials JSONB）。
+// 模型限制必须写 credentials.model_mapping（白名单恒等映射）；顶层 models 无效。
 type sub2APIAdminAccountBulkUpdate struct {
-	AccountIDs []int64 `json:"account_ids"`
-	Priority   *int    `json:"priority,omitempty"`
-	Status     *string `json:"status,omitempty"`
-	Models     *string `json:"models,omitempty"`
+	AccountIDs  []int64        `json:"account_ids"`
+	Priority    *int           `json:"priority,omitempty"`
+	Status      *string        `json:"status,omitempty"`
+	Credentials map[string]any `json:"credentials,omitempty"`
 }
 
 // bulkUpdateSub2APIAdminAccount 只调用 Sub2API 的字段级批量更新接口。旧版或第三方分支若以
@@ -2540,13 +2540,31 @@ func (s *PlatformService) UpdateSub2APIAdminAccountStatus(session Session, accou
 	})
 }
 
-// UpdateSub2APIAdminAccountModels 通过字段级批量接口更新 sub2api 转发账号的「模型限制」
-// （accounts.models，逗号分隔）。供 connection_health 在 model_not_found / server_error
-// 时临时摘除异常模型，并在探活恢复后写回。
+// UpdateSub2APIAdminAccountModels 通过 bulk-update 写入 Sub2API 账号的模型白名单。
+// Sub2API 将「模型限制」存在 credentials.model_mapping（恒等映射 = 白名单；空对象 = 不限制），
+// 不是顶层 models 字段。credentials 为 merge 语义，只改 model_mapping，不会擦掉 api_key。
 func (s *PlatformService) UpdateSub2APIAdminAccountModels(session Session, accountID string, models string) error {
+	mapping := modelListToIdentityMapping(models)
 	return s.bulkUpdateSub2APIAdminAccount(session, accountID, sub2APIAdminAccountBulkUpdate{
-		Models: &models,
+		Credentials: map[string]any{
+			"model_mapping": mapping,
+		},
 	})
+}
+
+// modelListToIdentityMapping 把逗号分隔模型列表转为 Sub2API 白名单用的恒等 model_mapping。
+// 空列表 -> 空 map，表示清除模型限制（允许全部模型）。
+func modelListToIdentityMapping(models string) map[string]string {
+	parts := strings.Split(models, ",")
+	mapping := make(map[string]string, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		mapping[name] = name
+	}
+	return mapping
 }
 
 // sub2APIUserIDKeys/sub2APIUserCreatedAtKeys/sub2APIUserLastUsedAtKeys/sub2APIBalanceHistoryTimeKeys

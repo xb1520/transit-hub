@@ -110,10 +110,10 @@ type Metrics struct {
 	HistoryRecharge MetricValue `json:"historyRecharge"`
 	// LifetimeConsume 是平台累计实际消耗（上游原始单位，未乘 rechargeRate）。
 	// 预授信「累计消耗(成本)」= LifetimeConsume × rechargeRate。
-	LifetimeConsume MetricValue      `json:"lifetimeConsume"`
-	Group            GroupInfo        `json:"group"`
-	Groups           []GroupInfo      `json:"groups"`
-	Subscriptions    []SubscriptionInfo `json:"subscriptions,omitempty"`
+	LifetimeConsume MetricValue        `json:"lifetimeConsume"`
+	Group           GroupInfo          `json:"group"`
+	Groups          []GroupInfo        `json:"groups"`
+	Subscriptions   []SubscriptionInfo `json:"subscriptions,omitempty"`
 }
 
 // SubscriptionInfo 是上游订阅资产（与钱包余额分开展示）。
@@ -361,11 +361,11 @@ type SettlementSummary struct {
 // 资料"弹窗需要展示的只读字段。字段在远端响应中不存在或类型不匹配时保持零值/nil，
 // 由调用方（tickets.Service）按需降级展示，不在这里伪造数据。
 type Sub2APIAdminUser struct {
-	ID            string
-	Email         string
-	Username      string
-	Role          string
-	Status        string
+	ID       string
+	Email    string
+	Username string
+	Role     string
+	Status   string
 	// Notes 是 Sub2API 后台用户备注（notes / remark 等字段）。
 	Notes         string
 	Balance       *float64
@@ -435,12 +435,12 @@ type Sub2APIUserBreakdown struct {
 
 // Sub2APIUserGroupUsage 是某用户在日期区间内按分组汇总的用量（admin dashboard/groups + user_id）。
 type Sub2APIUserGroupUsage struct {
-	GroupID      string
-	GroupName    string
-	ActualCost   float64
-	Cost         float64
-	Requests     int
-	TotalTokens  int64
+	GroupID     string
+	GroupName   string
+	ActualCost  float64
+	Cost        float64
+	Requests    int
+	TotalTokens int64
 }
 
 // Sub2APIBatchUserUsage 来自 POST /api/v1/admin/dashboard/users-usage 的单用户汇总。

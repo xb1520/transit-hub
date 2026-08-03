@@ -161,28 +161,129 @@ func (s *Service) runSchedulerTick(ctx context.Context) {
 		return
 	}
 	jobs := s.collectAdminProbeJobsWithGroupsAndCache(ctx, policies, assignments, groupAssignments, exclusions, inventoryCache)
-	if len(jobs) == 0 {
+	if len(jobs) > 0 {
+		globalSem := make(chan struct{}, globalProbeConcurrency)
+		workspaceSemaphores := make(map[string]chan struct{})
+		var wg sync.WaitGroup
+
+		for _, j := range jobs {
+			wsKey := j.userID + "|" + j.adminAccountID
+			wsSem, ok := workspaceSemaphores[wsKey]
+			if !ok {
+				wsSem = make(chan struct{}, perSiteProbeConcurrency)
+				workspaceSemaphores[wsKey] = wsSem
+			}
+
+			wg.Add(1)
+			globalSem <- struct{}{}
+			wsSem <- struct{}{}
+			go s.runAdminProbeJob(ctx, j, globalSem, wsSem, &wg)
+		}
+		wg.Wait()
+	}
+
+	// 探活有冷却/间隔：已暂停模型可能本轮不会再被探测。每 tick 根据库内状态立即同步
+	// sub2api 模型限制，避免「已探活暂停但要等下一轮探测才摘除」。
+	s.syncModelLimitsFromStoredStates(ctx, policies, assignments, groupAssignments, exclusions, inventoryCache)
+}
+
+// syncModelLimitsFromStoredStates 不发起探活，只根据库内已有健康状态同步 sub2api 模型白名单。
+// 解决「探活冷却期内不再探测 → 摘除滞后」以及「写错字段后需下一轮立即纠正」。
+func (s *Service) syncModelLimitsFromStoredStates(
+	ctx context.Context,
+	policies []Policy,
+	targetAssignments []PolicyAssignment,
+	groupAssignments []GroupPolicyAssignment,
+	exclusions []GroupTargetExclusion,
+	inventoryCache adminInventoryCache,
+) {
+	if s.platformGroups == nil || s.dispatcher == nil {
 		return
 	}
+	targetPolicies := assignedEnabledPoliciesByTarget(policies, targetAssignments)
+	groupPolicies := assignedEnabledPoliciesByGroup(policies, groupAssignments)
+	excluded := groupTargetExclusionIndex(exclusions)
 
-	globalSem := make(chan struct{}, globalProbeConcurrency)
-	workspaceSemaphores := make(map[string]chan struct{})
-	var wg sync.WaitGroup
-
-	for _, j := range jobs {
-		wsKey := j.userID + "|" + j.adminAccountID
-		wsSem, ok := workspaceSemaphores[wsKey]
-		if !ok {
-			wsSem = make(chan struct{}, perSiteProbeConcurrency)
-			workspaceSemaphores[wsKey] = wsSem
+	type wsKey struct{ userID, adminAccountID string }
+	workspaces := make(map[wsKey]struct{})
+	for _, p := range policies {
+		if p.Enabled {
+			workspaces[wsKey{p.UserID, p.AdminAccountID}] = struct{}{}
 		}
-
-		wg.Add(1)
-		globalSem <- struct{}{}
-		wsSem <- struct{}{}
-		go s.runAdminProbeJob(ctx, j, globalSem, wsSem, &wg)
 	}
-	wg.Wait()
+	for _, a := range targetAssignments {
+		workspaces[wsKey{a.UserID, a.AdminAccountID}] = struct{}{}
+	}
+	for _, a := range groupAssignments {
+		workspaces[wsKey{a.UserID, a.AdminAccountID}] = struct{}{}
+	}
+
+	for ws := range workspaces {
+		inventory, err := s.loadAdminInventory(ctx, ws.userID, ws.adminAccountID, inventoryCache)
+		if err != nil {
+			continue
+		}
+		platform := string(inventory.session.Platform)
+		if platform != string(upstream.PlatformSub2API) {
+			continue
+		}
+		// 每个 target 可能出现在多个分组；合并策略后只 reconcile 一次。
+		type targetBundle struct {
+			target   AdminProbeTarget
+			policies []Policy
+		}
+		bundles := make(map[string]*targetBundle)
+		for _, groupInventory := range inventory.groups {
+			if groupInventory.err != nil {
+				continue
+			}
+			for _, acc := range groupInventory.accounts {
+				targetID := buildTargetID(platform, ws.adminAccountID, acc.ID)
+				inherited := groupPolicies[ws.userID+"|"+ws.adminAccountID][groupInventory.group.ID]
+				if excluded[ws.userID+"|"+ws.adminAccountID][groupInventory.group.ID][targetID] {
+					inherited = nil
+				}
+				effective := mergePoliciesByID(targetPolicies[ws.userID+"|"+ws.adminAccountID][targetID], inherited)
+				if len(effective) == 0 {
+					continue
+				}
+				b, ok := bundles[targetID]
+				if !ok {
+					target := AdminProbeTarget{
+						TargetID: targetID, Platform: platform,
+						AdminGroupID: groupInventory.group.ID, AdminGroupName: groupInventory.group.Name,
+						AccountID: acc.ID, AccountName: acc.Name, AccountStatus: acc.Status,
+						AccountWeight: cloneIntPointer(acc.Weight), ProviderFamily: acc.Platform,
+						Models: splitModelList(acc.Models),
+					}
+					if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, targetID); storeErr == nil {
+						target = expandTargetModelsForProbe(target, stored)
+					}
+					b = &targetBundle{target: target}
+					bundles[targetID] = b
+				}
+				b.policies = mergePoliciesByID(b.policies, effective)
+			}
+		}
+		for targetID, b := range bundles {
+			// 无 suspended 且无已管理模型限制时跳过，减少上游写放大。
+			states, stateErr := s.repo.ListStatesByConnection(ctx, targetID)
+			if stateErr != nil {
+				continue
+			}
+			stored, _ := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, targetID)
+			if !hasModelLimitExclusion(states) && (stored == nil || !hasManagedModelLimits(stored)) {
+				continue
+			}
+			specs := candidateModelSpecs(b.target.Models, b.policies)
+			if len(specs) == 0 {
+				continue
+			}
+			if _, err := s.reconcileTargetRemoteAction(ctx, ws.userID, ws.adminAccountID, inventory.session, b.target, specs); err != nil {
+				log.Printf("[connection-health] model-limits sweep failed target_id=%s err=%v", targetID, err)
+			}
+		}
+	}
 }
 
 // runAdminProbeJob 处理单个目标的到期任务：先解析一次凭据；凭据不可用时对每个到期模型记录

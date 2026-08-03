@@ -83,7 +83,7 @@ func TestFetchNewAPISelfTopupHistory_PaginatesAll(t *testing.T) {
 	for i := 1; i <= 100; i++ {
 		page1Items = append(page1Items, map[string]any{
 			"id": i, "money": 1.0, "status": "success",
-			"trade_no": "T" + strconv.Itoa(i),
+			"trade_no":    "T" + strconv.Itoa(i),
 			"create_time": float64(1712345678 - i),
 		})
 	}

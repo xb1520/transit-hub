@@ -83,17 +83,17 @@ type MarkRechargeInput struct {
 
 // RechargeCandidate 平台充值候选 + 本地标记。
 type RechargeCandidate struct {
-	PlatformID      string   `json:"platformId"`
-	PlatformType    string   `json:"platformType,omitempty"`
-	AmountPlatform  float64  `json:"amountPlatform"`
-	AmountCost      float64  `json:"amountCost"`
-	Note            string   `json:"note,omitempty"`
-	CreatedAt       *string  `json:"createdAt,omitempty"`
-	SuggestedTag    string   `json:"suggestedTag,omitempty"` // recharge | gift | rebate
-	Tag             string   `json:"tag,omitempty"`          // 已标记
-	LedgerID        string   `json:"ledgerId,omitempty"`
-	CountsAsInbound bool     `json:"countsAsInbound"`
-	BusinessDate    string   `json:"businessDate,omitempty"`
+	PlatformID      string  `json:"platformId"`
+	PlatformType    string  `json:"platformType,omitempty"`
+	AmountPlatform  float64 `json:"amountPlatform"`
+	AmountCost      float64 `json:"amountCost"`
+	Note            string  `json:"note,omitempty"`
+	CreatedAt       *string `json:"createdAt,omitempty"`
+	SuggestedTag    string  `json:"suggestedTag,omitempty"` // recharge | gift | rebate
+	Tag             string  `json:"tag,omitempty"`          // 已标记
+	LedgerID        string  `json:"ledgerId,omitempty"`
+	CountsAsInbound bool    `json:"countsAsInbound"`
+	BusinessDate    string  `json:"businessDate,omitempty"`
 }
 
 // RechargeCandidatesResponse 站点充值记录列表（后端全量拉取后按 page 切片返回）。
@@ -1043,6 +1043,7 @@ func (s *Service) InboundOnDate(ctx context.Context, userID, adminAccountID, dat
 //   - 返利 → rebate（不计今日进货）
 //   - 支付/管理员加款/兑换/订阅等 → recharge（计今日进货）
 //   - 明确赠送 → gift（不计进货；极少自动）
+//
 // 仅处理「今日」业务日，避免历史全量刷进今日；已有标记（含用户手改）由 Upsert 的 voided 保护与 kind 更新策略处理。
 // 预授信站跳过。
 func (s *Service) ProcessLedgerAfterSync(
