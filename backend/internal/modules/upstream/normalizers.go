@@ -319,17 +319,32 @@ func quotaToUSDValueWithUnit(value *float64, quotaPerUnit float64) float64 {
 func newAPIGroups(groupsPayload any, pricingPayload any) []GroupInfo {
 	groupsRecord := dataRecord(groupsPayload)
 	pricingRecord := dataRecord(pricingPayload)
+	// Merge order matters for new-api:
+	//  1) /api/pricing group_ratio  = global GroupRatio (base rates)
+	//  2) /api/user/self/groups     = effective rates after GroupGroupRatio
+	//     (user-group × usage-group specials)
+	// Prefer self/groups so token-page and billing-facing multipliers match.
+	// Pricing only fills groups the user endpoint did not return.
 	groupRatios := map[string]*float64{}
-	for name, source := range groupsRecord {
-		if ratio := firstNumber(source, []string{"ratio", "rate", "multiplier"}); ratio != nil {
-			groupRatios[name] = ratio
-		}
-	}
 	if values, ok := pricingRecord["group_ratio"].(map[string]any); ok {
 		for name, source := range values {
 			if ratio := readNumber(source); ratio != nil {
 				groupRatios[name] = ratio
 			}
+		}
+	}
+	for name, source := range groupsRecord {
+		// Skip non-group bookkeeping keys if a payload nests group_ratio oddly.
+		if name == "group_ratio" || name == "usable_group" {
+			continue
+		}
+		if ratio := firstNumber(source, []string{"ratio", "rate", "multiplier"}); ratio != nil {
+			groupRatios[name] = ratio
+			continue
+		}
+		// Some fixtures / older shapes return bare numeric ratios per group name.
+		if ratio := readNumber(source); ratio != nil {
+			groupRatios[name] = ratio
 		}
 	}
 	usableGroups := map[string]string{}
