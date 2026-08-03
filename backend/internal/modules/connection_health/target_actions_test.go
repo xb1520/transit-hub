@@ -165,6 +165,32 @@ func TestReconcileTargetRemoteAction_DoesNotEnableInitiallyDisabledTarget(t *tes
 	}
 }
 
+func TestReconcileTargetRemoteAction_RestoresDespiteLastAppliedMismatch(t *testing.T) {
+	// LastApplied=active 但上游仍是 inactive/error（写入失败或进程中断）时，
+	// 不得永久 conflict，应重试写 active。
+	repo := newFakeRepository()
+	platform := &fakePlatformActioner{}
+	service := &Service{repo: repo, dispatcher: newRemoteActionDispatcher(nil, nil, platform)}
+	targetID := "sub2api:ws1:5"
+	repo.states[targetID] = map[string]ConnectionHealthState{
+		"gpt-5.4": {ConnectionID: targetID, ModelName: "gpt-5.4", State: StateHealthy, CurrentWeight: 100},
+	}
+	repo.targetActionStates["user1|ws1|"+targetID] = TargetActionState{
+		UserID: "user1", AdminAccountID: "ws1", TargetID: targetID,
+		OriginalStatus: "active", LastAppliedStatus: "active", // 本地以为已恢复
+	}
+	policy := Policy{ID: "p1", Enabled: true, AutoDegradeEnabled: true, AutoRemoteActionEnabled: true}
+	target := AdminProbeTarget{TargetID: targetID, Platform: string(upstream.PlatformSub2API), AccountID: "5", AccountStatus: "error"}
+
+	action, err := service.reconcileTargetRemoteAction(context.Background(), "user1", "ws1", upstream.Session{Platform: upstream.PlatformSub2API}, target, []probeModelSpec{{modelName: "gpt-5.4", policy: policy}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if action != RemoteActionSub2APIStatusActive || len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("must retry active write on inactive/error mismatch, action=%q calls=%+v", action, platform.sub2APICalls)
+	}
+}
+
 func TestReconcileTargetRemoteAction_RestoresOrphanInactiveWithHealthyModels(t *testing.T) {
 	// 无 TargetActionState 快照（如磁盘故障丢失），但模型已全部健康、账号仍 inactive：
 	// 必须拉回 active，不能当成「用户原本停用」永久跳过。

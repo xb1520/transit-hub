@@ -172,23 +172,39 @@ func (s *Service) reconcileTargetRemoteAction(
 			return "", err
 		}
 	} else if len(statusModels) > 0 && targetActionCheckpointConflicted(target, stored, currentStatus, currentWeight) {
-		stored.Conflict = true
-		stored.PendingStatus = ""
-		stored.PendingWeight = nil
-		stored.PendingModels = ""
-		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
-			return "", err
+		// 当前停用 + 有健康有效模型：优先视为「写入失败/进程中断/error 残留」，不要标死 conflict。
+		// 只有账号已启用却与 lastApplied 不一致时，才当作用户手动改动并停止覆盖。
+		if !targetStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
+			log.Printf("[connection-health] ignore status mismatch for restore target_id=%s current=%s lastApplied=%s pending=%s",
+				target.TargetID, currentStatus, stored.LastAppliedStatus, stored.PendingStatus)
+			stored.Conflict = false
+			stored.PendingStatus = ""
+			stored.PendingWeight = nil
+		} else {
+			stored.Conflict = true
+			stored.PendingStatus = ""
+			stored.PendingWeight = nil
+			stored.PendingModels = ""
+			if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+				return "", err
+			}
+			log.Printf("[connection-health] skip target conflict target_id=%s current=%s lastApplied=%s",
+				target.TargetID, currentStatus, stored.LastAppliedStatus)
+			return RemoteActionSkippedTargetConflict, nil
 		}
-		return RemoteActionSkippedTargetConflict, nil
 	}
 	if stored.Conflict {
-		// 若上游当前值仍等于系统最后写入值，说明并非用户手动改动后的残留冲突，
-		// 允许继续恢复（避免历史误标 conflict 导致永久无法启用）。
-		if targetStateEqual(target, currentStatus, currentWeight, stored.LastAppliedStatus, stored.LastAppliedWeight) {
+		// 停用且有健康模型：清掉陈旧 conflict，允许恢复。
+		if !targetStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
+			log.Printf("[connection-health] clear conflict for inactive healthy target_id=%s", target.TargetID)
+			stored.Conflict = false
+		} else if targetStateEqual(target, currentStatus, currentWeight, stored.LastAppliedStatus, stored.LastAppliedWeight) {
 			log.Printf("[connection-health] clear stale target conflict target_id=%s current=%s lastApplied=%s",
 				target.TargetID, currentStatus, stored.LastAppliedStatus)
 			stored.Conflict = false
 		} else {
+			log.Printf("[connection-health] skip stored conflict target_id=%s current=%s lastApplied=%s",
+				target.TargetID, currentStatus, stored.LastAppliedStatus)
 			return RemoteActionSkippedTargetConflict, nil
 		}
 	}
@@ -769,12 +785,17 @@ func normalizeTargetStatus(platform string, status string) string {
 		}
 		return "2"
 	}
-	// Sub2API 管理端「停用」可能对应 inactive / error / disabled 等枚举。
+	// Sub2API 账号 status 仅允许 active / inactive / error（error 在管理端也显示为停用）。
 	if normalized == "inactive" || normalized == "disabled" || normalized == "2" ||
 		normalized == "error" || normalized == "stopped" || normalized == "ban" || normalized == "banned" {
 		return "inactive"
 	}
-	return "active"
+	// 显式 active / enabled / 1 / 空（部分列表缺省）视为启用。
+	if normalized == "" || normalized == "active" || normalized == "enabled" || normalized == "1" || normalized == "normal" {
+		return "active"
+	}
+	// 未知枚举按停用处理，避免误判为已恢复而跳过写入。
+	return "inactive"
 }
 
 func targetStatusEnabled(platform string, status string) bool {
