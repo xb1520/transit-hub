@@ -304,6 +304,10 @@ func (s *Service) ProbeTarget(ctx context.Context, userID string, targetID strin
 	if err != nil {
 		return nil, err
 	}
+	// 已摘除模型限制时仍用 OriginalModels 作为候选，避免被摘模型无法再被手动探活恢复。
+	if stored, storeErr := s.repo.GetTargetActionState(ctx, userID, adminAccountID, target.TargetID); storeErr == nil {
+		target = expandTargetModelsForProbe(target, stored)
+	}
 	allSpecs := candidateModelSpecs(target.Models, policies)
 	specs := allSpecs
 

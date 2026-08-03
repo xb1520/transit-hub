@@ -142,6 +142,10 @@ type PrioritySyncState struct {
 
 // TargetActionState 记录分组健康首次接管账号/渠道启停或权重前的上游状态。
 // 健康恢复后只能恢复到这里保存的原值，不能假设账号原本一定启用或权重一定为 100。
+//
+// OriginalModels / LastAppliedModels 用于 sub2api 账号「模型限制」的自动摘除与恢复：
+// 当探活明确判定 model_not_found / server_error 时，从上游 models 字段移除该模型；
+// 探活恢复后写回。OriginalModels 保存首次接管时的完整限制列表，供持续探活与恢复使用。
 type TargetActionState struct {
 	UserID            string
 	AdminAccountID    string
@@ -152,6 +156,9 @@ type TargetActionState struct {
 	LastAppliedWeight *int
 	PendingStatus     string
 	PendingWeight     *int
+	OriginalModels    string
+	LastAppliedModels string
+	PendingModels     string
 	Conflict          bool
 	UpdatedAt         time.Time
 }

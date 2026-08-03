@@ -39,7 +39,12 @@ type fakePlatformActioner struct {
 		accountID string
 		status    string
 	}
-	sub2APIErr error
+	sub2APIModelCalls []struct {
+		accountID string
+		models    string
+	}
+	sub2APIErr       error
+	sub2APIModelsErr error
 }
 
 func (f *fakePlatformActioner) UpdateNewAPIChannelWeightStatus(session upstream.Session, channelID string, weight int, status int) error {
@@ -63,6 +68,17 @@ func (f *fakePlatformActioner) UpdateSub2APIAdminAccountStatus(session upstream.
 		status    string
 	}{accountID, status})
 	return f.sub2APIErr
+}
+
+func (f *fakePlatformActioner) UpdateSub2APIAdminAccountModels(session upstream.Session, accountID string, models string) error {
+	if f.panicValue != nil {
+		panic(f.panicValue)
+	}
+	f.sub2APIModelCalls = append(f.sub2APIModelCalls, struct {
+		accountID string
+		models    string
+	}{accountID, models})
+	return f.sub2APIModelsErr
 }
 
 func TestActions_NewAPIDegradeSuccess(t *testing.T) {

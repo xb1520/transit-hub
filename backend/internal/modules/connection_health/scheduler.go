@@ -396,6 +396,10 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 				break
 			}
 			candidate := candidates[targetID]
+			// 若已对 sub2api 模型限制做过摘除，用 OriginalModels 继续探活被摘除的模型，才能自动恢复。
+			if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, candidate.target.TargetID); storeErr == nil {
+				candidate.target = expandTargetModelsForProbe(candidate.target, stored)
+			}
 			specs := candidateModelSpecs(candidate.target.Models, candidate.policies)
 			for index := range specs {
 				if source, exists := candidate.policySources[specs[index].policy.ID]; exists {

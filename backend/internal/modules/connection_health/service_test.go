@@ -624,6 +624,10 @@ func (noopRemoteActionRunner) ApplyTargetState(ctx context.Context, session upst
 	return "", nil
 }
 
+func (noopRemoteActionRunner) ApplyTargetModels(ctx context.Context, session upstream.Session, target AdminProbeTarget, models string) (string, error) {
+	return "", nil
+}
+
 func TestGroups_NoRealConnectionsShowsNotConnected(t *testing.T) {
 	repo := newFakeRepository()
 	mySites := fakeMySitesReader{

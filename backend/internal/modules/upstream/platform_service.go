@@ -1408,12 +1408,12 @@ func (s *PlatformService) fetchNewAPIMetrics(session Session, loginData map[stri
 	}
 	qpu := session.QuotaPerUnit
 	return Metrics{
-		Balance:          metric(quotaToUSDWithUnit(quota, qpu)),
-		TodayConsume:     metric(quotaToUSDWithUnit(firstNumber(dataRecord(stat.Payload), []string{"quota", "used_quota", "usedQuota"}), qpu)),
-		HistoryRecharge:  metric(quotaToUSDWithUnit(estimatedGranted, qpu)),
+		Balance:         metric(quotaToUSDWithUnit(quota, qpu)),
+		TodayConsume:    metric(quotaToUSDWithUnit(firstNumber(dataRecord(stat.Payload), []string{"quota", "used_quota", "usedQuota"}), qpu)),
+		HistoryRecharge: metric(quotaToUSDWithUnit(estimatedGranted, qpu)),
 		LifetimeConsume: metric(quotaToUSDWithUnit(usedQuota, qpu)),
-		Group:            group,
-		Groups:           groups,
+		Group:           group,
+		Groups:          groups,
 	}, nil
 }
 
@@ -1459,13 +1459,13 @@ func (s *PlatformService) fetchSub2APIMetrics(session Session) (Metrics, error) 
 		firstGroup = groups[0]
 	}
 	return Metrics{
-		Balance:          metric(balance),
-		TodayConsume:     metric(firstNumber(statsData, []string{"today_actual_cost"})),
-		HistoryRecharge:  metric(totalRecharged),
+		Balance:         metric(balance),
+		TodayConsume:    metric(firstNumber(statsData, []string{"today_actual_cost"})),
+		HistoryRecharge: metric(totalRecharged),
 		LifetimeConsume: metric(lifetimeConsume),
-		Group:            firstGroup,
-		Groups:           groups,
-		Subscriptions:    subscriptions,
+		Group:           firstGroup,
+		Groups:          groups,
+		Subscriptions:   subscriptions,
 	}, nil
 }
 
@@ -2495,10 +2495,14 @@ func (s *PlatformService) updateSub2APIAdminAccountPriority(session Session, acc
 // sub2APIAdminAccountBulkUpdate 对应 Sub2API 的账号批量局部更新请求。指针字段配合
 // omitempty 保证请求体只包含本次明确要修改的字段，不会把详情接口缺失的 rate_multiplier、
 // credentials、group_ids 等字段用零值覆盖。
+//
+// Models 使用指针：nil 表示本次不改模型限制；非 nil 时即使字符串为空也写入，
+// 以支持「清空模型限制」语义（与 status/priority 一致，字段级局部更新）。
 type sub2APIAdminAccountBulkUpdate struct {
 	AccountIDs []int64 `json:"account_ids"`
 	Priority   *int    `json:"priority,omitempty"`
 	Status     *string `json:"status,omitempty"`
+	Models     *string `json:"models,omitempty"`
 }
 
 // bulkUpdateSub2APIAdminAccount 只调用 Sub2API 的字段级批量更新接口。旧版或第三方分支若以
@@ -2533,6 +2537,15 @@ func (s *PlatformService) bulkUpdateSub2APIAdminAccount(session Session, account
 func (s *PlatformService) UpdateSub2APIAdminAccountStatus(session Session, accountID string, status string) error {
 	return s.bulkUpdateSub2APIAdminAccount(session, accountID, sub2APIAdminAccountBulkUpdate{
 		Status: &status,
+	})
+}
+
+// UpdateSub2APIAdminAccountModels 通过字段级批量接口更新 sub2api 转发账号的「模型限制」
+// （accounts.models，逗号分隔）。供 connection_health 在 model_not_found / server_error
+// 时临时摘除异常模型，并在探活恢复后写回。
+func (s *PlatformService) UpdateSub2APIAdminAccountModels(session Session, accountID string, models string) error {
+	return s.bulkUpdateSub2APIAdminAccount(session, accountID, sub2APIAdminAccountBulkUpdate{
+		Models: &models,
 	})
 }
 

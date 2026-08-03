@@ -72,6 +72,13 @@ const aggregateState = (account: AdminGroupAccount): ConnectionHealthState | '' 
   return ''
 }
 
+/** 徽标 ×N 统计处于代表性状态的模型数，避免「仅 1 个暂停」显示成 ×全部模型数。 */
+const aggregateStateCount = (account: AdminGroupAccount): number => {
+  const state = aggregateState(account)
+  if (!state) return 0
+  return (account.modelHealth ?? []).filter((m) => m.state === state).length
+}
+
 const numberOrDash = (value: number | undefined | null): string =>
   value === undefined || value === null ? '-' : String(value)
 
@@ -193,7 +200,7 @@ const assignedPolicyLabel = (account: AdminGroupAccount): string => {
                       :class="connectionHealthStateBadgeClass(aggregateState(account))"
                     >
                       {{ stateLabel(aggregateState(account)) }}
-                      <span v-if="account.modelHealth.length > 1" class="ml-1 opacity-70">×{{ account.modelHealth.length }}</span>
+                      <span v-if="aggregateStateCount(account) > 1" class="ml-1 opacity-70">×{{ aggregateStateCount(account) }}</span>
                     </span>
                   </td>
                   <td class="py-2 pr-3">

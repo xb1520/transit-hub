@@ -194,6 +194,9 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_connection_health_target_action_workspace ON connection_health_target_action_states (user_id, admin_account_id)`,
 		`ALTER TABLE connection_health_target_action_states ADD COLUMN IF NOT EXISTS pending_status text NOT NULL DEFAULT ''`,
 		`ALTER TABLE connection_health_target_action_states ADD COLUMN IF NOT EXISTS pending_weight integer NULL`,
+		`ALTER TABLE connection_health_target_action_states ADD COLUMN IF NOT EXISTS original_models text NOT NULL DEFAULT ''`,
+		`ALTER TABLE connection_health_target_action_states ADD COLUMN IF NOT EXISTS last_applied_models text NOT NULL DEFAULT ''`,
+		`ALTER TABLE connection_health_target_action_states ADD COLUMN IF NOT EXISTS pending_models text NOT NULL DEFAULT ''`,
 
 		`CREATE TABLE IF NOT EXISTS connection_health_probe_budget_usage (
 			user_id text NOT NULL,
@@ -1222,13 +1225,15 @@ func (r *Repository) DeletePrioritySyncState(ctx context.Context, userID string,
 func (r *Repository) GetTargetActionState(ctx context.Context, userID string, adminAccountID string, targetID string) (*TargetActionState, error) {
 	row := r.db.QueryRow(ctx, `
 		SELECT user_id, admin_account_id, target_id, original_status, original_weight,
-			last_applied_status, last_applied_weight, pending_status, pending_weight, conflict, updated_at
+			last_applied_status, last_applied_weight, pending_status, pending_weight,
+			original_models, last_applied_models, pending_models, conflict, updated_at
 		FROM connection_health_target_action_states
 		WHERE user_id = $1 AND admin_account_id = $2 AND target_id = $3
 	`, userID, adminAccountID, targetID)
 	var state TargetActionState
 	if err := row.Scan(&state.UserID, &state.AdminAccountID, &state.TargetID, &state.OriginalStatus, &state.OriginalWeight,
-		&state.LastAppliedStatus, &state.LastAppliedWeight, &state.PendingStatus, &state.PendingWeight, &state.Conflict, &state.UpdatedAt); err != nil {
+		&state.LastAppliedStatus, &state.LastAppliedWeight, &state.PendingStatus, &state.PendingWeight,
+		&state.OriginalModels, &state.LastAppliedModels, &state.PendingModels, &state.Conflict, &state.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -1240,7 +1245,8 @@ func (r *Repository) GetTargetActionState(ctx context.Context, userID string, ad
 func (r *Repository) ListTargetActionStates(ctx context.Context, userID string, adminAccountID string) ([]TargetActionState, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT user_id, admin_account_id, target_id, original_status, original_weight,
-			last_applied_status, last_applied_weight, pending_status, pending_weight, conflict, updated_at
+			last_applied_status, last_applied_weight, pending_status, pending_weight,
+			original_models, last_applied_models, pending_models, conflict, updated_at
 		FROM connection_health_target_action_states
 		WHERE user_id = $1 AND admin_account_id = $2
 	`, userID, adminAccountID)
@@ -1254,7 +1260,8 @@ func (r *Repository) ListTargetActionStates(ctx context.Context, userID string, 
 func (r *Repository) ListAllTargetActionStates(ctx context.Context) ([]TargetActionState, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT user_id, admin_account_id, target_id, original_status, original_weight,
-			last_applied_status, last_applied_weight, pending_status, pending_weight, conflict, updated_at
+			last_applied_status, last_applied_weight, pending_status, pending_weight,
+			original_models, last_applied_models, pending_models, conflict, updated_at
 		FROM connection_health_target_action_states
 	`)
 	if err != nil {
@@ -1269,7 +1276,8 @@ func scanTargetActionStates(rows pgx.Rows) ([]TargetActionState, error) {
 	for rows.Next() {
 		var state TargetActionState
 		if err := rows.Scan(&state.UserID, &state.AdminAccountID, &state.TargetID, &state.OriginalStatus, &state.OriginalWeight,
-			&state.LastAppliedStatus, &state.LastAppliedWeight, &state.PendingStatus, &state.PendingWeight, &state.Conflict, &state.UpdatedAt); err != nil {
+			&state.LastAppliedStatus, &state.LastAppliedWeight, &state.PendingStatus, &state.PendingWeight,
+			&state.OriginalModels, &state.LastAppliedModels, &state.PendingModels, &state.Conflict, &state.UpdatedAt); err != nil {
 			return nil, err
 		}
 		states = append(states, state)
@@ -1281,8 +1289,9 @@ func (r *Repository) UpsertTargetActionState(ctx context.Context, state TargetAc
 	_, err := r.db.Exec(ctx, `
 		INSERT INTO connection_health_target_action_states (
 			user_id, admin_account_id, target_id, original_status, original_weight,
-			last_applied_status, last_applied_weight, pending_status, pending_weight, conflict, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
+			last_applied_status, last_applied_weight, pending_status, pending_weight,
+			original_models, last_applied_models, pending_models, conflict, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now())
 		ON CONFLICT (user_id, admin_account_id, target_id) DO UPDATE SET
 			original_status = EXCLUDED.original_status,
 			original_weight = EXCLUDED.original_weight,
@@ -1290,10 +1299,14 @@ func (r *Repository) UpsertTargetActionState(ctx context.Context, state TargetAc
 			last_applied_weight = EXCLUDED.last_applied_weight,
 			pending_status = EXCLUDED.pending_status,
 			pending_weight = EXCLUDED.pending_weight,
+			original_models = EXCLUDED.original_models,
+			last_applied_models = EXCLUDED.last_applied_models,
+			pending_models = EXCLUDED.pending_models,
 			conflict = EXCLUDED.conflict,
 			updated_at = now()
 	`, state.UserID, state.AdminAccountID, state.TargetID, state.OriginalStatus, state.OriginalWeight,
-		state.LastAppliedStatus, state.LastAppliedWeight, state.PendingStatus, state.PendingWeight, state.Conflict)
+		state.LastAppliedStatus, state.LastAppliedWeight, state.PendingStatus, state.PendingWeight,
+		state.OriginalModels, state.LastAppliedModels, state.PendingModels, state.Conflict)
 	return err
 }
 

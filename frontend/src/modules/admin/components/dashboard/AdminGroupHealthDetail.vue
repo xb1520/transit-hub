@@ -76,6 +76,13 @@ const aggregateState = (account: AdminGroupAccount): ConnectionHealthState | '' 
   return STATE_PRIORITY.find((state) => present.has(state)) ?? ''
 }
 
+/** 行首徽标的 ×N 必须统计「处于该代表性状态」的模型数，不能用模型总数（否则 1 个暂停会显示成 ×8）。 */
+const aggregateStateCount = (account: AdminGroupAccount): number => {
+  const state = aggregateState(account)
+  if (!state) return 0
+  return (account.modelHealth ?? []).filter((model) => model.state === state).length
+}
+
 const unprobedModels = (account: AdminGroupAccount) => account.unprobedModels ?? []
 
 const assignmentLabel = (account: AdminGroupAccount): string => {
@@ -221,7 +228,7 @@ const formatMultiplier = (value: number | null | undefined): string => value == 
                     </span>
                     <span v-else class="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium" :class="connectionHealthStateBadgeClass(aggregateState(account))">
                       {{ t(`${prefix}.stateLabels.${aggregateState(account)}`) }}
-                      <span v-if="account.modelHealth.length > 1" class="ml-1 opacity-70">×{{ account.modelHealth.length }}</span>
+                      <span v-if="aggregateStateCount(account) > 1" class="ml-1 opacity-70">×{{ aggregateStateCount(account) }}</span>
                     </span>
                     <span v-if="unprobedModels(account).length > 0 && aggregateState(account)" class="text-[11px] text-muted-foreground">
                       {{ t(`${prefix}.notProbed`) }} ×{{ unprobedModels(account).length }}

@@ -54,24 +54,60 @@ func (s *Service) reconcileTargetRemoteAction(
 	}
 	allHealthy, blocked, minWeight := aggregateTargetStates(states)
 	allHealthy = allHealthy && statesComplete
-	// 普通 degraded 只记录模型健康；只有已经接管或进入暂停/观察/恢复阶段时才修改上游。
-	if stored == nil && (!statesComplete || (!blocked && !hasRecoveringState(states))) {
+	// 模型限制摘除即使不阻塞账号启停，也需要 reconcile（可与启停路径独立）。
+	needsModelLimits := target.Platform == string(upstream.PlatformSub2API) &&
+		(hasModelLimitExclusion(states) || (stored != nil && strings.TrimSpace(stored.OriginalModels) != ""))
+	// 账号启停：普通 degraded 只记健康；只有接管中 / 阻塞 / 恢复中才改上游启停。
+	needsStatusAction := blocked || hasRecoveringState(states) || (stored != nil && (stored.OriginalStatus != "" || stored.LastAppliedStatus != ""))
+	if stored != nil && strings.TrimSpace(stored.OriginalModels) != "" {
+		// 已建立模型限制快照时也算「已接管」，避免丢失快照。
+		needsStatusAction = true
+	}
+	if !statesComplete && !blocked && !needsModelLimits {
 		return "", nil
 	}
-	// 已接管目标只有在全部受控模型都有状态后才能开始恢复。缺失状态不能被当作健康，
-	// 但如果已有模型明确进入暂停，仍需允许下面的 blocked 分支继续执行降级动作。
-	if stored != nil && !statesComplete && !blocked {
+	if stored == nil && !needsStatusAction && !needsModelLimits {
+		return "", nil
+	}
+	// 已接管但状态不完整：仅在 blocked 或模型限制需要时继续。
+	if stored != nil && !statesComplete && !blocked && !needsModelLimits {
 		return "", nil
 	}
 
 	currentStatus := normalizeTargetStatus(target.Platform, target.AccountStatus)
 	currentWeight := normalizedTargetWeight(target)
+
+	// —— 仅模型限制、尚未接管启停：用轻量快照，绝不改账号 active/inactive ——
+	if stored == nil && needsModelLimits && !blocked && !hasRecoveringState(states) {
+		stored = &TargetActionState{
+			UserID: userID, AdminAccountID: adminAccountID, TargetID: target.TargetID,
+			OriginalStatus: currentStatus, OriginalWeight: cloneIntPointer(currentWeight),
+			LastAppliedStatus: currentStatus, LastAppliedWeight: cloneIntPointer(currentWeight),
+		}
+		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+			return "", err
+		}
+		return s.reconcileTargetModelLimits(ctx, session, target, states, stored)
+	}
+
 	if stored == nil {
 		originalStatus := currentStatus
 		originalWeight := cloneIntPointer(currentWeight)
 		// 用户原本就在上游暂停的账号不属于自动恢复对象，探活可以继续，但绝不替用户启用。
 		if !targetStatusEnabled(target.Platform, currentStatus) {
 			if !legacyTargetWasManaged(states) {
+				// 仍可尝试模型限制（账号本来就停用，改 models 无害）。
+				if needsModelLimits {
+					stored = &TargetActionState{
+						UserID: userID, AdminAccountID: adminAccountID, TargetID: target.TargetID,
+						OriginalStatus: currentStatus, OriginalWeight: cloneIntPointer(currentWeight),
+						LastAppliedStatus: currentStatus, LastAppliedWeight: cloneIntPointer(currentWeight),
+					}
+					if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+						return "", err
+					}
+					return s.reconcileTargetModelLimits(ctx, session, target, states, stored)
+				}
 				return RemoteActionSkippedTargetInitiallyDisabled, nil
 			}
 			// 升级前已由健康模块停用的目标没有动作快照。仅在历史 remote_action 能明确证明
@@ -90,6 +126,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		stored.Conflict = true
 		stored.PendingStatus = ""
 		stored.PendingWeight = nil
+		stored.PendingModels = ""
 		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 			return "", err
 		}
@@ -99,16 +136,46 @@ func (s *Service) reconcileTargetRemoteAction(
 		return RemoteActionSkippedTargetConflict, nil
 	}
 
+	// 先处理 sub2api 模型限制摘除/恢复；动作标签可能与账号启停叠加。
+	modelsAction, modelsErr := s.reconcileTargetModelLimits(ctx, session, target, states, stored)
+	if modelsErr != nil {
+		log.Printf("[connection-health] reconcile model limits failed target_id=%s action=%s err=%v", target.TargetID, modelsAction, modelsErr)
+		if modelsAction == "" {
+			modelsAction = RemoteActionSub2APIModelsUpdateFailed
+		}
+	}
+
+	// 仅模型限制场景且当前不需要改启停：保持原启停，不强制 active。
+	if !blocked && !hasRecoveringState(states) && !allHealthy {
+		// 没有账号级阻塞时不要把用户手动 inactive 的账号改回 active。
+		if !targetStatusEnabled(target.Platform, currentStatus) &&
+			normalizeTargetStatus(target.Platform, stored.OriginalStatus) == currentStatus {
+			if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+				return modelsAction, err
+			}
+			return modelsAction, modelsErr
+		}
+	}
+
 	desiredStatus, desiredWeight := desiredTargetState(target.Platform, allHealthy, blocked, minWeight, *stored)
-	if targetStateEqual(target, currentStatus, currentWeight, desiredStatus, desiredWeight) {
+	statusEqual := targetStateEqual(target, currentStatus, currentWeight, desiredStatus, desiredWeight)
+	if statusEqual {
 		stored.LastAppliedStatus = desiredStatus
 		stored.LastAppliedWeight = cloneIntPointer(desiredWeight)
 		stored.PendingStatus = ""
 		stored.PendingWeight = nil
-		if allHealthy {
+		// 全部健康且模型限制也已恢复到原始列表时，才能删除接管快照。
+		if allHealthy && !hasManagedModelLimits(stored) {
+			if modelsAction != "" {
+				_ = s.repo.DeleteTargetActionState(ctx, userID, adminAccountID, target.TargetID)
+				return modelsAction, modelsErr
+			}
 			return "", s.repo.DeleteTargetActionState(ctx, userID, adminAccountID, target.TargetID)
 		}
-		return "", s.repo.UpsertTargetActionState(ctx, *stored)
+		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+			return modelsAction, err
+		}
+		return modelsAction, modelsErr
 	}
 
 	// Persist the intended value before touching the upstream. A later database failure can
@@ -116,21 +183,24 @@ func (s *Service) reconcileTargetRemoteAction(
 	stored.PendingStatus = desiredStatus
 	stored.PendingWeight = cloneIntPointer(desiredWeight)
 	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
-		return "", err
+		return modelsAction, err
 	}
 	action, actionErr := s.dispatcher.ApplyTargetState(ctx, session, target, desiredWeight, desiredStatus)
 	if actionErr != nil {
 		log.Printf("[connection-health] aggregate target action failed target_id=%s action=%s err=%v", target.TargetID, action, actionErr)
-		return action, actionErr
+		return joinRemoteActions(modelsAction, action), actionErr
 	}
 	stored.LastAppliedStatus = desiredStatus
 	stored.LastAppliedWeight = cloneIntPointer(desiredWeight)
 	stored.PendingStatus = ""
 	stored.PendingWeight = nil
-	if allHealthy {
-		return action, s.repo.DeleteTargetActionState(ctx, userID, adminAccountID, target.TargetID)
+	if allHealthy && !hasManagedModelLimits(stored) {
+		return joinRemoteActions(modelsAction, action), s.repo.DeleteTargetActionState(ctx, userID, adminAccountID, target.TargetID)
 	}
-	return action, s.repo.UpsertTargetActionState(ctx, *stored)
+	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+		return joinRemoteActions(modelsAction, action), err
+	}
+	return joinRemoteActions(modelsAction, action), nil
 }
 
 // restoreUnmanagedTargetActions 恢复已经失去有效自动动作策略的目标。用户解绑分组、禁用策略、
@@ -231,6 +301,9 @@ func (s *Service) restoreUnmanagedTargetActions(
 		}
 		stored.PendingStatus = stored.OriginalStatus
 		stored.PendingWeight = cloneIntPointer(stored.OriginalWeight)
+		if strings.TrimSpace(stored.OriginalModels) != "" {
+			stored.PendingModels = stored.OriginalModels
+		}
 		if err := s.repo.UpsertTargetActionState(ctx, stored); err != nil {
 			log.Printf("[connection-health] store unmanaged target restore intent failed target_id=%s err=%v", stored.TargetID, err)
 			continue
@@ -239,6 +312,14 @@ func (s *Service) restoreUnmanagedTargetActions(
 		if actionErr != nil {
 			log.Printf("[connection-health] restore unmanaged target failed target_id=%s action=%s err=%v", stored.TargetID, action, actionErr)
 			continue
+		}
+		if strings.TrimSpace(stored.OriginalModels) != "" {
+			modelsAction, modelsErr := s.dispatcher.ApplyTargetModels(ctx, inventory.session, target, stored.OriginalModels)
+			if modelsErr != nil {
+				log.Printf("[connection-health] restore unmanaged target models failed target_id=%s action=%s err=%v", stored.TargetID, modelsAction, modelsErr)
+			} else {
+				action = joinRemoteActions(action, modelsAction)
+			}
 		}
 		s.recordTargetEvent(ctx, stored.UserID, stored.AdminAccountID, target, "", "*", "policy_unmanaged_restore", "", "", nil, "", "", action)
 		if err := s.repo.DeleteTargetActionState(ctx, stored.UserID, stored.AdminAccountID, stored.TargetID); err != nil {
@@ -277,6 +358,7 @@ func legacyOriginalTargetState(platform string) (string, *int) {
 func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blocked bool, minWeight int) {
 	allHealthy = true
 	minWeight = 100
+	exclusionOnly := len(states) > 0
 	for _, state := range states {
 		if state.State != StateHealthy {
 			allHealthy = false
@@ -284,11 +366,225 @@ func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blo
 		if state.CurrentWeight < minWeight {
 			minWeight = state.CurrentWeight
 		}
+		// model_not_found / server_error 优先通过「模型限制」摘除处理，不单独把整账号
+		// 打成 inactive，否则同账号其它健康模型也会被停用。
+		if isModelLimitExclusionState(state) {
+			continue
+		}
+		exclusionOnly = false
 		if state.State == StateSuspended || state.State == StateObserving || state.State == StateDisabled || state.CurrentWeight <= 0 {
 			blocked = true
 		}
 	}
+	// 全部受控模型都因上述原因被摘除时，仍阻塞账号，避免 models 被清空后继续接流量。
+	if exclusionOnly {
+		blocked = true
+	}
 	return allHealthy, blocked, minWeight
+}
+
+// isModelLimitExclusionResult 判定探活错误是否应通过 sub2api 模型限制摘除处理。
+func isModelLimitExclusionResult(errorKey string) bool {
+	switch ResultKey(strings.TrimSpace(errorKey)) {
+	case ResultModelNotFound, ResultServerError:
+		return true
+	default:
+		return false
+	}
+}
+
+// isModelLimitExclusionState 当前仍处于「应排除在模型限制外」的暂停态。
+func isModelLimitExclusionState(state ConnectionHealthState) bool {
+	return state.State == StateSuspended && isModelLimitExclusionResult(state.LastErrorKey)
+}
+
+func hasModelLimitExclusion(states []ConnectionHealthState) bool {
+	for _, state := range states {
+		if isModelLimitExclusionState(state) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasManagedModelLimits(stored *TargetActionState) bool {
+	if stored == nil {
+		return false
+	}
+	original := normalizeModelListString(stored.OriginalModels)
+	if original == "" {
+		return false
+	}
+	// 仍在管理模型限制：当前应用值与原始列表不同，或还有 pending。
+	if strings.TrimSpace(stored.PendingModels) != "" {
+		return true
+	}
+	return normalizeModelListString(stored.LastAppliedModels) != original
+}
+
+// reconcileTargetModelLimits 根据探活状态计算期望的 sub2api models 字段并写入上游。
+// 仅当账号原本配置了非空模型限制时生效；空限制表示「不限制模型」，系统不会擅自启用限制。
+func (s *Service) reconcileTargetModelLimits(
+	ctx context.Context,
+	session upstream.Session,
+	target AdminProbeTarget,
+	states []ConnectionHealthState,
+	stored *TargetActionState,
+) (string, error) {
+	if stored == nil || target.Platform != string(upstream.PlatformSub2API) {
+		return "", nil
+	}
+	// 尚未建立 original 时，用当前上游列表作为基线（仅当非空）。
+	if strings.TrimSpace(stored.OriginalModels) == "" {
+		current := joinModelList(target.Models)
+		if current == "" {
+			return "", nil
+		}
+		// 没有任何需要摘除的模型时不必建立模型快照。
+		if !hasModelLimitExclusion(states) {
+			return "", nil
+		}
+		stored.OriginalModels = current
+		stored.LastAppliedModels = current
+	}
+
+	desired := desiredModelLimits(stored.OriginalModels, states)
+	currentModels := joinModelList(target.Models)
+
+	// 冲突检测：上游当前 models 既不等于上次系统写入，也不等于 pending，视为人工修改。
+	if targetModelLimitsConflicted(stored, currentModels) {
+		stored.Conflict = true
+		stored.PendingModels = ""
+		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+			return "", err
+		}
+		return RemoteActionSkippedTargetConflict, nil
+	}
+
+	if normalizeModelListString(currentModels) == normalizeModelListString(desired) {
+		stored.LastAppliedModels = desired
+		stored.PendingModels = ""
+		return "", s.repo.UpsertTargetActionState(ctx, *stored)
+	}
+
+	stored.PendingModels = desired
+	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+		return "", err
+	}
+	action, actionErr := s.dispatcher.ApplyTargetModels(ctx, session, target, desired)
+	if actionErr != nil {
+		return action, actionErr
+	}
+	stored.LastAppliedModels = desired
+	stored.PendingModels = ""
+	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+		return action, err
+	}
+	return action, nil
+}
+
+func targetModelLimitsConflicted(stored *TargetActionState, currentModels string) bool {
+	current := normalizeModelListString(currentModels)
+	if strings.TrimSpace(stored.PendingModels) != "" {
+		if current == normalizeModelListString(stored.PendingModels) {
+			// 上游已是 pending 值：视为上次写成功但未确认。
+			stored.LastAppliedModels = stored.PendingModels
+			stored.PendingModels = ""
+			return false
+		}
+	}
+	last := normalizeModelListString(stored.LastAppliedModels)
+	if last == "" {
+		// 首次管理：当前值应等于 original，否则不强制冲突（允许刚接管）。
+		return false
+	}
+	return current != last && current != normalizeModelListString(stored.PendingModels)
+}
+
+// desiredModelLimits 从原始模型限制中去掉仍处于 model_not_found/server_error 暂停的模型。
+func desiredModelLimits(originalModels string, states []ConnectionHealthState) string {
+	original := splitModelList(originalModels)
+	if len(original) == 0 {
+		return ""
+	}
+	excluded := make(map[string]struct{})
+	for _, state := range states {
+		if isModelLimitExclusionState(state) {
+			excluded[strings.TrimSpace(state.ModelName)] = struct{}{}
+		}
+	}
+	kept := make([]string, 0, len(original))
+	for _, model := range original {
+		name := strings.TrimSpace(model)
+		if name == "" {
+			continue
+		}
+		if _, drop := excluded[name]; drop {
+			continue
+		}
+		kept = append(kept, name)
+	}
+	return joinModelList(kept)
+}
+
+func joinModelList(models []string) string {
+	parts := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		name := strings.TrimSpace(model)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		parts = append(parts, name)
+	}
+	return strings.Join(parts, ",")
+}
+
+// normalizeModelListString 用于比较：去空、去重、排序无关的集合相等。
+func normalizeModelListString(models string) string {
+	parts := splitModelList(models)
+	if len(parts) == 0 {
+		return ""
+	}
+	// 稳定比较：排序后 join
+	sorted := append([]string(nil), parts...)
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j] < sorted[i] {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+	return strings.Join(sorted, ",")
+}
+
+func joinRemoteActions(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// expandTargetModelsForProbe 若已接管模型限制，用 OriginalModels 作为探活候选来源，
+// 否则被摘除的模型会从账号列表消失，永远无法再被探活恢复。
+func expandTargetModelsForProbe(target AdminProbeTarget, stored *TargetActionState) AdminProbeTarget {
+	if stored == nil {
+		return target
+	}
+	original := splitModelList(stored.OriginalModels)
+	if len(original) == 0 {
+		return target
+	}
+	target.Models = original
+	return target
 }
 
 func hasRecoveringState(states []ConnectionHealthState) bool {

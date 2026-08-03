@@ -20,6 +20,8 @@ type RemoteActionRunner interface {
 	DegradeTarget(ctx context.Context, session upstream.Session, target AdminProbeTarget, state ConnectionHealthState) (remoteAction string, err error)
 	RestoreTarget(ctx context.Context, session upstream.Session, target AdminProbeTarget, state ConnectionHealthState) (remoteAction string, err error)
 	ApplyTargetState(ctx context.Context, session upstream.Session, target AdminProbeTarget, weight *int, status string) (remoteAction string, err error)
+	// ApplyTargetModels 写入 sub2api 账号模型限制；new-api 等不支持时返回 unsupported。
+	ApplyTargetModels(ctx context.Context, session upstream.Session, target AdminProbeTarget, models string) (remoteAction string, err error)
 }
 
 // PlatformActioner 是 connection_health 对 upstream.PlatformService 远端降级能力的窄依赖，
@@ -29,6 +31,8 @@ type PlatformActioner interface {
 	// UpdateSub2APIAdminAccountStatus 切换 sub2api 转发账号的启用状态（active/inactive）。
 	// 第一期远端动作只做状态开关，不做 priority 权重映射（见 dispatcher 顶部说明）。
 	UpdateSub2APIAdminAccountStatus(session upstream.Session, accountID string, status string) error
+	// UpdateSub2APIAdminAccountModels 更新 sub2api 转发账号的模型限制（逗号分隔 models 字段）。
+	UpdateSub2APIAdminAccountModels(session upstream.Session, accountID string, models string) error
 }
 
 // SessionProvider 复用 my_sites 已登录并自动刷新的 admin 会话，不重复实现登录逻辑。
@@ -54,6 +58,8 @@ const (
 	RemoteActionSub2APIStatusActive         = "sub2api_account_status_active"
 	RemoteActionSub2APIStatusInactiveFailed = "sub2api_account_status_inactive_failed"
 	RemoteActionSub2APIStatusActiveFailed   = "sub2api_account_status_active_failed"
+	RemoteActionSub2APIModelsUpdated        = "sub2api_account_models_updated"
+	RemoteActionSub2APIModelsUpdateFailed   = "sub2api_account_models_update_failed"
 	RemoteActionNewAPIUpdateFailed          = "newapi_channel_update_failed"
 )
 
@@ -221,6 +227,23 @@ func (d *remoteActionDispatcher) ApplyTargetState(ctx context.Context, session u
 		return RemoteActionSub2APIStatusInactive, nil
 	}
 	return RemoteActionSub2APIStatusActive, nil
+}
+
+// ApplyTargetModels 仅对 sub2api 账号写入 models 字段（模型限制）。其它平台返回 unsupported。
+func (d *remoteActionDispatcher) ApplyTargetModels(ctx context.Context, session upstream.Session, target AdminProbeTarget, models string) (remoteAction string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			remoteAction = RemoteActionUnsupported
+			err = fmt.Errorf("apply target models panic recovered: %v", r)
+		}
+	}()
+	if target.AccountID == "" || target.Platform != string(upstream.PlatformSub2API) {
+		return RemoteActionUnsupported, nil
+	}
+	if err := d.platform.UpdateSub2APIAdminAccountModels(session, target.AccountID, models); err != nil {
+		return RemoteActionSub2APIModelsUpdateFailed, err
+	}
+	return RemoteActionSub2APIModelsUpdated, nil
 }
 
 func (d *remoteActionDispatcher) degradeNewAPI(ctx context.Context, conn my_sites.RealConnection) (string, error) {

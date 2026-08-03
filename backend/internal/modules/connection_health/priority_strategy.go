@@ -414,6 +414,7 @@ func hasMultiplierPriorityPolicy(policies []Policy) bool {
 // resolvePriorityMultiplier 决定倍率排序使用的成本倍率：
 //  1. 优先使用 real_connections 绑定的上游 API Key 当前分组倍率（真实进货成本）；
 //  2. 无法可靠解析时回退到 admin 分组倍率中的最低值（目标跨多分组时取 min）。
+//
 // 返回 ok=false 表示本轮没有可用倍率，调用方应保持等待态而不是猜测 1x。
 func resolvePriorityMultiplier(item *priorityTargetInventory, upstreamKeyGroups map[string]upstreamKeyGroupInfo) (float64, bool) {
 	if item == nil {
