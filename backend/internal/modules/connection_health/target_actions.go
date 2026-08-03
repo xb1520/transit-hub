@@ -138,26 +138,30 @@ func (s *Service) reconcileTargetRemoteAction(
 	if stored == nil {
 		originalStatus := currentStatus
 		originalWeight := cloneIntPointer(currentWeight)
-		// 用户原本就在上游暂停的账号不属于自动恢复对象，探活可以继续，但绝不替用户启用。
+		// 账号当前停用且无历史快照时：
+		// 1) 事件里有系统停用痕迹，或
+		// 2) 已有健康有效模型（常见于磁盘故障丢快照后：模型已恢复但账号仍 inactive）
+		// → 按默认启用建立快照并继续恢复，避免永久钉死在停用。
+		// 无健康模型且无系统痕迹 → 视为用户原本停用，不擅自启用。
 		if !targetStatusEnabled(target.Platform, currentStatus) {
-			if !legacyTargetWasManaged(statusAggStates) {
-				// 仍可尝试模型限制（账号本来就停用，改 models 无害）。
-				if needsModelLimits {
-					stored = &TargetActionState{
-						UserID: userID, AdminAccountID: adminAccountID, TargetID: target.TargetID,
-						OriginalStatus: currentStatus, OriginalWeight: cloneIntPointer(currentWeight),
-						LastAppliedStatus: currentStatus, LastAppliedWeight: cloneIntPointer(currentWeight),
-					}
-					if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
-						return "", err
-					}
-					return s.reconcileTargetModelLimits(ctx, session, target, modelLimitStates, stored)
+			if legacyTargetWasManaged(statusAggStates) || (hasHealthyEffective && !blocked) {
+				originalStatus, originalWeight = legacyOriginalTargetState(target.Platform)
+				log.Printf("[connection-health] adopt inactive account for restore target_id=%s account_id=%s healthy=%v legacyManaged=%v",
+					target.TargetID, target.AccountID, hasHealthyEffective, legacyTargetWasManaged(statusAggStates))
+			} else if needsModelLimits {
+				// 仅模型限制：不改启停。
+				stored = &TargetActionState{
+					UserID: userID, AdminAccountID: adminAccountID, TargetID: target.TargetID,
+					OriginalStatus: currentStatus, OriginalWeight: cloneIntPointer(currentWeight),
+					LastAppliedStatus: currentStatus, LastAppliedWeight: cloneIntPointer(currentWeight),
 				}
+				if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+					return "", err
+				}
+				return s.reconcileTargetModelLimits(ctx, session, target, modelLimitStates, stored)
+			} else {
 				return RemoteActionSkippedTargetInitiallyDisabled, nil
 			}
-			// 升级前已由健康模块停用的目标没有动作快照。仅在历史 remote_action 能明确证明
-			// 是系统执行的情况下，按旧默认 active/100 建立一次兼容快照。
-			originalStatus, originalWeight = legacyOriginalTargetState(target.Platform)
 		}
 		stored = &TargetActionState{
 			UserID: userID, AdminAccountID: adminAccountID, TargetID: target.TargetID,
