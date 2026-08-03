@@ -27,109 +27,159 @@ func (s *Service) SaveSiteSnapshot(ctx context.Context, userID string, adminAcco
 	}
 	trimmedSiteID := strings.TrimSpace(siteID)
 	trimmedSiteName := strings.TrimSpace(siteName)
-
-	// 构建经过验证和清洗的分组列表。
-	type validatedGroup struct {
-		groupID    string
-		groupName  string
-		platform   string
-		groupType  string
-		multiplier float64
-	}
-	var validated []validatedGroup
-	for _, group := range groups {
-		name := strings.TrimSpace(group.Name)
-		if name == "" || group.Multiplier == nil {
-			continue
-		}
-		platform := strings.TrimSpace(sitePlatform)
-		groupType := ""
-		if group.Platform != nil {
-			if gp := strings.TrimSpace(*group.Platform); gp != "" {
-				groupType = gp
-			}
-		}
-		if platform == "" {
-			continue
-		}
-		validated = append(validated, validatedGroup{
-			groupID:    strings.TrimSpace(group.ID),
-			groupName:  name,
-			platform:   platform,
-			groupType:  groupType,
-			multiplier: *group.Multiplier,
-		})
-	}
+	platform := strings.TrimSpace(sitePlatform)
 
 	// 获取该站点每个分组的最新快照，用于判断倍率是否变化以及检测已消失分组。
 	existing, err := s.repository.LatestGroupKeysForSite(ctx, ownerID, workspaceID, trimmedSiteID)
 	if err != nil {
 		return err
 	}
+
+	plan, err := planSiteSnapshot(ownerID, workspaceID, trimmedSiteID, trimmedSiteName, platform, groups, existing, now)
+	if err != nil {
+		return err
+	}
+
+	if err := s.repository.MarkDeleted(ctx, plan.toDelete); err != nil {
+		return err
+	}
+	if err := s.repository.TouchSnapshots(ctx, plan.toTouch, trimmedSiteName, now); err != nil {
+		return err
+	}
+	return s.repository.InsertSnapshots(ctx, plan.toInsert)
+}
+
+// snapshotPlan is the set of DB writes produced by one site sync.
+type snapshotPlan struct {
+	toInsert []snapshotRecord
+	toTouch  []string
+	toDelete []string
+}
+
+// groupPresenceKey returns the stable identity used for snapshot upsert / soft-delete.
+// Prefer non-empty group_id; fall back to group_name (legacy rows).
+func groupPresenceKey(groupID, groupName string) string {
+	if id := strings.TrimSpace(groupID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(groupName)
+}
+
+// planSiteSnapshot decides insert / touch / soft-delete for one site sync.
+//
+// Presence (soft-delete) is based on every named group still returned by upstream,
+// even when Multiplier is nil or site platform is empty. Those groups cannot get a
+// new rate row (multiplier is required), but must not be marked deleted just because
+// the rate payload is missing — that was wiping auto / incomplete groups from the
+// default "all" tab on every sync.
+//
+// Only groups with a numeric multiplier and a non-empty site platform are inserted
+// or used for rate-change detection.
+func planSiteSnapshot(
+	ownerID string,
+	workspaceID string,
+	siteID string,
+	siteName string,
+	sitePlatform string,
+	groups []SnapshotGroup,
+	existing []latestGroupKey,
+	now time.Time,
+) (snapshotPlan, error) {
+	type validatedGroup struct {
+		key        string
+		groupID    string
+		groupName  string
+		platform   string
+		groupType  string
+		multiplier float64
+	}
+
+	// presentKeys: still visible upstream (name non-empty). Used only for soft-delete.
+	presentKeys := make(map[string]struct{}, len(groups))
+	var validated []validatedGroup
+	for _, group := range groups {
+		name := strings.TrimSpace(group.Name)
+		if name == "" {
+			continue
+		}
+		groupID := strings.TrimSpace(group.ID)
+		key := groupPresenceKey(groupID, name)
+		presentKeys[key] = struct{}{}
+
+		// Rate rows require a numeric multiplier and a known site platform.
+		if group.Multiplier == nil || sitePlatform == "" {
+			continue
+		}
+		groupType := ""
+		if group.Platform != nil {
+			if gp := strings.TrimSpace(*group.Platform); gp != "" {
+				groupType = gp
+			}
+		}
+		validated = append(validated, validatedGroup{
+			key:        key,
+			groupID:    groupID,
+			groupName:  name,
+			platform:   sitePlatform,
+			groupType:  groupType,
+			multiplier: *group.Multiplier,
+		})
+	}
+
 	existingMap := make(map[string]latestGroupKey, len(existing))
 	for _, e := range existing {
-		key := e.GroupID
-		if key == "" {
-			key = e.GroupName
-		}
-		existingMap[key] = e
+		existingMap[groupPresenceKey(e.GroupID, e.GroupName)] = e
 	}
 
-	// 拆分为"倍率未变 → 刷新时间戳"和"倍率变化或新分组 → 插入新行"两组。
-	// 只有倍率真正变化时才写入新快照，使得 LEAD 窗口函数始终对比的是上一次不同的倍率，
-	// 涨跌幅会持续展示直到发生下一次倍率变动，而非仅展示一个同步周期。
-	var toInsert []snapshotRecord
-	var toTouch []string
-	incomingKeys := make(map[string]struct{}, len(validated))
+	// Split into "rate unchanged → touch last_seen" vs "rate changed / new → insert".
+	// Only real multiplier changes create a new snapshot row so LEAD() always
+	// compares against the previous distinct rate, not every sync cycle.
+	var plan snapshotPlan
+	validatedKeys := make(map[string]struct{}, len(validated))
 	for _, g := range validated {
-		key := g.groupID
-		if key == "" {
-			key = g.groupName
+		validatedKeys[g.key] = struct{}{}
+		if prev, ok := existingMap[g.key]; ok && prev.Multiplier == g.multiplier && !prev.Deleted {
+			plan.toTouch = append(plan.toTouch, prev.ID)
+			continue
 		}
-		incomingKeys[key] = struct{}{}
+		id, err := newSnapshotID()
+		if err != nil {
+			return snapshotPlan{}, err
+		}
+		plan.toInsert = append(plan.toInsert, snapshotRecord{
+			ID:             id,
+			UserID:         ownerID,
+			AdminAccountID: workspaceID,
+			SiteID:         siteID,
+			SiteName:       siteName,
+			GroupID:        g.groupID,
+			GroupName:      g.groupName,
+			Platform:       g.platform,
+			Type:           g.groupType,
+			Multiplier:     g.multiplier,
+			CreatedAt:      now,
+		})
+	}
 
-		if prev, ok := existingMap[key]; ok && prev.Multiplier == g.multiplier && !prev.Deleted {
-			toTouch = append(toTouch, prev.ID)
-		} else {
-			id, err := newSnapshotID()
-			if err != nil {
-				return err
-			}
-			toInsert = append(toInsert, snapshotRecord{
-				ID:             id,
-				UserID:         ownerID,
-				AdminAccountID: workspaceID,
-				SiteID:         trimmedSiteID,
-				SiteName:       trimmedSiteName,
-				GroupID:        g.groupID,
-				GroupName:      g.groupName,
-				Platform:       g.platform,
-				Type:           g.groupType,
-				Multiplier:     g.multiplier,
-				CreatedAt:      now,
-			})
+	// Present but not rate-insertable (nil multiplier / empty platform): keep the
+	// existing active row alive by refreshing last_seen instead of soft-deleting.
+	for key := range presentKeys {
+		if _, ok := validatedKeys[key]; ok {
+			continue
+		}
+		if prev, ok := existingMap[key]; ok && !prev.Deleted {
+			plan.toTouch = append(plan.toTouch, prev.ID)
 		}
 	}
 
-	// 检测已消失的分组并标记为已删除。
-	var toDelete []string
+	// Soft-delete only groups that truly vanished from the upstream payload.
 	for _, e := range existing {
-		key := e.GroupID
-		if key == "" {
-			key = e.GroupName
-		}
-		if _, found := incomingKeys[key]; !found && !e.Deleted {
-			toDelete = append(toDelete, e.ID)
+		key := groupPresenceKey(e.GroupID, e.GroupName)
+		if _, found := presentKeys[key]; !found && !e.Deleted {
+			plan.toDelete = append(plan.toDelete, e.ID)
 		}
 	}
-
-	if err := s.repository.MarkDeleted(ctx, toDelete); err != nil {
-		return err
-	}
-	if err := s.repository.TouchSnapshots(ctx, toTouch, trimmedSiteName, now); err != nil {
-		return err
-	}
-	return s.repository.InsertSnapshots(ctx, toInsert)
+	return plan, nil
 }
 
 func (s *Service) List(ctx context.Context, userID string, adminAccountID string, query ListQuery) (ListResult, error) {

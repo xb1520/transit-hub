@@ -249,8 +249,9 @@ func (r *Repository) List(ctx context.Context, userID string, adminAccountID str
 	}
 	offset := (query.Page - 1) * query.PageSize
 
-	// latest keeps one current row per site URL/group ID tuple, then the
-	// filtered CTE applies admin list controls before LIMIT/OFFSET. Facets are
+	// latest keeps one current row per site ID / group key tuple (not base_url —
+	// multiple upstream sites may share a URL and must not collapse into one row).
+	// The filtered CTE applies admin list controls before LIMIT/OFFSET. Facets are
 	// intentionally calculated from latest without active filters so the UI can
 	// keep showing all available filter choices while one filter is selected.
 	rows, err := r.db.Query(ctx, `
@@ -269,7 +270,7 @@ func (r *Repository) List(ctx context.Context, userID string, adminAccountID str
 				COALESCE(sites.recharge_rate, 1) AS recharge_rate,
 				snapshots.created_at,
 				COALESCE(snapshots.last_seen_at, snapshots.created_at) AS last_seen_at,
-				COALESCE(sites.base_url, snapshots.site_id) AS site_key,
+				snapshots.site_id AS site_key,
 				COALESCE(NULLIF(snapshots.group_id, ''), snapshots.group_name) AS group_key
 			FROM group_rate_snapshots AS snapshots
 			LEFT JOIN upstream_sites AS sites
@@ -411,12 +412,9 @@ func (r *Repository) ListDistinctGroupNames(ctx context.Context, userID string, 
 				snapshots.deleted,
 				snapshots.created_at,
 				snapshots.id,
-				COALESCE(sites.base_url, snapshots.site_id) AS site_key,
+				snapshots.site_id AS site_key,
 				COALESCE(NULLIF(snapshots.group_id, ''), snapshots.group_name) AS group_key
 			FROM group_rate_snapshots AS snapshots
-			LEFT JOIN upstream_sites AS sites
-				ON sites.user_id = snapshots.user_id
-				AND sites.id = snapshots.site_id
 			WHERE snapshots.user_id = $1 AND snapshots.admin_account_id = $2
 		), ranked AS (
 			SELECT group_name, platform, type, deleted,
@@ -576,18 +574,13 @@ func (r *Repository) facets(ctx context.Context, userID string, adminAccountID s
 		WITH enriched AS (
 			SELECT
 				snapshots.user_id,
-				snapshots.site_id,
-				snapshots.group_name,
+				snapshots.site_id AS site_key,
 				COALESCE(NULLIF(snapshots.group_id, ''), snapshots.group_name) AS group_key,
 				snapshots.platform,
 				snapshots.type,
 				snapshots.created_at,
-				snapshots.id,
-				COALESCE(sites.base_url, snapshots.site_id) AS site_key
+				snapshots.id
 			FROM group_rate_snapshots AS snapshots
-			LEFT JOIN upstream_sites AS sites
-				ON sites.user_id = snapshots.user_id
-				AND sites.id = snapshots.site_id
 			WHERE snapshots.user_id = $1 AND snapshots.admin_account_id = $2
 		), ranked AS (
 			SELECT platform, type,
@@ -622,12 +615,9 @@ func (r *Repository) statusCounts(ctx context.Context, userID string, adminAccou
 				snapshots.type,
 				snapshots.deleted,
 				snapshots.created_at,
-				COALESCE(sites.base_url, snapshots.site_id) AS site_key,
+				snapshots.site_id AS site_key,
 				COALESCE(NULLIF(snapshots.group_id, ''), snapshots.group_name) AS group_key
 			FROM group_rate_snapshots AS snapshots
-			LEFT JOIN upstream_sites AS sites
-				ON sites.user_id = snapshots.user_id
-				AND sites.id = snapshots.site_id
 			WHERE snapshots.user_id = $1 AND snapshots.admin_account_id = $2
 		), ranked AS (
 			SELECT *, ROW_NUMBER() OVER (
