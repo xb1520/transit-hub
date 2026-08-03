@@ -296,7 +296,24 @@ const formatMultiplier = (value: number | null | undefined): string => value == 
                     <div v-for="model in account.modelHealth" :key="model.modelName" class="rounded-lg border border-border/50 bg-background px-3 py-2.5">
                       <div class="flex items-center justify-between gap-3">
                         <span class="truncate text-sm font-medium text-foreground">{{ model.modelName }}</span>
-                        <span class="rounded-md px-2 py-0.5 text-xs font-medium" :class="connectionHealthStateBadgeClass(model.state)">{{ t(`${prefix}.stateLabels.${model.state}`) }}</span>
+                        <div class="flex shrink-0 flex-wrap items-center justify-end gap-1">
+                          <span
+                            v-if="model.modelLimitStatus === 'excluded' || model.modelLimitExcluded"
+                            class="rounded-md bg-violet-500/15 px-2 py-0.5 text-xs font-medium text-violet-700 dark:text-violet-300"
+                            :title="t(`${detailPrefix}.models.limitExcludedHint`)"
+                          >{{ t(`${detailPrefix}.models.limitExcluded`) }}</span>
+                          <span
+                            v-else-if="model.modelLimitStatus === 'pending'"
+                            class="rounded-md bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300"
+                            :title="t(`${detailPrefix}.models.limitPendingHint`)"
+                          >{{ t(`${detailPrefix}.models.limitPending`) }}</span>
+                          <span
+                            v-else-if="model.modelLimitStatus === 'failed'"
+                            class="rounded-md bg-destructive/15 px-2 py-0.5 text-xs font-medium text-destructive"
+                            :title="t(`${detailPrefix}.models.limitFailedHint`)"
+                          >{{ t(`${detailPrefix}.models.limitFailed`) }}</span>
+                          <span class="rounded-md px-2 py-0.5 text-xs font-medium" :class="connectionHealthStateBadgeClass(model.state)">{{ t(`${prefix}.stateLabels.${model.state}`) }}</span>
+                        </div>
                       </div>
                       <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                         <span>{{ t(`${detailPrefix}.models.latency`, { value: model.lastLatencyMs ?? '-' }) }}</span>

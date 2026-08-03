@@ -1084,7 +1084,13 @@ export default {
           empty: 'This target has no model probe results yet.',
           latency: 'Latency {value} ms',
           lastProbe: 'Last {value}',
-          weight: 'Health weight {value}%'
+          weight: 'Health weight {value}%',
+          limitExcluded: 'Removed',
+          limitExcludedHint: 'System removed this model from the Sub2API model whitelist; it should not be scheduled upstream.',
+          limitPending: 'Pending removal',
+          limitPendingHint: 'Probe is paused but model-limit write is not confirmed yet; usually syncs within 30s.',
+          limitFailed: 'Removal failed',
+          limitFailedHint: 'Local snapshot still lists this paused model — upstream model-limit write may have failed. Check applied model limits logs.'
         }
       },
       setup: {

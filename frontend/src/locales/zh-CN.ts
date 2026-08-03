@@ -1084,7 +1084,13 @@ export default {
           empty: '该目标还没有模型探活结果。',
           latency: '延迟 {value} ms',
           lastProbe: '最近 {value}',
-          weight: '健康权重 {value}%'
+          weight: '健康权重 {value}%',
+          limitExcluded: '已摘除',
+          limitExcludedHint: '系统已从 Sub2API 模型白名单中移除该模型，上游不应再调度它。',
+          limitPending: '待摘除',
+          limitPendingHint: '探活已暂停，但本地尚未确认写入模型限制；通常 30 秒内会同步。',
+          limitFailed: '摘除失败',
+          limitFailedHint: '本地快照仍包含该暂停模型，说明上游模型限制可能未写成功，请查日志 applied model limits / failed。'
         }
       },
       setup: {

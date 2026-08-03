@@ -9,6 +9,8 @@ export type ConnectionHealthState =
   | 'recovering'
   | 'disabled'
 
+export type ModelLimitStatus = 'excluded' | 'pending' | 'failed' | ''
+
 export interface ModelHealth {
   modelName: string
   providerFamily: string
@@ -25,6 +27,10 @@ export interface ModelHealth {
   lastErrorDetail: string
   lastRemoteAction: string
   updatedAt: string | null
+  /** 系统认为已从 sub2api 模型白名单摘除 */
+  modelLimitExcluded?: boolean
+  /** excluded | pending | failed */
+  modelLimitStatus?: ModelLimitStatus | string
 }
 
 export interface ConnectionHealth {
@@ -133,6 +139,11 @@ export interface AdminGroupAccount {
   priorityManaged?: boolean
   priorityConflict?: boolean
   effectiveMultiplier?: number | null
+  /** 是否正在管理该账号的模型限制 */
+  modelLimitsManaged?: boolean
+  /** 上次写入上游的模型白名单（逗号分隔） */
+  modelLimitsApplied?: string
+  modelLimitsOriginal?: string
 }
 
 export interface AdminGroupHealth {

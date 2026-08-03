@@ -115,6 +115,14 @@ type ModelHealth struct {
 	LastErrorDetail      string     `json:"lastErrorDetail"`
 	LastRemoteAction     string     `json:"lastRemoteAction"`
 	UpdatedAt            *time.Time `json:"updatedAt"`
+	// ModelLimitExcluded 表示系统认为该模型已从 sub2api「模型限制/白名单」中摘除。
+	// 用于前端展示「已摘除」标记，便于确认摘除代码是否执行（与上游 UI 对照排障）。
+	ModelLimitExcluded bool `json:"modelLimitExcluded"`
+	// ModelLimitStatus: excluded | pending | failed | ""(不适用)
+	// - excluded: 本地快照显示已不在 LastAppliedModels 中
+	// - pending:  探活已暂停，但尚未建立/写入模型限制快照
+	// - failed:   已管理快照，但 LastAppliedModels 仍包含该暂停模型（上游写入可能失败）
+	ModelLimitStatus string `json:"modelLimitStatus,omitempty"`
 }
 
 // ConnectionHealth 是一条已对接上游分组链路的健康展示数据。UpstreamKeyID 只保留 ID 辅助排障，

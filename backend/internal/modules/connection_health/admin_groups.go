@@ -101,6 +101,10 @@ type AdminGroupAccount struct {
 	PriorityManaged         bool                    `json:"priorityManaged"`
 	PriorityConflict        bool                    `json:"priorityConflict"`
 	EffectiveMultiplier     *float64                `json:"effectiveMultiplier,omitempty"`
+	// 模型限制管理快照（sub2api）：便于前端展示「已摘除」与排障对照。
+	ModelLimitsManaged  bool   `json:"modelLimitsManaged"`
+	ModelLimitsApplied  string `json:"modelLimitsApplied,omitempty"` // 上次写入上游的白名单
+	ModelLimitsOriginal string `json:"modelLimitsOriginal,omitempty"`
 }
 
 type AdminGroupUnprobedModel struct {
@@ -159,6 +163,10 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 	if err != nil {
 		return nil, err
 	}
+	actionStates, err := s.repo.ListTargetActionStates(ctx, userID, adminAccountID)
+	if err != nil {
+		return nil, err
+	}
 	// assignmentsByTarget: targetId -> 该 target 已分配的全部策略行（不限已启用/禁用，
 	// 展示层需要如实反映分配关系，是否生效由调度器按启用状态另行判断）。
 	assignmentsByTarget := make(map[string][]PolicyAssignment, len(assignments))
@@ -183,6 +191,10 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 	priorityByTarget := make(map[string]PrioritySyncState, len(priorityStates))
 	for _, state := range priorityStates {
 		priorityByTarget[state.TargetID] = state
+	}
+	actionByTarget := make(map[string]TargetActionState, len(actionStates))
+	for _, state := range actionStates {
+		actionByTarget[state.TargetID] = state
 	}
 	// 真实上游 API Key 分组倍率仅用于展示，不参与探活或优先级计算。读取失败时降级为空，
 	// 保证既有分组健康功能不会因为可选的倍率信息不可用而中断。
@@ -258,7 +270,12 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 			}
 			activeSpecs := candidateModelSpecs(splitModelList(acc.Models), effectivePolicies)
 			hasProbePolicy := hasEnabledProbePolicy(effectivePolicies)
-			modelHealth, unprobedModels := modelHealthForSpecs(stateIndex[targetID], activeSpecs)
+			var actionState *TargetActionState
+			if st, ok := actionByTarget[targetID]; ok {
+				copy := st
+				actionState = &copy
+			}
+			modelHealth, unprobedModels := modelHealthForSpecs(stateIndex[targetID], activeSpecs, actionState)
 			if credentialReason := latestCredentialUnavailableReason(modelHealth); credentialReason != "" {
 				available = false
 				reason = credentialReason
@@ -302,6 +319,13 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 				PriorityManaged:            priorityManaged,
 				PriorityConflict:           priorityManaged && priorityState.Conflict,
 				EffectiveMultiplier:        effectiveMultiplier,
+				ModelLimitsManaged:         hasManagedModelLimits(actionState),
+				ModelLimitsApplied:         "",
+				ModelLimitsOriginal:        "",
+			}
+			if actionState != nil {
+				item.ModelLimitsApplied = actionState.LastAppliedModels
+				item.ModelLimitsOriginal = actionState.OriginalModels
 			}
 			if item.HasEnabledProbePolicy {
 				health.MonitoredAccountCount++
@@ -560,7 +584,7 @@ func modelHealthForConnection(byModel map[string]ConnectionHealthState) []ModelH
 
 // modelHealthForSpecs 只展开当前有效策略仍启用的模型。历史状态继续留库用于审计，但模型被
 // 删除、禁用或不再属于目标后，不得继续影响页面汇总、优先级和账号级动作。
-func modelHealthForSpecs(byModel map[string]ConnectionHealthState, specs []probeModelSpec) ([]ModelHealth, []AdminGroupUnprobedModel) {
+func modelHealthForSpecs(byModel map[string]ConnectionHealthState, specs []probeModelSpec, actionState *TargetActionState) ([]ModelHealth, []AdminGroupUnprobedModel) {
 	models := make([]ModelHealth, 0, len(specs))
 	unprobed := make([]AdminGroupUnprobedModel, 0)
 	for _, spec := range specs {
@@ -573,9 +597,68 @@ func modelHealthForSpecs(byModel map[string]ConnectionHealthState, specs []probe
 		}
 		model := toModelHealth(spec.modelName, state)
 		model.ProviderFamily = spec.providerFamily
+		annotateModelLimitFlags(&model, actionState)
 		models = append(models, model)
 	}
 	return models, unprobed
+}
+
+// annotateModelLimitFlags 根据 TargetActionState 快照标注模型是否已从 sub2api 白名单摘除。
+func annotateModelLimitFlags(model *ModelHealth, stored *TargetActionState) {
+	if model == nil {
+		return
+	}
+	managing := hasManagedModelLimits(stored)
+	applied := modelNameSet(storedLastApplied(stored))
+	_, inApplied := applied[model.ModelName]
+
+	if model.State == StateSuspended {
+		if managing && !inApplied {
+			model.ModelLimitExcluded = true
+			model.ModelLimitStatus = "excluded"
+			return
+		}
+		if managing && inApplied {
+			// 本地已管理，但上次写入的白名单仍包含该暂停模型 → 写入可能失败或冲突。
+			model.ModelLimitStatus = "failed"
+			return
+		}
+		// 已暂停但系统尚未建立/写入模型限制快照。
+		model.ModelLimitStatus = "pending"
+		return
+	}
+	if managing && !inApplied {
+		// 非暂停却不在白名单：通常是暂停摘除后尚未恢复，或原本就不在白名单。
+		original := modelNameSet(storedOriginal(stored))
+		_, inOriginal := original[model.ModelName]
+		if len(original) == 0 || inOriginal {
+			model.ModelLimitExcluded = true
+			model.ModelLimitStatus = "excluded"
+		}
+	}
+}
+
+func storedLastApplied(stored *TargetActionState) string {
+	if stored == nil {
+		return ""
+	}
+	return stored.LastAppliedModels
+}
+
+func storedOriginal(stored *TargetActionState) string {
+	if stored == nil {
+		return ""
+	}
+	return stored.OriginalModels
+}
+
+func modelNameSet(models string) map[string]struct{} {
+	parts := splitModelList(models)
+	out := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		out[p] = struct{}{}
+	}
+	return out
 }
 
 func latestCredentialUnavailableReason(models []ModelHealth) string {
