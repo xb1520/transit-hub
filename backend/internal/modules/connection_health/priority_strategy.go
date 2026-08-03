@@ -23,7 +23,9 @@ type priorityTargetInventory struct {
 	currentPriority int
 }
 
-// syncMultiplierPriorities 在每轮探活前同步上游优先级。普通倍率策略仍然「健康优先、倍率次之」，
+// syncMultiplierPriorities 在每轮探活前同步上游优先级。普通倍率策略「健康优先、倍率次之」：
+// 可调度模型（healthy+degraded）按平均延迟分四档（<3s/<10s/<30s/≥30s），同档再比成本倍率；
+// 观察中/恢复中/暂停仍单独更差；已从白名单摘除的模型不参与。
 // 仅倍率策略则完全忽略探活状态。它故意与 job 生成分开，确保未到探活时间的目标也能更新顺序。
 func (s *Service) syncMultiplierPriorities(
 	ctx context.Context,
@@ -167,8 +169,8 @@ func (s *Service) syncWorkspacePriorities(
 		}
 	}
 
-	// 上游 API Key 真实成本倍率优先于 admin 售卖分组倍率。同一售卖分组里常有 0.1x / 0.2x
-	// 等多条上游；若只按 admin 分组倍率排序，健康目标会全部落到同一 priority。
+	// 上游 API Key 真实成本倍率（分组倍率 × 站点充值倍率）优先于 admin 售卖分组倍率。
+	// 同一售卖分组里常有 0.1x / 0.2x 等多条上游；若只按 admin 分组倍率排序，健康目标会全部落到同一 priority。
 	upstreamKeyGroups := s.upstreamKeyGroupsByAdminAccount(ctx, userID, adminAccountID, string(session.Platform))
 
 	managed := make(map[string]*priorityTargetInventory)
@@ -346,6 +348,35 @@ func (s *Service) syncWorkspacePriorities(
 	}
 }
 
+// 健康延迟分档（仅在可调度模型全部 healthy 时生效；已从上游白名单摘除的模型不在 states 中）。
+// 平均延迟阈值：<3s / <10s / <30s / ≥30s（无延迟数据按最差档）。
+const (
+	latencyTierFastMS   = 3000
+	latencyTierMediumMS = 10000
+	latencyTierSlowMS   = 30000
+
+	// Sub2API：数值越小越优先。各档互不重叠，每档最多 999 个倍率名次。
+	sub2APIHealthyLatency0Base = 1     // avg < 3s
+	sub2APIHealthyLatency1Base = 1000  // avg < 10s
+	sub2APIHealthyLatency2Base = 2000  // avg < 30s
+	sub2APIHealthyLatency3Base = 3000  // avg ≥ 30s 或无延迟
+	sub2APIRecoveringBase      = 10000
+	sub2APIDegradedBase        = 20000
+	sub2APIUnconfiguredBase    = 30000
+	sub2APISuspendedPriority   = 100000
+	sub2APIBandWidth           = 1000
+
+	// NewAPI：数值越大越优先。健康按延迟再分四档，再叠倍率分。
+	newAPIHealthyLatency0Base = 70000
+	newAPIHealthyLatency1Base = 60000
+	newAPIHealthyLatency2Base = 50000
+	newAPIHealthyLatency3Base = 40000
+	newAPIRecoveringBase      = 30000
+	newAPIDegradedBase        = 20000
+	newAPIUnconfiguredBase    = 10000
+	newAPISuspendedPriority   = 1
+)
+
 // desiredManagedPriorityForPlatform 按平台真实语义计算优先级：NewAPI 沿用「分数越高越优先」；
 // Sub2API 使用紧凑的小数值状态分段，数值越小越优先。
 func desiredManagedPriorityForPlatform(platform upstream.Platform, states []ConnectionHealthState, multiplierRank int) int {
@@ -360,46 +391,104 @@ func desiredManagedPriorityForPlatformWithExpected(platform upstream.Platform, s
 		return desiredSub2APIManagedPriority(states, multiplierRank, expectedModels)
 	}
 	score := desiredManagedPriority(states, multiplierRank)
-	if len(states) < expectedModels && score != 1 {
-		// Missing model states are unconfigured, not healthy. A known suspended/disabled
-		// state remains the lowest tier even when another model has not been probed yet.
+	if len(states) < expectedModels && score != newAPISuspendedPriority {
+		// 缺探活状态视为待配置，不是健康。已知 suspended/disabled 仍保持最差档。
 		priceScore := maxInt(0, 999-multiplierRank)
-		score = 10000 + priceScore
+		score = newAPIUnconfiguredBase + priceScore
 	}
 	return score
 }
 
-// desiredSub2APIManagedPriority 使用 Sub2API「数值越小越优先」的原生语义，并为不同健康
-// 状态预留互不重叠的区间：健康 1-9、恢复中 10-99、降级/观察 100-999、待配置
-// 1000-9999、暂停/禁用 10000。同一状态内 multiplierRank 越小，priority 越小。
-// rank 超出区间容量时在区间末尾并列，避免价格排序跨越健康状态边界。
+// desiredSub2APIManagedPriority 使用 Sub2API「数值越小越优先」：
+//
+//	延迟档(healthy+degraded) > 恢复中 > 观察中 > 待配置 > 暂停/禁用。
+//
+// 「降级」是软失败后的权重下滑态，仍可调度，因此并入平均延迟分档，不再单独压到降级档。
+// 「观察中」是暂停后的恢复观察（权重 0），「恢复中」是逐步抬权重，仍单独低于延迟档。
+// states 仅应包含仍可调度的模型（上游白名单内）；已摘除的 suspended 不得传入。
+// 同一档内 multiplierRank 越小 priority 越小；rank 超出档宽时在档末并列。
 func desiredSub2APIManagedPriority(states []ConnectionHealthState, multiplierRank int, expectedModels int) int {
 	for _, state := range states {
 		if state.State == StateDisabled || state.State == StateSuspended {
-			return 10000
+			return sub2APISuspendedPriority
 		}
 	}
 	if len(states) < expectedModels {
-		return sub2APIPriorityWithinBand(1000, 10000, multiplierRank)
+		return sub2APIPriorityWithinBand(sub2APIUnconfiguredBase, sub2APIUnconfiguredBase+sub2APIBandWidth, multiplierRank)
 	}
 
-	base, nextBase := 1, 10
+	hasObserving := false
+	hasRecovering := false
 	for _, state := range states {
 		switch state.State {
-		case StateDegraded, StateObserving:
-			base, nextBase = 100, 1000
+		case StateObserving:
+			hasObserving = true
 		case StateRecovering:
-			if base < 10 {
-				base, nextBase = 10, 100
-			}
+			hasRecovering = true
 		}
 	}
-	return sub2APIPriorityWithinBand(base, nextBase, multiplierRank)
+	// 观察中：暂停后权重仍为 0，不能按延迟冒充健康可调度。
+	if hasObserving {
+		return sub2APIPriorityWithinBand(sub2APIDegradedBase, sub2APIDegradedBase+sub2APIBandWidth, multiplierRank)
+	}
+	if hasRecovering {
+		return sub2APIPriorityWithinBand(sub2APIRecoveringBase, sub2APIRecoveringBase+sub2APIBandWidth, multiplierRank)
+	}
+
+	// 仅倍率策略（无探活状态）不套延迟分档，直接按倍率排在最快健康档。
+	if len(states) == 0 {
+		return sub2APIPriorityWithinBand(sub2APIHealthyLatency0Base, sub2APIHealthyLatency0Base+sub2APIBandWidth, multiplierRank)
+	}
+
+	// healthy + degraded：按可调度模型平均延迟分档，再按倍率。
+	base := sub2APIHealthyBaseForLatencyTier(latencyTierRank(states))
+	return sub2APIPriorityWithinBand(base, base+sub2APIBandWidth, multiplierRank)
+}
+
+func sub2APIHealthyBaseForLatencyTier(tier int) int {
+	switch tier {
+	case 0:
+		return sub2APIHealthyLatency0Base
+	case 1:
+		return sub2APIHealthyLatency1Base
+	case 2:
+		return sub2APIHealthyLatency2Base
+	default:
+		return sub2APIHealthyLatency3Base
+	}
 }
 
 func sub2APIPriorityWithinBand(base int, nextBase int, multiplierRank int) int {
 	offset := maxInt(0, multiplierRank)
 	return base + minInt(offset, nextBase-base-1)
+}
+
+// latencyTierRank 返回 0(最快) .. 3(最慢/无数据)。
+// 对 states 中有 LastLatencyMs 的模型求平均；全部缺失时落到最差档，避免无延迟数据伪装成最快。
+func latencyTierRank(states []ConnectionHealthState) int {
+	sum := 0
+	count := 0
+	for _, state := range states {
+		if state.LastLatencyMs == nil || *state.LastLatencyMs < 0 {
+			continue
+		}
+		sum += *state.LastLatencyMs
+		count++
+	}
+	if count == 0 {
+		return 3
+	}
+	avg := sum / count
+	switch {
+	case avg < latencyTierFastMS:
+		return 0
+	case avg < latencyTierMediumMS:
+		return 1
+	case avg < latencyTierSlowMS:
+		return 2
+	default:
+		return 3
+	}
 }
 
 func hasMultiplierPriorityPolicy(policies []Policy) bool {
@@ -412,7 +501,7 @@ func hasMultiplierPriorityPolicy(policies []Policy) bool {
 }
 
 // resolvePriorityMultiplier 决定倍率排序使用的成本倍率：
-//  1. 优先使用 real_connections 绑定的上游 API Key 当前分组倍率（真实进货成本）；
+//  1. 优先使用 real_connections 绑定的上游 API Key 成本倍率（分组倍率 × 站点充值倍率）；
 //  2. 无法可靠解析时回退到 admin 分组倍率中的最低值（目标跨多分组时取 min）。
 //
 // 返回 ok=false 表示本轮没有可用倍率，调用方应保持等待态而不是猜测 1x。
@@ -450,41 +539,58 @@ func minFloat(values []float64) float64 {
 	return minValue
 }
 
-// desiredManagedPriority 计算平台无关的路由分数，并使用互不重叠的区间保证健康状态始终压过价格：
-// healthy > recovering > degraded/observing > unconfigured > suspended/disabled。
-// 同一健康层级内，上游成本倍率排名越靠前（倍率越低）分数越大；平台数值方向由上层映射。
+// desiredManagedPriority 计算 NewAPI「分数越高越优先」的路由分数：
+// 延迟档(healthy+degraded) > 恢复中 > 观察中 > 待配置 > 暂停/禁用。
+// 「降级」并入平均延迟分档；观察中/恢复中仍单独低于延迟档。
+// states 仅应包含仍可调度的模型；已摘除模型不得传入。
+// 同一档内，上游成本倍率排名越靠前（倍率越低）分数越大。
 func desiredManagedPriority(states []ConnectionHealthState, multiplierRank int) int {
 	priceScore := 999 - multiplierRank
 	if priceScore < 0 {
 		priceScore = 0
 	}
 	if len(states) == 0 {
-		return 10000 + priceScore
+		// 仅倍率 / 无探活状态：落在待配置档，仍按倍率区分。
+		return newAPIUnconfiguredBase + priceScore
 	}
 
-	base := 40000
 	weight := 100
+	hasObserving := false
+	hasRecovering := false
 	for _, state := range states {
 		if state.CurrentWeight < weight {
 			weight = state.CurrentWeight
 		}
 		switch state.State {
 		case StateDisabled, StateSuspended:
-			return 1
-		case StateDegraded, StateObserving:
-			if base > 20000 {
-				base = 20000
-			}
+			return newAPISuspendedPriority
+		case StateObserving:
+			hasObserving = true
 		case StateRecovering:
-			if base > 30000 {
-				base = 30000
-			}
+			hasRecovering = true
 		}
 	}
-	if base == 30000 {
-		base += maxInt(0, minInt(100, weight)) * 50
-	} else if base == 20000 {
-		base += maxInt(0, minInt(100, weight)) * 10
+	if hasObserving {
+		return newAPIDegradedBase + maxInt(0, minInt(100, weight))*10 + priceScore
 	}
+	if hasRecovering {
+		return newAPIRecoveringBase + maxInt(0, minInt(100, weight))*50 + priceScore
+	}
+
+	// healthy + degraded 走延迟分档。
+	base := newAPIHealthyBaseForLatencyTier(latencyTierRank(states))
 	return base + priceScore
+}
+
+func newAPIHealthyBaseForLatencyTier(tier int) int {
+	switch tier {
+	case 0:
+		return newAPIHealthyLatency0Base
+	case 1:
+		return newAPIHealthyLatency1Base
+	case 2:
+		return newAPIHealthyLatency2Base
+	default:
+		return newAPIHealthyLatency3Base
+	}
 }

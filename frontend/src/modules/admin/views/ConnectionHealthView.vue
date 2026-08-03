@@ -60,6 +60,19 @@ const siteNameMap = ref<Map<string, string>>(new Map())
 const groupTypes = ['public', 'exclusive', 'subscription']
 const groupTypeLabel = (type: string): string => t(`admin.connectionHealth.groupTypes.${groupTypes.includes(type) ? type : 'public'}`)
 
+/** 分组倍率最多 3 位小数，避免 0.18000000000000002x 这类浮点噪声。 */
+const formatGroupMultiplier = (group: AdminGroupHealth): string => {
+  if (group.multiplier != null && Number.isFinite(group.multiplier)) {
+    return `${Number(group.multiplier.toFixed(3))}x`
+  }
+  const display = (group.multiplierDisplay || '').trim()
+  if (!display) return '-'
+  const match = display.match(/^(-?\d+(?:\.\d+)?)x?$/i)
+  if (!match) return display
+  const parsed = Number(match[1])
+  return Number.isFinite(parsed) ? `${Number(parsed.toFixed(3))}x` : display
+}
+
 const filteredGroups = computed(() => {
   const keyword = searchText.value.trim().toLocaleLowerCase()
   return adminGroups.value.filter((group) => {
@@ -356,7 +369,7 @@ const handleDeletePolicy = async (policy: ConnectionHealthPolicy) => {
                   </span>
                   <span class="mt-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
                     <span>{{ t('admin.connectionHealth.groupList.monitored', { count: group.monitoredAccountCount ?? 0, total: group.accountCount }) }}</span>
-                    <span>{{ group.multiplierDisplay || '-' }}</span>
+                    <span>{{ formatGroupMultiplier(group) }}</span>
                   </span>
                 </span>
               </button>

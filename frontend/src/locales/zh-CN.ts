@@ -1080,6 +1080,13 @@ export default {
           actions: '操作'
         },
         upstreamMultiplierPending: '关联后展示倍率',
+        latencyTier: {
+          hint: '按仍可调度模型的平均探活延迟分档（已摘除模型不计入）；同一档内再按上游成本倍率排序。',
+          fast: '延迟优秀 · <3s',
+          medium: '延迟良好 · <10s',
+          slow: '延迟一般 · <30s',
+          verySlow: '延迟偏慢 · ≥30s'
+        },
         models: {
           empty: '该目标还没有模型探活结果。',
           latency: '延迟 {value} ms',
@@ -1396,7 +1403,7 @@ export default {
           recoveryStep: '恢复过程中每次探活成功会按该百分比逐步提高本地权重，不是一次性恢复到 100%。',
           autoDegrade: '开启后，探活结果会推进链路的健康状态机并调整本地转发权重；关闭后只记录探活结果，不会自动改变状态或权重。',
           autoRemoteAction: '开启后，状态机触发降级/恢复时会执行受支持的上游动作：Sub2API 切换 admin 账号 active/inactive，NewAPI 调整 channel 权重/状态。关闭后只记录探活和状态结果。',
-          priorityMode: '按上游成本倍率排序会把较低进货倍率映射为较高的上游优先级（优先使用真实对接的上游 API Key 分组倍率，无法解析时回退到 admin 分组倍率）。健康等级先于价格排序；同一目标跨多个 admin 分组时取最低 admin 倍率作为回退；检测到人工修改时会停止自动覆盖。'
+          priorityMode: '按上游成本倍率排序会把较低进货倍率映射为较高的上游优先级（优先使用真实对接的上游 API Key 成本倍率 = 分组倍率 × 站点充值倍率，无法解析时回退到 admin 分组倍率）。排序规则：可调度模型优先（已摘除不参与）；healthy/降级按平均探活延迟分四档（<3s / <10s / <30s / ≥30s），同档内倍率越低越优先；观察中/恢复中/暂停单独更差。检测到人工修改时会停止自动覆盖。'
         },
         runFlow: {
           buttonLabel: '运行流程',

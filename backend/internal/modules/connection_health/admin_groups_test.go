@@ -143,11 +143,14 @@ func TestAdminGroups_TargetIDProbeAvailableAndModelHealth(t *testing.T) {
 
 // TestAdminGroups_UsesRealUpstreamAPIKeyGroupMultiplier 验证“上游 API Key 倍率”来自当前
 // API Key 所在的上游分组，而不是连接记录里的历史分组或 Sub2API admin 账号自身倍率。
+// 展示值为成本口径：上游分组倍率 × 站点充值倍率（与分组倍率页一致）。
 // 未建立真实对接关联、或同一账号存在无法全部解析的连接时，必须保持未知。
 func TestAdminGroups_UsesRealUpstreamAPIKeyGroupMultiplier(t *testing.T) {
 	forwardingAccountMultiplier := 1.75
 	unlinkedAccountMultiplier := 2.25
-	upstreamKeyGroupMultiplier := 0.42
+	upstreamKeyGroupMultiplier := 1.3
+	rechargeRate := 0.1
+	wantCostMultiplier := upstreamKeyGroupMultiplier * rechargeRate // 0.13
 	mySites := fakeAdminGroupKeyReader{
 		fakeMySitesReader: fakeMySitesReader{
 			session: upstream.Session{Platform: upstream.PlatformSub2API},
@@ -187,7 +190,8 @@ func TestAdminGroups_UsesRealUpstreamAPIKeyGroupMultiplier(t *testing.T) {
 	}
 	svc := newAdminGroupsService(reader, mySites, newFakeRepository())
 	svc.sites = fakeSiteLookup{site: &upstream.Site{
-		ID: "site-1",
+		ID:           "site-1",
+		RechargeRate: rechargeRate,
 		Metrics: upstream.Metrics{Groups: []upstream.GroupInfo{{
 			ID:         "historical-group",
 			Name:       "historical-vip",
@@ -215,11 +219,14 @@ func TestAdminGroups_UsesRealUpstreamAPIKeyGroupMultiplier(t *testing.T) {
 	if linked.UpstreamKeyGroupName != "upstream-vip" || linked.UpstreamKeyGroupMultiplier == nil {
 		t.Fatalf("expected linked upstream API key group, got %+v", linked)
 	}
-	if got := *linked.UpstreamKeyGroupMultiplier; got != upstreamKeyGroupMultiplier {
-		t.Fatalf("upstream API key group multiplier = %v, want %v", got, upstreamKeyGroupMultiplier)
+	if got := *linked.UpstreamKeyGroupMultiplier; got != wantCostMultiplier {
+		t.Fatalf("upstream API key cost multiplier = %v, want %v (group %v × recharge %v)", got, wantCostMultiplier, upstreamKeyGroupMultiplier, rechargeRate)
 	}
 	if *linked.UpstreamKeyGroupMultiplier == forwardingAccountMultiplier {
 		t.Fatalf("must not use forwarding account rate_multiplier")
+	}
+	if *linked.UpstreamKeyGroupMultiplier == upstreamKeyGroupMultiplier {
+		t.Fatalf("must apply site recharge rate, not raw upstream group multiplier")
 	}
 	if unlinked := accountsByID["200"]; unlinked.UpstreamKeyGroupMultiplier != nil || unlinked.UpstreamKeyGroupName != "" {
 		t.Fatalf("unlinked account must keep upstream API key group unknown, got %+v", unlinked)

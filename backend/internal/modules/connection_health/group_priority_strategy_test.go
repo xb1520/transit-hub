@@ -525,7 +525,8 @@ func TestMultiplierPrioritySync_UsesUpstreamKeyCostMultiplierWithinSameAdminGrou
 	service := &Service{
 		repo: repo, mySites: mySites, platformGroups: reader, priorityActions: priorityActions,
 		sites: fakeSiteLookup{site: &upstream.Site{
-			ID: "site-1",
+			ID:           "site-1",
+			RechargeRate: 1,
 			Metrics: upstream.Metrics{Groups: []upstream.GroupInfo{
 				{ID: "up-cheap", Name: "cheap", Multiplier: &cheapUpstream},
 				{ID: "up-expensive", Name: "expensive", Multiplier: &expensiveUpstream},
@@ -566,13 +567,37 @@ func TestMultiplierPrioritySync_UsesUpstreamKeyCostMultiplierWithinSameAdminGrou
 }
 
 func TestDesiredManagedPriority_HealthAlwaysBeatsMultiplier(t *testing.T) {
+	// 降级已并入延迟档：无延迟时 healthy 与 degraded 同档，倍率更低者更优先。
 	healthyExpensive := desiredManagedPriority([]ConnectionHealthState{{State: StateHealthy, CurrentWeight: 100}}, 20)
 	degradedCheap := desiredManagedPriority([]ConnectionHealthState{{State: StateDegraded, CurrentWeight: 75}}, 0)
-	if healthyExpensive <= degradedCheap {
-		t.Fatalf("health tier must outrank price: healthy=%d degraded=%d", healthyExpensive, degradedCheap)
+	if healthyExpensive >= degradedCheap {
+		t.Fatalf("degraded folds into latency tier; cheaper degraded should beat expensive healthy without latency: healthy=%d degraded=%d", healthyExpensive, degradedCheap)
 	}
-	cheap := desiredManagedPriority([]ConnectionHealthState{{State: StateHealthy, CurrentWeight: 100}}, 0)
-	expensive := desiredManagedPriority([]ConnectionHealthState{{State: StateHealthy, CurrentWeight: 100}}, 1)
+	// 观察中仍单独低于延迟档。
+	observingCheap := desiredManagedPriority([]ConnectionHealthState{{State: StateObserving, CurrentWeight: 0}}, 0)
+	if healthyExpensive <= observingCheap {
+		t.Fatalf("observing must stay below latency tiers: healthy=%d observing=%d", healthyExpensive, observingCheap)
+	}
+	latency := 500
+	fastExpensive := desiredManagedPriority([]ConnectionHealthState{{
+		State: StateHealthy, CurrentWeight: 100, LastLatencyMs: &latency,
+	}}, 20)
+	slow := 15000
+	slowCheap := desiredManagedPriority([]ConnectionHealthState{{
+		State: StateHealthy, CurrentWeight: 100, LastLatencyMs: &slow,
+	}}, 0)
+	if fastExpensive <= slowCheap {
+		t.Fatalf("faster latency tier must outrank cheaper-but-slower: fastExpensive=%d slowCheap=%d", fastExpensive, slowCheap)
+	}
+	// 快速降级应优于慢速健康。
+	fastDegraded := desiredManagedPriority([]ConnectionHealthState{{
+		State: StateDegraded, CurrentWeight: 75, LastLatencyMs: &latency,
+	}}, 5)
+	if fastDegraded <= slowCheap {
+		t.Fatalf("fast degraded should fold into latency and beat slow healthy: fastDegraded=%d slowCheap=%d", fastDegraded, slowCheap)
+	}
+	cheap := desiredManagedPriority([]ConnectionHealthState{{State: StateHealthy, CurrentWeight: 100, LastLatencyMs: &latency}}, 0)
+	expensive := desiredManagedPriority([]ConnectionHealthState{{State: StateHealthy, CurrentWeight: 100, LastLatencyMs: &latency}}, 1)
 	if cheap <= expensive {
 		t.Fatalf("within same health tier lower multiplier must rank higher: cheap=%d expensive=%d", cheap, expensive)
 	}
@@ -581,12 +606,12 @@ func TestDesiredManagedPriority_HealthAlwaysBeatsMultiplier(t *testing.T) {
 func TestDesiredManagedPriority_MissingModelIsUnconfigured(t *testing.T) {
 	healthy := []ConnectionHealthState{{State: StateHealthy, CurrentWeight: 100}}
 	score := desiredManagedPriorityForPlatformWithExpected(upstream.PlatformNewAPI, healthy, 0, 2)
-	expected := 10000 + 999
+	expected := newAPIUnconfiguredBase + 999
 	if score != expected {
 		t.Fatalf("one healthy and one unprobed model must use the unconfigured tier: got %d want %d", score, expected)
 	}
 	suspended := []ConnectionHealthState{{State: StateSuspended, CurrentWeight: 0}}
-	if got := desiredManagedPriorityForPlatformWithExpected(upstream.PlatformNewAPI, suspended, 0, 2); got != 1 {
+	if got := desiredManagedPriorityForPlatformWithExpected(upstream.PlatformNewAPI, suspended, 0, 2); got != newAPISuspendedPriority {
 		t.Fatalf("known suspended model must remain the lowest tier even with missing siblings: %d", got)
 	}
 }
@@ -675,6 +700,10 @@ func TestDesiredManagedPriority_UsesPlatformPriorityDirection(t *testing.T) {
 }
 
 func TestDesiredManagedPriority_Sub2APIUsesCompactStateBands(t *testing.T) {
+	fast := 800
+	medium := 5000
+	slow := 15000
+	verySlow := 45000
 	tests := []struct {
 		name           string
 		states         []ConnectionHealthState
@@ -684,14 +713,21 @@ func TestDesiredManagedPriority_Sub2APIUsesCompactStateBands(t *testing.T) {
 	}{
 		{name: "multiplier only best", rank: 0, expectedModels: 0, want: 1},
 		{name: "multiplier only second", rank: 1, expectedModels: 0, want: 2},
-		{name: "healthy third", states: []ConnectionHealthState{{State: StateHealthy}}, rank: 2, expectedModels: 1, want: 3},
-		{name: "recovering", states: []ConnectionHealthState{{State: StateRecovering}}, rank: 0, expectedModels: 1, want: 10},
-		{name: "degraded", states: []ConnectionHealthState{{State: StateDegraded}}, rank: 0, expectedModels: 1, want: 100},
-		{name: "observing second", states: []ConnectionHealthState{{State: StateObserving}}, rank: 1, expectedModels: 1, want: 101},
-		{name: "missing model", states: []ConnectionHealthState{{State: StateHealthy}}, rank: 0, expectedModels: 2, want: 1000},
-		{name: "suspended", states: []ConnectionHealthState{{State: StateSuspended}}, rank: 0, expectedModels: 1, want: 10000},
-		{name: "disabled outranks missing", states: []ConnectionHealthState{{State: StateDisabled}}, rank: 0, expectedModels: 2, want: 10000},
-		{name: "healthy rank stays in band", states: []ConnectionHealthState{{State: StateHealthy}}, rank: 99, expectedModels: 1, want: 9},
+		// 无延迟数据 → 最差健康档 3000+rank
+		{name: "healthy no latency third", states: []ConnectionHealthState{{State: StateHealthy}}, rank: 2, expectedModels: 1, want: sub2APIHealthyLatency3Base + 2},
+		{name: "healthy fast second", states: []ConnectionHealthState{{State: StateHealthy, LastLatencyMs: &fast}}, rank: 1, expectedModels: 1, want: sub2APIHealthyLatency0Base + 1},
+		{name: "healthy medium", states: []ConnectionHealthState{{State: StateHealthy, LastLatencyMs: &medium}}, rank: 0, expectedModels: 1, want: sub2APIHealthyLatency1Base},
+		{name: "healthy slow", states: []ConnectionHealthState{{State: StateHealthy, LastLatencyMs: &slow}}, rank: 0, expectedModels: 1, want: sub2APIHealthyLatency2Base},
+		{name: "healthy very slow", states: []ConnectionHealthState{{State: StateHealthy, LastLatencyMs: &verySlow}}, rank: 0, expectedModels: 1, want: sub2APIHealthyLatency3Base},
+		{name: "recovering", states: []ConnectionHealthState{{State: StateRecovering}}, rank: 0, expectedModels: 1, want: sub2APIRecoveringBase},
+		// 降级无延迟 → 最差延迟档（与 healthy 无延迟同档）
+		{name: "degraded folds into latency", states: []ConnectionHealthState{{State: StateDegraded}}, rank: 0, expectedModels: 1, want: sub2APIHealthyLatency3Base},
+		{name: "degraded fast", states: []ConnectionHealthState{{State: StateDegraded, LastLatencyMs: &fast}}, rank: 0, expectedModels: 1, want: sub2APIHealthyLatency0Base},
+		{name: "observing second", states: []ConnectionHealthState{{State: StateObserving}}, rank: 1, expectedModels: 1, want: sub2APIDegradedBase + 1},
+		{name: "missing model", states: []ConnectionHealthState{{State: StateHealthy}}, rank: 0, expectedModels: 2, want: sub2APIUnconfiguredBase},
+		{name: "suspended", states: []ConnectionHealthState{{State: StateSuspended}}, rank: 0, expectedModels: 1, want: sub2APISuspendedPriority},
+		{name: "disabled outranks missing", states: []ConnectionHealthState{{State: StateDisabled}}, rank: 0, expectedModels: 2, want: sub2APISuspendedPriority},
+		{name: "healthy rank stays in band", states: []ConnectionHealthState{{State: StateHealthy, LastLatencyMs: &fast}}, rank: 9999, expectedModels: 1, want: sub2APIHealthyLatency0Base + sub2APIBandWidth - 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -700,6 +736,100 @@ func TestDesiredManagedPriority_Sub2APIUsesCompactStateBands(t *testing.T) {
 				t.Fatalf("unexpected Sub2API priority: got %d want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDesiredManagedPriority_LatencyBeatsMultiplierWithinHealthy(t *testing.T) {
+	fast := 1000
+	slow := 12000
+	// 快但贵 必须优于 慢但便宜（Sub2API 数值越小越好）。
+	fastExpensive := desiredSub2APIManagedPriority([]ConnectionHealthState{{
+		State: StateHealthy, LastLatencyMs: &fast,
+	}}, 5, 1)
+	slowCheap := desiredSub2APIManagedPriority([]ConnectionHealthState{{
+		State: StateHealthy, LastLatencyMs: &slow,
+	}}, 0, 1)
+	if fastExpensive >= slowCheap {
+		t.Fatalf("latency tier must beat multiplier: fastExpensive=%d slowCheap=%d", fastExpensive, slowCheap)
+	}
+}
+
+func TestMultiplierPrioritySync_IgnoresExcludedSuspendedModels(t *testing.T) {
+	// 已从上游白名单摘除的 suspended 模型不得再拖 priority；只按仍可调度的健康模型 + 延迟 + 倍率排序。
+	repo := newFakeRepository()
+	priorityActions := &fakeTargetPriorityActioner{}
+	cheapPriority := 50
+	expensivePriority := 50
+	adminGroupMultiplier := 0.2
+	cheapUpstream := 0.1
+	expensiveUpstream := 0.2
+	fast := 900
+	mySites := fakeAdminGroupKeyReader{
+		fakeMySitesReader: fakeMySitesReader{
+			session: upstream.Session{Platform: upstream.PlatformSub2API},
+			connections: []my_sites.RealConnection{{
+				UserID: "user1", WorkspaceAdminAccountID: "ws1", UpstreamSiteID: "site-1",
+				UpstreamKeyID: "key-cheap", AdminAccountID: "100", AdminPlatform: string(upstream.PlatformSub2API),
+			}, {
+				UserID: "user1", WorkspaceAdminAccountID: "ws1", UpstreamSiteID: "site-1",
+				UpstreamKeyID: "key-expensive", AdminAccountID: "200", AdminPlatform: string(upstream.PlatformSub2API),
+			}},
+		},
+		keysBySite: map[string][]upstream.Sub2APIKeyItem{
+			"site-1": {
+				{ID: "key-cheap", GroupID: "up-cheap", GroupName: "cheap"},
+				{ID: "key-expensive", GroupID: "up-expensive", GroupName: "expensive"},
+			},
+		},
+	}
+	// 便宜目标：白名单只剩 gpt-4o（已摘除的 bad-model 不在 Models 里），状态库仍留有 suspended 历史。
+	reader := fakePlatformGroupReader{
+		groups: []upstream.AdminGroupInfo{{ID: "g1", Name: "vip", Multiplier: &adminGroupMultiplier}},
+		accountsByGrp: map[string][]upstream.AdminGroupAccountInfo{
+			"g1": {
+				{ID: "100", Name: "cheap", Priority: &cheapPriority, Models: "gpt-4o"},
+				{ID: "200", Name: "expensive", Priority: &expensivePriority, Models: "gpt-4o"},
+			},
+		},
+	}
+	service := &Service{
+		repo: repo, mySites: mySites, platformGroups: reader, priorityActions: priorityActions,
+		sites: fakeSiteLookup{site: &upstream.Site{
+			ID: "site-1", RechargeRate: 1,
+			Metrics: upstream.Metrics{Groups: []upstream.GroupInfo{
+				{ID: "up-cheap", Name: "cheap", Multiplier: &cheapUpstream},
+				{ID: "up-expensive", Name: "expensive", Multiplier: &expensiveUpstream},
+			}},
+		}},
+	}
+	policy := Policy{
+		ID: "p1", UserID: "user1", AdminAccountID: "ws1", Enabled: true,
+		AutoDegradeEnabled: true, PriorityMode: PriorityModeMultiplier,
+		ModelTargets: []ModelTarget{{ModelName: "gpt-4o", Enabled: true}, {ModelName: "bad-model", Enabled: true}},
+	}
+	assignment := GroupPolicyAssignment{UserID: "user1", AdminAccountID: "ws1", AdminGroupID: "g1", PolicyID: policy.ID}
+	repo.states["sub2api:ws1:100"] = map[string]ConnectionHealthState{
+		"gpt-4o":    {ConnectionID: "sub2api:ws1:100", ModelName: "gpt-4o", State: StateHealthy, CurrentWeight: 100, LastLatencyMs: &fast, UserID: "user1", AdminAccountID: "ws1"},
+		"bad-model": {ConnectionID: "sub2api:ws1:100", ModelName: "bad-model", State: StateSuspended, CurrentWeight: 0, UserID: "user1", AdminAccountID: "ws1"},
+	}
+	repo.states["sub2api:ws1:200"] = map[string]ConnectionHealthState{
+		"gpt-4o": {ConnectionID: "sub2api:ws1:200", ModelName: "gpt-4o", State: StateHealthy, CurrentWeight: 100, LastLatencyMs: &fast, UserID: "user1", AdminAccountID: "ws1"},
+	}
+
+	service.syncMultiplierPriorities(context.Background(), []Policy{policy}, nil, []GroupPolicyAssignment{assignment}, nil, nil)
+	if len(priorityActions.calls) != 2 {
+		t.Fatalf("expected both targets managed, calls=%+v", priorityActions.calls)
+	}
+	priorityByTarget := map[string]int{}
+	for _, call := range priorityActions.calls {
+		priorityByTarget[call.targetID] = call.priority
+	}
+	// 已摘除的 suspended 不得把 cheap 打到 100000；且 cheap 必须优于 expensive。
+	if priorityByTarget["100"] >= sub2APISuspendedPriority/2 {
+		t.Fatalf("excluded suspended must not degrade priority into suspended band: %+v", priorityByTarget)
+	}
+	if priorityByTarget["100"] >= priorityByTarget["200"] {
+		t.Fatalf("cheaper healthy target must win: cheap=%d expensive=%d", priorityByTarget["100"], priorityByTarget["200"])
 	}
 }
 

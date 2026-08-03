@@ -1080,6 +1080,13 @@ export default {
           actions: 'Actions'
         },
         upstreamMultiplierPending: 'Shown after linking',
+        latencyTier: {
+          hint: 'Latency tiers use average probe latency of still-schedulable models (excluded models are ignored). Within a tier, lower cost multiplier ranks higher.',
+          fast: 'Latency excellent · <3s',
+          medium: 'Latency good · <10s',
+          slow: 'Latency fair · <30s',
+          verySlow: 'Latency slow · ≥30s'
+        },
         models: {
           empty: 'This target has no model probe results yet.',
           latency: 'Latency {value} ms',
@@ -1396,7 +1403,7 @@ export default {
           recoveryStep: 'During recovery, each successful probe raises local weight by this percentage step, instead of jumping straight to 100%.',
           autoDegrade: 'When enabled, probe results drive the health state machine and adjust local routing weight. When disabled, probe results are only recorded — state and weight never change automatically.',
           autoRemoteAction: 'When enabled, supported upstream actions run when the state machine triggers degrade/recovery: Sub2API toggles the admin account active/inactive, and NewAPI updates channel weight/status. When disabled, only probe and state results are recorded.',
-          priorityMode: 'Upstream cost multiplier sorting maps lower purchase rates to higher upstream priority (preferring the linked upstream API key group rate, falling back to the admin group rate). Health tier outranks price; automation stops when it detects a manual priority change.'
+          priorityMode: 'Upstream cost multiplier sorting maps lower purchase rates to higher upstream priority (preferring linked upstream API key cost rate = group rate × site recharge rate, falling back to the admin group rate). Order: schedulable models first (excluded ignored); healthy and degraded share average probe latency tiers (<3s / <10s / <30s / ≥30s), then lower multiplier within the same tier; observing / recovering / suspended stay worse. Automation stops when it detects a manual priority change.'
         },
         runFlow: {
           buttonLabel: 'How it works',

@@ -196,8 +196,8 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 	for _, state := range actionStates {
 		actionByTarget[state.TargetID] = state
 	}
-	// 真实上游 API Key 分组倍率仅用于展示，不参与探活或优先级计算。读取失败时降级为空，
-	// 保证既有分组健康功能不会因为可选的倍率信息不可用而中断。
+	// 真实上游 API Key 成本倍率（分组倍率 × 站点充值倍率）用于展示，并与优先级策略共用同一解析路径。
+	// 读取失败时降级为空，保证既有分组健康功能不会因为可选的倍率信息不可用而中断。
 	upstreamKeyGroups := s.upstreamKeyGroupsByAdminAccount(ctx, userID, adminAccountID, platform)
 
 	// stateIndex[targetId][modelName] = 独立探活当前健康状态。旧的 real_connection 状态行
@@ -545,10 +545,14 @@ func (s *Service) upstreamKeyGroupForConnection(
 	if matched == nil {
 		return upstreamKeyGroupInfo{}, false
 	}
-	return newUpstreamKeyGroupInfo(siteID, keyID, *matched), true
+	// 与分组倍率页一致：展示/排序用的成本倍率 = 上游分组倍率 × 站点充值倍率。
+	// 例如上游分组 1.3x、充值倍率 0.1 → 成本 0.13x；否则跨站点价格不可比。
+	return newUpstreamKeyGroupInfo(siteID, keyID, *matched, site.RechargeRate), true
 }
 
-func newUpstreamKeyGroupInfo(siteID string, keyID string, group upstream.GroupInfo) upstreamKeyGroupInfo {
+// newUpstreamKeyGroupInfo 组装上游 Key 当前分组信息，并将分组倍率换算为成本口径。
+// rechargeRate <= 0 时按 1 处理，避免脏数据把成本倍率抹成 0。
+func newUpstreamKeyGroupInfo(siteID string, keyID string, group upstream.GroupInfo, rechargeRate float64) upstreamKeyGroupInfo {
 	info := upstreamKeyGroupInfo{
 		siteID:  strings.TrimSpace(siteID),
 		keyID:   strings.TrimSpace(keyID),
@@ -556,7 +560,11 @@ func newUpstreamKeyGroupInfo(siteID string, keyID string, group upstream.GroupIn
 		name:    strings.TrimSpace(group.Name),
 	}
 	if group.Multiplier != nil {
-		value := *group.Multiplier
+		rate := rechargeRate
+		if rate <= 0 {
+			rate = 1
+		}
+		value := *group.Multiplier * rate
 		info.multiplier = &value
 	}
 	return info

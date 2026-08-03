@@ -43,9 +43,10 @@ const (
 )
 
 // PriorityMode 控制策略是否同步上游账号/渠道的调度优先级。空值和 none 都保持旧行为；
-// multiplier 表示在健康状态优先的前提下，按上游成本倍率从低到高排序，并把排序结果
-// 映射为上游平台的 priority。成本倍率优先取 real_connections 绑定的上游 API Key 当前
-// 分组倍率；无法解析时回退到 admin 分组倍率。使用字符串常量是为了兼容数据库中未来扩展。
+// multiplier 表示：可调度模型健康等级优先（已摘除模型不参与）→ 健康目标再按平均探活延迟
+// 分四档（<3s/<10s/<30s/≥30s）→ 同档内按上游成本倍率从低到高，并把结果映射为上游 priority。
+// 成本倍率优先取 real_connections 绑定的上游 API Key 成本倍率（分组倍率 × 站点充值倍率）；
+// 无法解析时回退到 admin 分组倍率。使用字符串常量是为了兼容数据库中未来扩展。
 const (
 	PriorityModeNone       = "none"
 	PriorityModeMultiplier = "multiplier"
