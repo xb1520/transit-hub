@@ -1,5 +1,8 @@
-# TransitHub 生产部署示例。
-# 部署前必须修改所有 change-this-* 占位值，并确认镜像地址和版本号正确。
+# TransitHub 生产部署示例（可提交到 git）。
+# 使用方式：
+#   cp deploy/docker-compose.prod.yml.example deploy/docker-compose.prod.yml
+# 然后编辑 docker-compose.prod.yml，替换所有 change-this-* 占位值。
+# deploy/docker-compose.prod.yml 已在 .gitignore 中，避免把生产密钥提交进仓库。
 services:
   # TransitHub 应用服务：包含 Go 后端和已构建的前端静态文件。
   app:

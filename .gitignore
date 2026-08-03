@@ -20,7 +20,11 @@ backend/.prisma
 *.tsbuildinfo
 development-docs/
 data/
+__pycache__/
+*.py[cod]
+*.egg-info/
 
-# local docker override & credentials
+# local docker override & credentials（含生产密钥，勿提交）
 deploy/docker-compose.local.override.yml
+deploy/docker-compose.prod.yml
 data/
