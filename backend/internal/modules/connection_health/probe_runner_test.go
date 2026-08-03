@@ -146,6 +146,39 @@ func TestProbe_ModelNotFound(t *testing.T) {
 	}
 }
 
+func TestProbe_ModelNotSupported400ClassifiedAsModelNotFound(t *testing.T) {
+	// Codex ChatGPT 账号常见：HTTP 400 + invalid_request_error + "model is not supported"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.","type":"invalid_request_error"}}`))
+	}))
+	defer server.Close()
+
+	runner := NewRealProbeRunner()
+	outcome := runner.Probe(context.Background(), ProbeRequest{
+		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderOpenAI, ModelName: "codex-auto-review",
+	})
+	if outcome.Result != ResultModelNotFound {
+		t.Fatalf("expected model_not_found for unsupported model 400, got %s detail=%s", outcome.Result, outcome.Detail)
+	}
+}
+
+func TestProbe_Generic400StillInvalidResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"max_tokens must be positive","type":"invalid_request_error"}}`))
+	}))
+	defer server.Close()
+
+	runner := NewRealProbeRunner()
+	outcome := runner.Probe(context.Background(), ProbeRequest{
+		BaseURL: server.URL, UpstreamKey: "secret-key", ProviderFamily: ProviderOpenAI, ModelName: "gpt-4o",
+	})
+	if outcome.Result != ResultInvalidResponse {
+		t.Fatalf("expected invalid_response for generic 400, got %s", outcome.Result)
+	}
+}
+
 func TestProbe_InvalidResponseBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

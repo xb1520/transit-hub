@@ -158,9 +158,55 @@ func classifyHTTPResponse(status int, body []byte, upstreamKey string, latencyMs
 		return ProbeOutcome{Result: ResultServerError, LatencyMs: latencyMs, Detail: detail}
 
 	default:
-		// 其余 4xx（参数错误等）无法安全归类为上游不可用，按响应无法解析处理，避免误判暂停。
+		// 其余 4xx：优先从响应体识别「模型不存在/不支持」，避免被当成 soft invalid_response
+		// 而长期降级、无法触发模型限制摘除（例如 Codex ChatGPT 账号返回
+		// "model is not supported" 的 400 invalid_request_error）。
+		if status >= 400 && status < 500 && isModelUnavailableErrorBody(body) {
+			return ProbeOutcome{Result: ResultModelNotFound, LatencyMs: latencyMs, Detail: detail}
+		}
+		// 其它参数错误无法安全归类为上游不可用，按响应无法解析处理。
 		return ProbeOutcome{Result: ResultInvalidResponse, LatencyMs: latencyMs, Detail: detail}
 	}
+}
+
+// isModelUnavailableErrorBody 识别上游明确表示模型不可用/不支持的错误正文。
+// 这些应归类为 model_not_found（硬失败），而不是 invalid_response（软失败）。
+func isModelUnavailableErrorBody(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	// 常见 OpenAI / 网关文案
+	phrases := []string{
+		"model_not_found",
+		"model not found",
+		"model_not_available",
+		"model not available",
+		"unknown model",
+		"invalid model",
+		"no such model",
+		"does not exist",
+		"do not exist",
+		"not supported",
+		"is not supported",
+		"not support",
+		"unsupported model",
+		"model is not",
+		"cannot find model",
+		"could not find model",
+		"has no access to model",
+		"you do not have access to model",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	// invalid_request_error 且正文提到 model，多数是模型名/权限问题
+	if strings.Contains(lower, "invalid_request_error") && strings.Contains(lower, "model") {
+		return true
+	}
+	return false
 }
 
 // redact 把探活凭据从错误信息/响应体中裁剪掉，事件和日志绝不落地明文 key。

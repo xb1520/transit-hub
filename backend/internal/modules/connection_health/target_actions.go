@@ -366,36 +366,28 @@ func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blo
 		if state.CurrentWeight < minWeight {
 			minWeight = state.CurrentWeight
 		}
-		// model_not_found / server_error 优先通过「模型限制」摘除处理，不单独把整账号
-		// 打成 inactive，否则同账号其它健康模型也会被停用。
+		// 已暂停模型走「模型限制」摘除，不单独把整账号 inactive，避免同账号健康模型被连带停用。
+		// observing（冷却后观察）/ disabled / 权重 0 的非暂停态仍按原规则阻塞账号。
 		if isModelLimitExclusionState(state) {
 			continue
 		}
 		exclusionOnly = false
-		if state.State == StateSuspended || state.State == StateObserving || state.State == StateDisabled || state.CurrentWeight <= 0 {
+		if state.State == StateObserving || state.State == StateDisabled || state.CurrentWeight <= 0 {
 			blocked = true
 		}
 	}
-	// 全部受控模型都因上述原因被摘除时，仍阻塞账号，避免 models 被清空后继续接流量。
+	// 全部受控模型都处于探活暂停时，仍阻塞账号，避免 models 被清空后继续接流量。
 	if exclusionOnly {
 		blocked = true
 	}
 	return allHealthy, blocked, minWeight
 }
 
-// isModelLimitExclusionResult 判定探活错误是否应通过 sub2api 模型限制摘除处理。
-func isModelLimitExclusionResult(errorKey string) bool {
-	switch ResultKey(strings.TrimSpace(errorKey)) {
-	case ResultModelNotFound, ResultServerError:
-		return true
-	default:
-		return false
-	}
-}
-
-// isModelLimitExclusionState 当前仍处于「应排除在模型限制外」的暂停态。
+// isModelLimitExclusionState 判定模型是否应暂时从 sub2api「模型限制」中摘除。
+// 产品语义：凡进入「探活暂停」(suspended) 的模型都不应再被调度，直到探活恢复；
+// 不区分 model_not_found / server_error / invalid_response / network_fluctuation 等具体原因。
 func isModelLimitExclusionState(state ConnectionHealthState) bool {
-	return state.State == StateSuspended && isModelLimitExclusionResult(state.LastErrorKey)
+	return state.State == StateSuspended
 }
 
 func hasModelLimitExclusion(states []ConnectionHealthState) bool {
@@ -411,19 +403,24 @@ func hasManagedModelLimits(stored *TargetActionState) bool {
 	if stored == nil {
 		return false
 	}
-	original := normalizeModelListString(stored.OriginalModels)
-	if original == "" {
-		return false
-	}
-	// 仍在管理模型限制：当前应用值与原始列表不同，或还有 pending。
 	if strings.TrimSpace(stored.PendingModels) != "" {
 		return true
 	}
-	return normalizeModelListString(stored.LastAppliedModels) != original
+	original := normalizeModelListString(stored.OriginalModels)
+	applied := normalizeModelListString(stored.LastAppliedModels)
+	// 原本不限制：只要写过非空白名单，就仍在管理中。
+	if original == "" {
+		return applied != ""
+	}
+	return applied != original
 }
 
 // reconcileTargetModelLimits 根据探活状态计算期望的 sub2api models 字段并写入上游。
-// 仅当账号原本配置了非空模型限制时生效；空限制表示「不限制模型」，系统不会擅自启用限制。
+//
+// 基线语义：
+//   - OriginalModels 非空：账号原本配置了模型限制，恢复时写回该列表；
+//   - OriginalModels 为空：账号原本不限制模型；摘除时写入「已知模型 − 暂停模型」正向白名单，
+//     全部恢复后写回空字符串以恢复「不限制」。
 func (s *Service) reconcileTargetModelLimits(
 	ctx context.Context,
 	session upstream.Session,
@@ -434,21 +431,22 @@ func (s *Service) reconcileTargetModelLimits(
 	if stored == nil || target.Platform != string(upstream.PlatformSub2API) {
 		return "", nil
 	}
-	// 尚未建立 original 时，用当前上游列表作为基线（仅当非空）。
-	if strings.TrimSpace(stored.OriginalModels) == "" {
-		current := joinModelList(target.Models)
-		if current == "" {
-			return "", nil
-		}
-		// 没有任何需要摘除的模型时不必建立模型快照。
+
+	// 首次接管模型限制：用当前上游列表作为「有限制」基线；空列表表示原本不限制。
+	if strings.TrimSpace(stored.OriginalModels) == "" && strings.TrimSpace(stored.LastAppliedModels) == "" {
 		if !hasModelLimitExclusion(states) {
 			return "", nil
 		}
-		stored.OriginalModels = current
-		stored.LastAppliedModels = current
+		current := joinModelList(target.Models)
+		// 仅当上游确实配置了模型限制时才固化 OriginalModels；空 = 不限制。
+		if current != "" {
+			stored.OriginalModels = current
+			stored.LastAppliedModels = current
+		}
+		// 不限制时 OriginalModels 保持空，LastApplied 待首次写入白名单后再填。
 	}
 
-	desired := desiredModelLimits(stored.OriginalModels, states)
+	desired := desiredModelLimits(stored.OriginalModels, states, target.Models)
 	currentModels := joinModelList(target.Models)
 
 	// 冲突检测：上游当前 models 既不等于上次系统写入，也不等于 pending，视为人工修改。
@@ -461,7 +459,7 @@ func (s *Service) reconcileTargetModelLimits(
 		return RemoteActionSkippedTargetConflict, nil
 	}
 
-	if normalizeModelListString(currentModels) == normalizeModelListString(desired) {
+	if modelListsEqual(currentModels, desired) {
 		stored.LastAppliedModels = desired
 		stored.PendingModels = ""
 		return "", s.repo.UpsertTargetActionState(ctx, *stored)
@@ -473,8 +471,12 @@ func (s *Service) reconcileTargetModelLimits(
 	}
 	action, actionErr := s.dispatcher.ApplyTargetModels(ctx, session, target, desired)
 	if actionErr != nil {
+		log.Printf("[connection-health] apply model limits failed target_id=%s account_id=%s desired=%q action=%s err=%v",
+			target.TargetID, target.AccountID, desired, action, actionErr)
 		return action, actionErr
 	}
+	log.Printf("[connection-health] applied model limits target_id=%s account_id=%s models=%q original=%q",
+		target.TargetID, target.AccountID, desired, stored.OriginalModels)
 	stored.LastAppliedModels = desired
 	stored.PendingModels = ""
 	if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
@@ -501,18 +503,60 @@ func targetModelLimitsConflicted(stored *TargetActionState, currentModels string
 	return current != last && current != normalizeModelListString(stored.PendingModels)
 }
 
-// desiredModelLimits 从原始模型限制中去掉仍处于 model_not_found/server_error 暂停的模型。
-func desiredModelLimits(originalModels string, states []ConnectionHealthState) string {
-	original := splitModelList(originalModels)
-	if len(original) == 0 {
-		return ""
-	}
+// desiredModelLimits 计算应写入上游的模型限制。
+// originalModels 非空：从原始限制中去掉暂停模型。
+// originalModels 为空：账号原本不限制；无暂停时返回空；有暂停时返回「已知模型 − 暂停」。
+func desiredModelLimits(originalModels string, states []ConnectionHealthState, liveModels []string) string {
 	excluded := make(map[string]struct{})
 	for _, state := range states {
 		if isModelLimitExclusionState(state) {
-			excluded[strings.TrimSpace(state.ModelName)] = struct{}{}
+			name := strings.TrimSpace(state.ModelName)
+			if name != "" {
+				excluded[name] = struct{}{}
+			}
 		}
 	}
+
+	original := splitModelList(originalModels)
+	if len(original) == 0 {
+		// 不限制：无暂停则保持空；有暂停则建立正向白名单。
+		if len(excluded) == 0 {
+			return ""
+		}
+		known := make([]string, 0, len(states)+len(liveModels))
+		seen := make(map[string]struct{})
+		for _, state := range states {
+			name := strings.TrimSpace(state.ModelName)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			known = append(known, name)
+		}
+		for _, name := range liveModels {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			known = append(known, name)
+		}
+		kept := make([]string, 0, len(known))
+		for _, name := range known {
+			if _, drop := excluded[name]; drop {
+				continue
+			}
+			kept = append(kept, name)
+		}
+		return joinModelList(kept)
+	}
+
 	kept := make([]string, 0, len(original))
 	for _, model := range original {
 		name := strings.TrimSpace(model)
@@ -525,6 +569,10 @@ func desiredModelLimits(originalModels string, states []ConnectionHealthState) s
 		kept = append(kept, name)
 	}
 	return joinModelList(kept)
+}
+
+func modelListsEqual(a, b string) bool {
+	return normalizeModelListString(a) == normalizeModelListString(b)
 }
 
 func joinModelList(models []string) string {

@@ -70,11 +70,11 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeUpdatesInactive(t *testing.T) {
 		t.Fatalf("expected one call accountID=acc-1 status=inactive, got %+v", platform.sub2APICalls)
 	}
 	st := repo.states[targetID]["gpt-4o"]
-	if st.LastRemoteAction != RemoteActionSub2APIStatusInactive {
-		t.Fatalf("expected state.LastRemoteAction=%s, got %q", RemoteActionSub2APIStatusInactive, st.LastRemoteAction)
+	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APIStatusInactive) {
+		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APIStatusInactive, st.LastRemoteAction)
 	}
-	if len(repo.events) != 1 || repo.events[0].RemoteAction != RemoteActionSub2APIStatusInactive {
-		t.Fatalf("expected event.RemoteAction=%s, got %+v", RemoteActionSub2APIStatusInactive, repo.events)
+	if len(repo.events) != 1 || !strings.Contains(repo.events[0].RemoteAction, RemoteActionSub2APIStatusInactive) {
+		t.Fatalf("expected event.RemoteAction to include %s, got %+v", RemoteActionSub2APIStatusInactive, repo.events)
 	}
 }
 
@@ -155,11 +155,11 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeFailureRecordsFailedAction(t *t
 		t.Fatalf("expected hard failure to suspend, got %+v", results)
 	}
 	st := repo.states[targetID]["gpt-4o"]
-	if st.LastRemoteAction != RemoteActionSub2APIStatusInactiveFailed {
-		t.Fatalf("expected state.LastRemoteAction=%s, got %q", RemoteActionSub2APIStatusInactiveFailed, st.LastRemoteAction)
+	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APIStatusInactiveFailed) {
+		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APIStatusInactiveFailed, st.LastRemoteAction)
 	}
-	if len(repo.events) != 1 || repo.events[0].RemoteAction != RemoteActionSub2APIStatusInactiveFailed {
-		t.Fatalf("expected event.RemoteAction=%s, got %+v", RemoteActionSub2APIStatusInactiveFailed, repo.events)
+	if len(repo.events) != 1 || !strings.Contains(repo.events[0].RemoteAction, RemoteActionSub2APIStatusInactiveFailed) {
+		t.Fatalf("expected event.RemoteAction to include %s, got %+v", RemoteActionSub2APIStatusInactiveFailed, repo.events)
 	}
 }
 

@@ -2,43 +2,48 @@ package connection_health
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"transithub/backend/internal/modules/upstream"
 )
 
-func TestReconcileTargetRemoteAction_SuspendedSiblingBlocksRestore(t *testing.T) {
+func TestReconcileTargetRemoteAction_SuspendedSiblingUsesModelLimits(t *testing.T) {
+	// 产品语义：部分模型探活暂停时，通过模型限制摘除暂停模型，并允许账号恢复 active，
+	// 让仍健康/恢复中的模型继续被调度（不再用账号级 inactive 连带停用全部模型）。
 	repo := newFakeRepository()
 	platform := &fakePlatformActioner{}
 	service := &Service{repo: repo, dispatcher: newRemoteActionDispatcher(nil, nil, platform)}
 	targetID := "sub2api:ws1:acc-1"
 	repo.states[targetID] = map[string]ConnectionHealthState{
-		"model-a": {ConnectionID: targetID, ModelName: "model-a", State: StateSuspended, CurrentWeight: 0},
+		"model-a": {ConnectionID: targetID, ModelName: "model-a", State: StateSuspended, CurrentWeight: 0, LastErrorKey: string(ResultModelNotFound)},
 		"model-b": {ConnectionID: targetID, ModelName: "model-b", State: StateRecovering, CurrentWeight: 25},
 	}
 	repo.targetActionStates["user1|ws1|"+targetID] = TargetActionState{
 		UserID: "user1", AdminAccountID: "ws1", TargetID: targetID,
 		OriginalStatus: "active", LastAppliedStatus: "inactive",
+		OriginalModels: "model-a,model-b", LastAppliedModels: "model-a,model-b",
 	}
 	policy := Policy{ID: "p1", Enabled: true, AutoDegradeEnabled: true, AutoRemoteActionEnabled: true}
 	specs := []probeModelSpec{{modelName: "model-a", policy: policy}, {modelName: "model-b", policy: policy}}
-	target := AdminProbeTarget{TargetID: targetID, Platform: string(upstream.PlatformSub2API), AccountID: "acc-1", AccountStatus: "inactive"}
+	target := AdminProbeTarget{
+		TargetID: targetID, Platform: string(upstream.PlatformSub2API), AccountID: "acc-1",
+		AccountStatus: "inactive", Models: []string{"model-a", "model-b"},
+	}
 
 	action, err := service.reconcileTargetRemoteAction(context.Background(), "user1", "ws1", upstream.Session{Platform: upstream.PlatformSub2API}, target, specs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != "" || len(platform.sub2APICalls) != 0 {
-		t.Fatalf("suspended sibling must keep account inactive, action=%q calls=%+v", action, platform.sub2APICalls)
+	// 应摘除 model-a，并因非阻塞而恢复账号 active
+	if !strings.Contains(action, RemoteActionSub2APIStatusActive) && !strings.Contains(action, RemoteActionSub2APIModelsUpdated) {
+		t.Fatalf("expected models update and/or status active, action=%q", action)
 	}
-
-	repo.states[targetID]["model-a"] = ConnectionHealthState{ConnectionID: targetID, ModelName: "model-a", State: StateHealthy, CurrentWeight: 100}
-	action, err = service.reconcileTargetRemoteAction(context.Background(), "user1", "ws1", upstream.Session{Platform: upstream.PlatformSub2API}, target, specs)
-	if err != nil {
-		t.Fatalf("unexpected restore error: %v", err)
+	if len(platform.sub2APIModelCalls) != 1 || normalizeModelListString(platform.sub2APIModelCalls[0].models) != "model-b" {
+		t.Fatalf("expected models=model-b, got %+v", platform.sub2APIModelCalls)
 	}
-	if action != RemoteActionSub2APIStatusActive || len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("account should restore only after every model is safe, action=%q calls=%+v", action, platform.sub2APICalls)
+	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("partial suspension should re-enable account for healthy models, calls=%+v", platform.sub2APICalls)
 	}
 }
 

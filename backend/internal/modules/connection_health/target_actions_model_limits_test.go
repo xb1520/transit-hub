@@ -14,23 +14,40 @@ func TestDesiredModelLimits_RemovesExcludedModels(t *testing.T) {
 		{ModelName: "gpt-5.6-luna", State: StateSuspended, LastErrorKey: string(ResultModelNotFound)},
 		{ModelName: "gpt-5.5", State: StateSuspended, LastErrorKey: string(ResultServerError)},
 	}
-	got := desiredModelLimits(original, states)
+	got := desiredModelLimits(original, states, nil)
 	want := "gpt-4o"
 	if normalizeModelListString(got) != normalizeModelListString(want) {
 		t.Fatalf("desiredModelLimits = %q, want %q", got, want)
 	}
 }
 
-func TestDesiredModelLimits_RestoresWhenNoLongerExcluded(t *testing.T) {
+func TestDesiredModelLimits_AnySuspendedIsExcluded(t *testing.T) {
 	original := "a,b,c"
 	states := []ConnectionHealthState{
 		{ModelName: "a", State: StateHealthy},
-		{ModelName: "b", State: StateObserving, LastErrorKey: ""},                               // 已探测成功进入观察
-		{ModelName: "c", State: StateSuspended, LastErrorKey: string(ResultNetworkFluctuation)}, // 软失败不摘除
+		{ModelName: "b", State: StateObserving, LastErrorKey: ""}, // 已探测成功进入观察，应保留
+		// 探活暂停（无论原因）都应摘除
+		{ModelName: "c", State: StateSuspended, LastErrorKey: string(ResultNetworkFluctuation)},
 	}
-	got := desiredModelLimits(original, states)
-	if normalizeModelListString(got) != normalizeModelListString(original) {
-		t.Fatalf("soft-failure / observing must keep models, got %q", got)
+	got := desiredModelLimits(original, states, nil)
+	want := "a,b"
+	if normalizeModelListString(got) != normalizeModelListString(want) {
+		t.Fatalf("suspended models must be excluded, got %q want %q", got, want)
+	}
+}
+
+func TestDesiredModelLimits_UnrestrictedBuildsAllowlist(t *testing.T) {
+	// 原本不限制：有暂停时写入白名单；无暂停时保持空
+	states := []ConnectionHealthState{
+		{ModelName: "ok", State: StateHealthy},
+		{ModelName: "bad", State: StateSuspended, LastErrorKey: string(ResultInvalidResponse)},
+	}
+	got := desiredModelLimits("", states, []string{"ok", "bad", "extra"})
+	if normalizeModelListString(got) != normalizeModelListString("ok,extra") {
+		t.Fatalf("unrestricted allowlist = %q", got)
+	}
+	if desiredModelLimits("", []ConnectionHealthState{{ModelName: "ok", State: StateHealthy}}, nil) != "" {
+		t.Fatal("unrestricted with no suspension must stay empty")
 	}
 }
 

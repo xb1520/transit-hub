@@ -144,7 +144,7 @@ type PrioritySyncState struct {
 // 健康恢复后只能恢复到这里保存的原值，不能假设账号原本一定启用或权重一定为 100。
 //
 // OriginalModels / LastAppliedModels 用于 sub2api 账号「模型限制」的自动摘除与恢复：
-// 当探活明确判定 model_not_found / server_error 时，从上游 models 字段移除该模型；
+// 当模型进入探活暂停 (suspended) 时，从上游 models 字段移除该模型，避免继续被调度；
 // 探活恢复后写回。OriginalModels 保存首次接管时的完整限制列表，供持续探活与恢复使用。
 type TargetActionState struct {
 	UserID            string

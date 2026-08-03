@@ -108,10 +108,41 @@ func parseSub2APIAccount(record map[string]any) AdminGroupAccountInfo {
 	if p := firstString(record, []string{"platform"}); p != nil {
 		account.Platform = *p
 	}
-	if m := firstString(record, []string{"models"}); m != nil {
-		account.Models = *m
-	}
+	// models 可能是逗号字符串，也可能是 JSON 数组（不同 sub2api 版本不一致）。
+	account.Models = parseModelsField(record, "models")
 	return account
+}
+
+// parseModelsField 读取账号/渠道的模型限制字段，兼容 string 与 []string/[]any。
+func parseModelsField(record map[string]any, key string) string {
+	raw, ok := record[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if trimmed := strings.TrimSpace(s); trimmed != "" {
+					parts = append(parts, trimmed)
+				}
+			}
+		}
+		return strings.Join(parts, ",")
+	case []string:
+		parts := make([]string, 0, len(v))
+		for _, s := range v {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+		return strings.Join(parts, ",")
+	default:
+		return ""
+	}
 }
 
 // listNewAPIGroupChannels 读取 new-api 某分组下的 channel 列表。
