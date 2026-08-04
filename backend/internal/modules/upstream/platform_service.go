@@ -1635,6 +1635,42 @@ func (s *PlatformService) ListSub2APIKeys(session Session) ([]Sub2APIKeyItem, er
 	return keys, nil
 }
 
+// FetchUserGroupsWithRates 拉取当前登录用户可见的上游分组及生效倍率（含专属倍率覆盖）。
+// 供对接流程在创建转发账号前获取最新倍率，避免使用过期缓存。
+func (s *PlatformService) FetchUserGroupsWithRates(session Session) ([]GroupInfo, error) {
+	switch session.Platform {
+	case PlatformSub2API:
+		return s.fetchSub2APIAvailableGroupsWithRates(session)
+	case PlatformNewAPI:
+		metrics, err := s.FetchMetrics(session)
+		if err != nil {
+			return nil, err
+		}
+		return metrics.Groups, nil
+	default:
+		return nil, newRequestError(ErrorRequest, session.Platform)
+	}
+}
+
+// FetchSub2APISelfConcurrency 读取上游 Sub2API 用户自身的并发上限（GET /api/v1/auth/me）。
+// 对接时用于把 admin 转发账号的 concurrency 对齐到上游账号可承受的并发。
+// ok=false 表示上游未返回有效并发字段。
+func (s *PlatformService) FetchSub2APISelfConcurrency(session Session) (concurrency int, ok bool, err error) {
+	if session.Platform != PlatformSub2API || strings.TrimSpace(session.AccessToken) == "" {
+		return 0, false, newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	response, err := s.httpClient.requestJSON(session.BaseURL+"/api/v1/auth/me", sub2APIUserAuthOptions(session))
+	if err != nil {
+		return 0, false, err
+	}
+	meData := dataRecord(response.Payload)
+	value := firstNumber(meData, []string{"concurrency"})
+	if value == nil || *value <= 0 {
+		return 0, false, nil
+	}
+	return int(*value), true, nil
+}
+
 // CreateSub2APIKey 在上游 Sub2API 站点创建一个 API Key。
 // name 为 key 名称，groupID 为关联分组的数字 ID。
 // 返回新建 key 的 ID（字符串）和 key 值；失败时返回 error。
@@ -2550,6 +2586,73 @@ func (s *PlatformService) UpdateSub2APIAdminAccountModels(session Session, accou
 			"model_mapping": mapping,
 		},
 	})
+}
+
+// SyncSub2APIAdminAccountModelsFromUpstream 调用 Sub2API
+// POST /api/v1/admin/accounts/:id/models/sync-upstream 拉取上游模型列表，
+// 再以恒等 model_mapping 写入账号白名单（对齐后台「同步上游模型列表」后保存的行为）。
+// 上游返回空列表时不修改白名单。
+func (s *PlatformService) SyncSub2APIAdminAccountModelsFromUpstream(session Session, accountID string) error {
+	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+		return newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return newRequestError(ErrorInvalidResponse, PlatformSub2API)
+	}
+	options := adminAuthOptions(session)
+	options.Method = http.MethodPost
+	response, err := s.httpClient.requestJSON(session.BaseURL+"/api/v1/admin/accounts/"+accountID+"/models/sync-upstream", options)
+	if err != nil {
+		return err
+	}
+	models := parseSyncUpstreamModelIDs(response.Payload)
+	if len(models) == 0 {
+		return nil
+	}
+	return s.UpdateSub2APIAdminAccountModels(session, accountID, strings.Join(models, ","))
+}
+
+// parseSyncUpstreamModelIDs 解析 Sub2API sync-upstream 响应中的模型 ID 列表。
+// 兼容 {"data":{"models":[...]}} 与 {"models":[...]}，元素可为 string 或带 id 的对象。
+func parseSyncUpstreamModelIDs(payload any) []string {
+	record, ok := payload.(map[string]any)
+	if !ok {
+		return nil
+	}
+	var raw any
+	if data, ok := record["data"].(map[string]any); ok {
+		raw = data["models"]
+	}
+	if raw == nil {
+		raw = record["models"]
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	models := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		name := ""
+		switch v := item.(type) {
+		case string:
+			name = strings.TrimSpace(v)
+		case map[string]any:
+			if id := firstString(v, []string{"id", "model", "name"}); id != nil {
+				name = strings.TrimSpace(*id)
+			}
+		}
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		models = append(models, name)
+	}
+	return models
 }
 
 // modelListToIdentityMapping 把逗号分隔模型列表转为 Sub2API 白名单用的恒等 model_mapping。

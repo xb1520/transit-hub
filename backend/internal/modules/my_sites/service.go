@@ -801,19 +801,59 @@ func groupTypePrefix(groupType string) string {
 	}
 }
 
-// resolveGroupInfo 从上游站点缓存的分组列表中查找指定分组的平台类型和倍率显示文本。
-// 返回小写的平台名（如 "openai"、"anthropic"）和倍率显示文本（如 "1.5x"），未找到时返回空字符串。
-func resolveGroupInfo(groups []upstream.GroupInfo, groupID string) (groupType string, multiplierDisplay string) {
-	for _, g := range groups {
-		if g.ID == groupID {
-			if g.Platform != nil && strings.TrimSpace(*g.Platform) != "" {
-				groupType = strings.ToLower(strings.TrimSpace(*g.Platform))
-			}
-			multiplierDisplay = g.MultiplierDisplay
-			return
+// resolveGroupInfo 从上游分组列表中查找指定分组的平台类型、倍率显示文本和数值倍率。
+// 优先按 ID 匹配，其次按名称匹配（兼容缓存 ID 为空或与快照不一致的情况）。
+func resolveGroupInfo(groups []upstream.GroupInfo, groupID, groupName string) (groupType string, multiplierDisplay string, rateMultiplier *float64) {
+	groupID = strings.TrimSpace(groupID)
+	groupName = strings.TrimSpace(groupName)
+	var byName *upstream.GroupInfo
+	for i := range groups {
+		g := &groups[i]
+		if groupID != "" && g.ID == groupID {
+			return groupInfoFields(g)
+		}
+		if groupName != "" && (g.Name == groupName || g.ID == groupName) {
+			byName = g
 		}
 	}
+	if byName != nil {
+		return groupInfoFields(byName)
+	}
 	return
+}
+
+func groupInfoFields(g *upstream.GroupInfo) (groupType string, multiplierDisplay string, rateMultiplier *float64) {
+	if g.Platform != nil && strings.TrimSpace(*g.Platform) != "" {
+		groupType = strings.ToLower(strings.TrimSpace(*g.Platform))
+	}
+	multiplierDisplay = g.MultiplierDisplay
+	rateMultiplier = g.Multiplier
+	return
+}
+
+// effectiveAccountRateMultiplier 计算写入 Sub2API 账号的计费倍率。
+// 与分组倍率页「上游倍率」一致：分组原始倍率 × 站点充值倍率（rechargeRate）。
+// 未知分组倍率按 1.0；rechargeRate<=0 时按 1.0。
+func effectiveAccountRateMultiplier(groupMultiplier *float64, rechargeRate float64) float64 {
+	rate := 1.0
+	if groupMultiplier != nil && *groupMultiplier >= 0 {
+		rate = *groupMultiplier
+	}
+	if rechargeRate <= 0 {
+		rechargeRate = 1
+	}
+	return rate * rechargeRate
+}
+
+// formatMultiplierLabel 生成账号名称中的倍率后缀（如 "0.12x"）。
+func formatMultiplierLabel(rate float64) string {
+	formatted := strconv.FormatFloat(rate, 'f', 4, 64)
+	formatted = strings.TrimRight(formatted, "0")
+	formatted = strings.TrimRight(formatted, ".")
+	if formatted == "" || formatted == "-0" {
+		formatted = "0"
+	}
+	return formatted + "x"
 }
 
 // stringsToInts 将字符串切片转为整数切片（Sub2API 接口要求 group_ids 为整数数组）。
@@ -829,44 +869,59 @@ func stringsToInts(ss []string) ([]int, error) {
 	return result, nil
 }
 
+// defaultSub2APIAccountConcurrency 在无法读取上游用户并发时的回落值（对齐 Sub2API 创建表单默认 10）。
+const defaultSub2APIAccountConcurrency = 10
+
+// defaultSub2APIPoolModeRetryCount 对齐 Sub2API 池模式默认同账号重试次数。
+const defaultSub2APIPoolModeRetryCount = 3
+
 // buildAccountPayload 按分组类型组装 admin 站点创建转发账号的请求体。
-// 不同类型有不同的 platform、extra、credentials 配置，详见计划文档中的类型表。
-func buildAccountPayload(groupType, baseURL, apiKey string, ownGroupIDs []int, accountName string) map[string]any {
+//
+// 对接场景默认：
+//   - 不开启 openai/anthropic 自动透传，保留模型白名单/映射可编辑；
+//   - concurrency / rateMultiplier 由调用方按上游用户并发与生效倍率传入；
+//   - openai/anthropic/gemini apikey 启用池模式（上游为另一个中转实例时避免 429/403/401 误标错误）。
+func buildAccountPayload(groupType, baseURL, apiKey string, ownGroupIDs []int, accountName string, concurrency int, rateMultiplier float64) map[string]any {
 	credentials := map[string]any{
 		"base_url": baseURL,
 		"api_key":  apiKey,
 	}
 
+	if concurrency <= 0 {
+		concurrency = defaultSub2APIAccountConcurrency
+	}
+	if rateMultiplier < 0 {
+		rateMultiplier = 1
+	}
+
 	payload := map[string]any{
-		"name":        accountName,
-		"type":        "apikey",
-		"credentials": credentials,
-		"priority":    1,
-		"group_ids":   ownGroupIDs,
+		"name":            accountName,
+		"type":            "apikey",
+		"credentials":     credentials,
+		"priority":        1,
+		"group_ids":       ownGroupIDs,
+		"concurrency":     concurrency,
+		"rate_multiplier": rateMultiplier,
 	}
 
 	switch strings.ToLower(groupType) {
 	case "openai":
 		payload["platform"] = "openai"
 		credentials["pool_mode"] = true
-		payload["extra"] = map[string]any{"openai_passthrough": true}
-		payload["concurrency"] = 1000
+		credentials["pool_mode_retry_count"] = defaultSub2APIPoolModeRetryCount
 	case "anthropic":
 		payload["platform"] = "anthropic"
 		credentials["pool_mode"] = true
-		payload["extra"] = map[string]any{"anthropic_passthrough": true}
-		payload["concurrency"] = 1000
+		credentials["pool_mode_retry_count"] = defaultSub2APIPoolModeRetryCount
 	case "gemini":
 		payload["platform"] = "gemini"
 		credentials["pool_mode"] = true
+		credentials["pool_mode_retry_count"] = defaultSub2APIPoolModeRetryCount
 		credentials["tier_id"] = "aistudio_free"
-		payload["concurrency"] = 1000
 	case "antigravity":
 		payload["platform"] = "antigravity"
-		payload["concurrency"] = 10
 	default:
 		payload["platform"] = groupType
-		payload["concurrency"] = 100
 	}
 
 	return payload

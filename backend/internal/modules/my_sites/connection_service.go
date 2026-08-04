@@ -21,6 +21,7 @@ type connectionContext struct {
 	groupType       string
 	groupName       string
 	multiplierLabel string
+	rateMultiplier  *float64
 }
 
 func addToPricingMapping(value *bool) bool {
@@ -49,16 +50,22 @@ func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, 
 		return connectionContext{}, requestError(ErrorRequest)
 	}
 
-	groupType, multiplierLabel := resolveGroupInfo(upstreamSite.Metrics.Groups, strings.TrimSpace(groupID))
-	if groupType == "" {
-		groupType = strings.ToLower(strings.TrimSpace(requestedType))
-	}
 	resolvedName := strings.TrimSpace(groupName)
 	if resolvedName == "" {
 		resolvedName = strings.TrimSpace(groupID)
 	}
 	if resolvedName == "" {
 		return connectionContext{}, requestError(ErrorRequest)
+	}
+
+	// 优先实时拉取上游分组倍率；失败时回退站点缓存，避免对接因可选刷新失败而中断。
+	groups := upstreamSite.Metrics.Groups
+	if fresh, err := s.platformService.FetchUserGroupsWithRates(*upstreamSite.Session); err == nil && len(fresh) > 0 {
+		groups = fresh
+	}
+	groupType, multiplierLabel, rateMultiplier := resolveGroupInfo(groups, strings.TrimSpace(groupID), resolvedName)
+	if groupType == "" {
+		groupType = strings.ToLower(strings.TrimSpace(requestedType))
 	}
 	// A Sub2API admin account requires a concrete provider type even when the
 	// upstream side is NewAPI and its group itself has no type metadata.
@@ -74,6 +81,7 @@ func (s *Service) prepareConnectionContext(ctx context.Context, userID, siteID, 
 		groupType:       groupType,
 		groupName:       resolvedName,
 		multiplierLabel: multiplierLabel,
+		rateMultiplier:  rateMultiplier,
 	}, nil
 }
 
@@ -263,14 +271,39 @@ func (s *Service) createAdminResource(connectionCtx connectionContext, requested
 	if err != nil {
 		return "", "", requestError(ErrorRequest)
 	}
-	rateLabel := connectionCtx.multiplierLabel
+
+	// 账号计费倍率 = 上游分组倍率 × 站点充值倍率（与分组页「上游倍率」一致）。
+	rateMultiplier := effectiveAccountRateMultiplier(connectionCtx.rateMultiplier, connectionCtx.upstreamSite.RechargeRate)
+	rateLabel := formatMultiplierLabel(rateMultiplier)
+	// 分组无数值倍率时（如 auto），名称后缀保留原展示文案。
+	if connectionCtx.rateMultiplier == nil && strings.TrimSpace(connectionCtx.multiplierLabel) != "" {
+		rateLabel = connectionCtx.multiplierLabel
+	}
 	if rateLabel == "" {
 		rateLabel = connectionCtx.groupName
 	}
+
+	// 并发数对齐上游用户自身并发上限；读不到时回落默认 10。
+	concurrency := defaultSub2APIAccountConcurrency
+	if connectionCtx.upstreamSession.Platform == upstream.PlatformSub2API {
+		if n, ok, fetchErr := s.platformService.FetchSub2APISelfConcurrency(connectionCtx.upstreamSession); fetchErr != nil {
+			log.Printf("[real-connect] fetch upstream concurrency failed err=%v", fetchErr)
+		} else if ok && n > 0 {
+			concurrency = n
+		}
+	}
+
 	name := fmt.Sprintf("%s-【%s】-%s", groupTypePrefix(connectionCtx.groupType), connectionCtx.upstreamSite.Name, rateLabel)
-	payload := buildAccountPayload(connectionCtx.groupType, connectionCtx.upstreamSite.BaseURL, key, numericGroupIDs, name)
+	payload := buildAccountPayload(connectionCtx.groupType, connectionCtx.upstreamSite.BaseURL, key, numericGroupIDs, name, concurrency, rateMultiplier)
 	id, err := s.platformService.CreateSub2APIAdminAccount(connectionCtx.state.Session, payload)
-	return id, name, err
+	if err != nil {
+		return "", "", err
+	}
+	// 创建成功后同步上游模型列表写入白名单；失败不回滚账号（资源已可用，模型可后续手动同步）。
+	if syncErr := s.platformService.SyncSub2APIAdminAccountModelsFromUpstream(connectionCtx.state.Session, id); syncErr != nil {
+		log.Printf("[real-connect] sync upstream models failed account_id=%s err=%v", id, syncErr)
+	}
+	return id, name, nil
 }
 
 func (s *Service) deleteAdminResource(session upstream.Session, resourceID string) error {

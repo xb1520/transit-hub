@@ -106,6 +106,67 @@ func TestUpdateSub2APIAdminAccountModels_WritesModelMappingCredentials(t *testin
 	}
 }
 
+func TestSyncSub2APIAdminAccountModelsFromUpstream_WritesWhitelist(t *testing.T) {
+	var bulkBody map[string]any
+	var syncCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts/1515/models/sync-upstream":
+			syncCalled = true
+			writeJSON(w, map[string]any{"data": map[string]any{"models": []any{"gpt-5.4", "gpt-5.5", map[string]any{"id": "o3"}}}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts/bulk-update":
+			var err error
+			bulkBody, err = readJSONBody(r)
+			if err != nil {
+				t.Fatalf("decode bulk-update: %v", err)
+			}
+			writeJSON(w, map[string]any{"success": true})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	service := NewPlatformService(NewHTTPClient(server.Client()))
+	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
+	if err := service.SyncSub2APIAdminAccountModelsFromUpstream(session, "1515"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !syncCalled {
+		t.Fatal("expected sync-upstream to be called")
+	}
+	assertSub2APIBulkAccountIDs(t, bulkBody, 1515)
+	creds, ok := bulkBody["credentials"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected credentials, got %+v", bulkBody)
+	}
+	mapping, ok := creds["model_mapping"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected model_mapping, got %+v", creds)
+	}
+	for _, model := range []string{"gpt-5.4", "gpt-5.5", "o3"} {
+		if mapping[model] != model {
+			t.Fatalf("missing identity mapping for %s: %+v", model, mapping)
+		}
+	}
+}
+
+func TestSyncSub2APIAdminAccountModelsFromUpstream_EmptyModelsSkipsUpdate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/admin/accounts/1515/models/sync-upstream" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		writeJSON(w, map[string]any{"data": map[string]any{"models": []any{}}})
+	}))
+	defer server.Close()
+
+	service := NewPlatformService(NewHTTPClient(server.Client()))
+	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
+	if err := service.SyncSub2APIAdminAccountModelsFromUpstream(session, "1515"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback 验证旧版接口不支持时直接失败，
 // 不再尝试危险的 GET+PUT 整对象回写。
 func TestSub2APIBulkAccountUpdate_UnsupportedDoesNotFallback(t *testing.T) {
