@@ -28,3 +28,6 @@ __pycache__/
 deploy/docker-compose.local.override.yml
 deploy/docker-compose.prod.yml
 data/
+
+# QQ 机器人 demo 捕获的用户 OpenID（本地运行产物，勿提交）
+qq_user_openid.txt
