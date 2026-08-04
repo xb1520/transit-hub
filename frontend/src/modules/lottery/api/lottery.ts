@@ -1,9 +1,9 @@
 import {
   authUnauthorizedErrorKey,
-  getAccessToken,
   handleAuthExpired,
   isUnauthorizedApiResponse,
 } from '@/modules/auth/api/auth'
+import { buildAuthHeaders } from '@/lib/apiHeaders'
 import type {
   LotteryAuditResponse,
   LotteryCampaign,
@@ -20,11 +20,7 @@ const endpoint = (path: string): string => `${apiBaseUrl.replace(/\/$/, '')}${pa
 
 type AdminErrorPayload = { message?: string }
 
-const authHeaders = (): HeadersInit => {
-  const token = getAccessToken()
-  if (!token) return {}
-  return { Authorization: `Bearer ${token}` }
-}
+const authHeaders = (): HeadersInit => buildAuthHeaders()
 
 const requestJson = async <T>(path: string, options: RequestInit = {}): Promise<T> => {
   let response: Response

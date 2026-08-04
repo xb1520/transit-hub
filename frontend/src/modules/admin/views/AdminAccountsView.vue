@@ -3,11 +3,12 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useDark, useToggle } from '@vueuse/core'
-import { Globe, User, Clock, Check, Loader2, Plus, Moon, Sun, LogOut, Trash2, AlertTriangle } from 'lucide-vue-next'
+import { Globe, User, Clock, Check, Loader2, Plus, Moon, Sun, LogOut, Trash2, AlertTriangle, Pencil } from 'lucide-vue-next'
 import { useAdminAccounts } from '../composables/useAdminAccounts'
 import { clearAccessToken } from '@/modules/auth/api/auth'
 import { loginDashboardAdmin } from '../api/dashboardAdmin'
 import { markWorkspaceActive } from '@/lib/workspaceGuard'
+import { setSelectedWorkspaceId } from '@/lib/workspaceSelection'
 import AdminLoginModal from '../components/dashboard/AdminLoginModal.vue'
 import type { DashboardAdminLoginForm } from '../types/dashboardAdmin'
 import { WORKSPACE_DELETE_CONFIRMATION, type AdminAccount } from '../types/adminAccounts'
@@ -36,19 +37,33 @@ const {
   noticeKey,
   loadAccounts,
   switchAccount,
+  renameAccount,
   deleteAccount,
 } = useAdminAccounts()
 
 const showAddModal = ref(false)
 const addSubmitting = ref(false)
 const addErrorKey = ref<string | null>(null)
+const renameTarget = ref<AdminAccount | null>(null)
+const renameName = ref('')
+const isRenaming = ref(false)
+const renameErrorKey = ref<string | null>(null)
 const deleteTarget = ref<AdminAccount | null>(null)
 const deleteConfirmation = ref('')
 const deleteTypedManually = ref(false)
 const deleteErrorKey = ref<string | null>(null)
 
+const renameTitleId = 'workspace-rename-title'
+const renameDescriptionId = 'workspace-rename-description'
 const deleteTitleId = 'workspace-delete-title'
 const deleteDescriptionId = 'workspace-delete-description'
+
+const canSaveRename = computed(() => (
+  !isRenaming.value
+  && renameName.value.trim().length > 0
+  && renameTarget.value != null
+  && renameName.value.trim() !== renameTarget.value.displayName
+))
 
 const canDeleteWorkspace = computed(() => (
   !isDeleting.value
@@ -87,8 +102,38 @@ const resetDeleteConfirmation = () => {
   deleteTypedManually.value = false
 }
 
+const openRenameModal = (account: AdminAccount) => {
+  if (isSwitching.value || isDeleting.value || isRenaming.value) return
+  renameTarget.value = account
+  renameName.value = account.displayName
+  renameErrorKey.value = null
+}
+
+const closeRenameModal = () => {
+  if (isRenaming.value) return
+  renameTarget.value = null
+  renameName.value = ''
+  renameErrorKey.value = null
+}
+
+const submitRenameWorkspace = async () => {
+  if (!renameTarget.value || !canSaveRename.value) return
+  isRenaming.value = true
+  renameErrorKey.value = null
+  try {
+    await renameAccount(renameTarget.value.id, renameName.value)
+    renameTarget.value = null
+    renameName.value = ''
+    renameErrorKey.value = null
+  } catch (err) {
+    renameErrorKey.value = err instanceof Error ? err.message : 'admin.adminAccounts.errors.request'
+  } finally {
+    isRenaming.value = false
+  }
+}
+
 const openDeleteModal = (account: AdminAccount) => {
-  if (isSwitching.value || isDeleting.value) return
+  if (isSwitching.value || isDeleting.value || isRenaming.value) return
   deleteTarget.value = account
   deleteErrorKey.value = null
   resetDeleteConfirmation()
@@ -206,7 +251,12 @@ const handleAddSubmit = async (form: DashboardAdminLoginForm) => {
   addSubmitting.value = true
   addErrorKey.value = null
   try {
-    await loginDashboardAdmin(form)
+    const status = await loginDashboardAdmin(form)
+    // Bind this browser to the newly created/switched workspace so subsequent
+    // requests do not keep the previous X-Admin-Account-Id selection.
+    if (status.adminAccountId) {
+      setSelectedWorkspaceId(status.adminAccountId)
+    }
     showAddModal.value = false
     markWorkspaceActive()
     await router.push('/admin')
@@ -273,26 +323,43 @@ const handleAddSubmit = async (form: DashboardAdminLoginForm) => {
                 : 'border-border/60 bg-surface-elevated hover:border-primary/40'
             ]"
           >
-            <div v-if="account.current" class="absolute top-3 right-14 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-primary text-primary-foreground">
-              <Check class="h-3.5 w-3.5" />
+            <div class="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+              <div
+                v-if="account.current"
+                class="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground"
+                :title="t('admin.adminAccounts.currentLabel')"
+              >
+                <Check class="h-3.5 w-3.5" />
+              </div>
+              <button
+                type="button"
+                class="flex h-8 w-8 items-center justify-center rounded-full border border-border/60 bg-surface-elevated text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:pointer-events-none disabled:opacity-50"
+                :aria-label="t('admin.adminAccounts.rename.actionLabel', { name: account.displayName })"
+                :title="t('admin.adminAccounts.rename.actionLabel', { name: account.displayName })"
+                :disabled="isSwitching || isDeleting || isRenaming"
+                @click.stop="openRenameModal(account)"
+              >
+                <Pencil class="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                class="flex h-8 w-8 items-center justify-center rounded-full border border-destructive/30 bg-destructive/10 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive disabled:pointer-events-none disabled:opacity-50"
+                :aria-label="t('admin.adminAccounts.delete.actionLabel', { name: account.displayName })"
+                :title="t('admin.adminAccounts.delete.actionLabel', { name: account.displayName })"
+                :disabled="isSwitching || isDeleting || isRenaming"
+                @click.stop="openDeleteModal(account)"
+              >
+                <Trash2 class="h-4 w-4" />
+              </button>
             </div>
 
             <button
               type="button"
-              class="absolute right-3 top-3 z-10 flex h-8 w-8 items-center justify-center rounded-full border border-destructive/30 bg-destructive/10 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive disabled:pointer-events-none disabled:opacity-50"
-              :aria-label="t('admin.adminAccounts.delete.actionLabel', { name: account.displayName })"
-              :title="t('admin.adminAccounts.delete.actionLabel', { name: account.displayName })"
-              :disabled="isSwitching || isDeleting"
-              @click.stop="openDeleteModal(account)"
-            >
-              <Trash2 class="h-4 w-4" />
-            </button>
-
-            <button
-              type="button"
-              :disabled="isSwitching || isDeleting"
+              :disabled="isSwitching || isDeleting || isRenaming"
               @click="switchAccount(account.id)"
-              class="flex min-h-[160px] w-full flex-col gap-3 p-5 pr-24 text-left transition-all disabled:opacity-50"
+              class="flex min-h-[160px] w-full flex-col gap-3 p-5 pr-28 text-left transition-all disabled:opacity-50"
+              :aria-current="account.current ? 'true' : undefined"
+              :title="account.current ? t('admin.adminAccounts.openCurrent') : t('admin.adminAccounts.switchTo')"
             >
               <div class="flex items-center gap-3">
                 <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 border border-primary/20">
@@ -320,10 +387,10 @@ const handleAddSubmit = async (form: DashboardAdminLoginForm) => {
               </div>
 
               <div
-                v-if="account.current"
-                class="mt-1 text-xs font-medium text-primary"
+                class="mt-1 text-xs font-medium"
+                :class="account.current ? 'text-primary' : 'text-muted-foreground'"
               >
-                {{ t('admin.adminAccounts.currentLabel') }}
+                {{ account.current ? t('admin.adminAccounts.currentLabel') : t('admin.adminAccounts.switchTo') }}
               </div>
             </button>
           </div>
@@ -358,6 +425,80 @@ const handleAddSubmit = async (form: DashboardAdminLoginForm) => {
       @submit="handleAddSubmit"
       @close="closeAddModal"
     />
+
+    <Teleport defer to="body">
+      <div
+        v-if="renameTarget"
+        class="fixed inset-0 z-[100] flex items-center justify-center p-4"
+        @keydown.esc.prevent.stop="closeRenameModal"
+      >
+        <div class="absolute inset-0 bg-background/80 backdrop-blur-sm" @click="closeRenameModal" />
+
+        <form
+          role="dialog"
+          aria-modal="true"
+          :aria-labelledby="renameTitleId"
+          :aria-describedby="renameDescriptionId"
+          class="relative w-full max-w-md overflow-hidden rounded-2xl border border-border/70 bg-card text-card-foreground shadow-2xl animate-in fade-in zoom-in-95 duration-200"
+          @submit.prevent="submitRenameWorkspace"
+        >
+          <div class="p-6">
+            <div class="flex items-start gap-4">
+              <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-primary/30 bg-primary/10 text-primary">
+                <Pencil class="h-5 w-5" />
+              </div>
+              <div class="min-w-0 flex-1">
+                <h3 :id="renameTitleId" class="text-lg font-semibold text-foreground">
+                  {{ t('admin.adminAccounts.rename.title') }}
+                </h3>
+                <p :id="renameDescriptionId" class="mt-2 text-sm leading-6 text-muted-foreground">
+                  {{ t('admin.adminAccounts.rename.description') }}
+                </p>
+              </div>
+            </div>
+
+            <label class="mt-5 block text-sm font-medium text-foreground" for="workspace-rename-name">
+              {{ t('admin.adminAccounts.rename.nameLabel') }}
+            </label>
+            <input
+              id="workspace-rename-name"
+              v-model="renameName"
+              type="text"
+              class="mt-2 h-11 w-full rounded-xl border border-border/70 bg-surface px-4 text-sm text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:opacity-50"
+              :placeholder="t('admin.adminAccounts.rename.namePlaceholder')"
+              maxlength="64"
+              autocomplete="off"
+              :disabled="isRenaming"
+              autofocus
+            />
+
+            <div v-if="renameErrorKey" class="mt-5 flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{{ t(renameErrorKey) }}</span>
+            </div>
+
+            <div class="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                class="inline-flex h-10 items-center justify-center rounded-xl bg-secondary px-4 py-2 text-sm font-semibold text-secondary-foreground transition-colors hover:bg-surface-line focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:pointer-events-none disabled:opacity-50"
+                :disabled="isRenaming"
+                @click="closeRenameModal"
+              >
+                {{ t('admin.adminAccounts.rename.cancel') }}
+              </button>
+              <button
+                type="submit"
+                class="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:pointer-events-none disabled:opacity-50"
+                :disabled="!canSaveRename"
+              >
+                <Loader2 v-if="isRenaming" class="h-4 w-4 animate-spin" />
+                {{ t(isRenaming ? 'admin.adminAccounts.rename.saving' : 'admin.adminAccounts.rename.confirm') }}
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </Teleport>
 
     <Teleport defer to="body">
       <div

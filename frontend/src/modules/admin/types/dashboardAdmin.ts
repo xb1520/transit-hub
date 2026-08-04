@@ -16,6 +16,8 @@ export interface DashboardAdminStatus {
   identity?: string
   /** 登录凭证（access token）过期的毫秒时间戳，临期自动刷新；null 表示未知。 */
   expiresAt?: number | null
+  /** 登录成功后返回的工作区 ID，供本浏览器写入本地工作区选择。 */
+  adminAccountId?: string
 }
 
 /** 登录弹窗提交的表单，覆盖两种登录方式所需字段。 */

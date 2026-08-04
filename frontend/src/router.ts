@@ -8,6 +8,7 @@ import {
   isWorkspaceActive,
   setWorkspaceChecked,
 } from './lib/workspaceGuard'
+import { setSelectedWorkspaceId } from './lib/workspaceSelection'
 
 const routes = [
   {
@@ -137,7 +138,10 @@ router.beforeEach(async (to) => {
   if (to.matched.some((route) => route.meta.requiresWorkspace)) {
     if (!isWorkspaceChecked()) {
       try {
-        await getCurrentAdminAccount()
+        const account = await getCurrentAdminAccount()
+        // Persist the resolved workspace so this browser stays on it even if
+        // another frontend updates the shared server-side default.
+        setSelectedWorkspaceId(account.id)
         setWorkspaceChecked(true, true)
       } catch {
         setWorkspaceChecked(true, false)

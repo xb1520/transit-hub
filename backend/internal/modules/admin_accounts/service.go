@@ -5,6 +5,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"transithub/backend/internal/shared/authctx"
 )
 
 type accountRepository interface {
@@ -13,6 +15,7 @@ type accountRepository interface {
 	List(ctx context.Context, userID string) ([]Account, error)
 	Current(ctx context.Context, userID string) (*Account, error)
 	CurrentID(ctx context.Context, userID string) (string, error)
+	GetForUser(ctx context.Context, userID string, accountID string) (*Account, error)
 	UpsertAndSwitch(ctx context.Context, userID string, input UpsertInput) (Account, error)
 	Switch(ctx context.Context, userID string, accountID string) (*Account, error)
 	Update(ctx context.Context, userID string, accountID string, displayName string) (*Account, error)
@@ -42,14 +45,63 @@ func (s *Service) AssignLegacyRows(ctx context.Context) error {
 }
 
 func (s *Service) List(ctx context.Context, userID string) ([]Account, error) {
-	return s.repository.List(ctx, userID)
+	accounts, err := s.repository.List(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	// Mark "current" from the browser-local selection (header) when present so
+	// the workspace picker reflects this frontend's active workspace rather
+	// than the shared users.current_admin_account_id fallback.
+	preferredID, err := s.CurrentID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if preferredID == "" {
+		return accounts, nil
+	}
+	currentIndex := -1
+	for i := range accounts {
+		isCurrent := accounts[i].ID == preferredID
+		accounts[i].Current = isCurrent
+		if isCurrent {
+			currentIndex = i
+		}
+	}
+	// Keep the browser-current workspace first for stable picker UX.
+	if currentIndex > 0 {
+		current := accounts[currentIndex]
+		copy(accounts[1:currentIndex+1], accounts[0:currentIndex])
+		accounts[0] = current
+	}
+	return accounts, nil
 }
 
 func (s *Service) Current(ctx context.Context, userID string) (*Account, error) {
+	if preferredID, ok := authctx.AdminAccountID(ctx); ok {
+		account, err := s.repository.GetForUser(ctx, userID, preferredID)
+		if err != nil {
+			return nil, err
+		}
+		if account != nil {
+			account.Current = true
+			return account, nil
+		}
+		// Stale browser selection (deleted elsewhere): fall back to DB default.
+	}
 	return s.repository.Current(ctx, userID)
 }
 
 func (s *Service) CurrentID(ctx context.Context, userID string) (string, error) {
+	if preferredID, ok := authctx.AdminAccountID(ctx); ok {
+		account, err := s.repository.GetForUser(ctx, userID, preferredID)
+		if err != nil {
+			return "", err
+		}
+		if account != nil {
+			return account.ID, nil
+		}
+		// Stale browser selection: fall back to DB default.
+	}
 	return s.repository.CurrentID(ctx, userID)
 }
 
@@ -77,6 +129,9 @@ func (s *Service) UpsertAndSwitch(ctx context.Context, userID string, input Upse
 }
 
 func (s *Service) Switch(ctx context.Context, userID string, accountID string) (*Account, error) {
+	// Switch still updates users.current_admin_account_id as a fallback default
+	// for clients without a browser-local selection. Concurrent browsers keep
+	// independence via the X-Admin-Account-Id request header.
 	account, err := s.repository.Switch(ctx, userID, strings.TrimSpace(accountID))
 	if err != nil {
 		return nil, err
@@ -84,17 +139,28 @@ func (s *Service) Switch(ctx context.Context, userID string, accountID string) (
 	if account == nil {
 		return nil, requestError(ErrorNotFound)
 	}
+	account.Current = true
 	return account, nil
 }
 
 func (s *Service) Update(ctx context.Context, userID string, accountID string, req UpdateRequest) (*Account, error) {
-	account, err := s.repository.Update(ctx, userID, strings.TrimSpace(accountID), req.DisplayName)
+	displayName := strings.TrimSpace(req.DisplayName)
+	if displayName == "" {
+		return nil, requestError(ErrorRequest)
+	}
+	account, err := s.repository.Update(ctx, userID, strings.TrimSpace(accountID), displayName)
 	if err != nil {
 		return nil, err
 	}
 	if account == nil {
 		return nil, requestError(ErrorNotFound)
 	}
+	// Preserve browser-local "current" semantics instead of the shared DB pointer.
+	preferredID, err := s.CurrentID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	account.Current = preferredID != "" && account.ID == preferredID
 	return account, nil
 }
 

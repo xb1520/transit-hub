@@ -1,20 +1,16 @@
 import type { DashboardAdminLoginForm, DashboardAdminStatus } from '../types/dashboardAdmin'
 import {
   authUnauthorizedErrorKey,
-  getAccessToken,
   handleAuthExpired,
   isUnauthorizedApiResponse,
 } from '@/modules/auth/api/auth'
+import { buildAuthHeaders } from '@/lib/apiHeaders'
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? '/api'
 
 const endpoint = (path: string): string => `${apiBaseUrl.replace(/\/$/, '')}${path}`
 
-const authHeaders = (): HeadersInit => {
-  const token = getAccessToken()
-  if (!token) return {}
-  return { Authorization: `Bearer ${token}` }
-}
+const authHeaders = (): HeadersInit => buildAuthHeaders()
 
 type AdminErrorPayload = {
   message?: string

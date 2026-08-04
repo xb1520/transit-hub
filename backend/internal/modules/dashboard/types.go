@@ -58,13 +58,15 @@ type LoginRequest struct {
 
 // StatusResponse 描述当前用户的仪表盘 admin 登录状态，供前端决定是否弹窗。
 // ExpiresAt 是登录凭证（access token）的过期毫秒时间戳，临期会自动刷新；nil 表示未知。
+// AdminAccountID 在登录成功时返回，供浏览器前端写入本地工作区选择。
 type StatusResponse struct {
-	Authenticated bool   `json:"authenticated"`
-	Platform      string `json:"platform"`
-	BaseURL       string `json:"baseUrl"`
-	AuthMethod    string `json:"authMethod"`
-	Identity      string `json:"identity"`
-	ExpiresAt     *int64 `json:"expiresAt"`
+	Authenticated  bool   `json:"authenticated"`
+	Platform       string `json:"platform"`
+	BaseURL        string `json:"baseUrl"`
+	AuthMethod     string `json:"authMethod"`
+	Identity       string `json:"identity"`
+	ExpiresAt      *int64 `json:"expiresAt"`
+	AdminAccountID string `json:"adminAccountId,omitempty"`
 }
 
 // requestError 让 service 返回可直接作为 i18n key 的业务错误，由 handler 映射成 HTTP 状态码。

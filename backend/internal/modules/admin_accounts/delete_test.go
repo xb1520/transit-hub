@@ -29,6 +29,9 @@ func (f *deleteFakeAccountRepository) Current(ctx context.Context, userID string
 func (f *deleteFakeAccountRepository) CurrentID(ctx context.Context, userID string) (string, error) {
 	return "", nil
 }
+func (f *deleteFakeAccountRepository) GetForUser(ctx context.Context, userID string, accountID string) (*Account, error) {
+	return nil, nil
+}
 func (f *deleteFakeAccountRepository) UpsertAndSwitch(ctx context.Context, userID string, input UpsertInput) (Account, error) {
 	return Account{}, nil
 }

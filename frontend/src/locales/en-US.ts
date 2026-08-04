@@ -477,12 +477,24 @@ export default {
     },
     adminAccounts: {
       title: 'Select Workspace',
-      subtitle: 'Choose an admin workspace to continue, or add a new one.',
+      subtitle: 'Choose the admin workspace for this browser, or add a new one. Different browsers can open different workspaces at the same time.',
       empty: 'No workspaces yet. Add your first workspace to get started.',
-      currentLabel: 'Current workspace',
+      currentLabel: 'Current in this browser',
+      openCurrent: 'Open workspace',
+      switchTo: 'Switch to this workspace',
       addWorkspace: 'Add Workspace',
       addWorkspaceHint: 'Connect a new site admin account',
       creating: 'Creating workspace...',
+      rename: {
+        actionLabel: 'Rename workspace {name}',
+        title: 'Rename workspace',
+        description: 'Give this workspace a clear name so you can tell it apart, for example “Production” or “LAN test”.',
+        nameLabel: 'Workspace name',
+        namePlaceholder: 'Enter a workspace name',
+        cancel: 'Cancel',
+        confirm: 'Save',
+        saving: 'Saving...'
+      },
       delete: {
         actionLabel: 'Delete workspace {name}',
         title: 'Delete {name}',
@@ -499,6 +511,7 @@ export default {
       errors: {
         noCurrentAccount: 'Please select a workspace first.',
         notFound: 'Workspace not found.',
+        nameRequired: 'Please enter a workspace name.',
         deleteFailed: 'Workspace deletion failed. Type the confirmation phrase again and retry.',
         request: 'Operation failed. Please try again.',
         network: 'Network error. Check your connection and try again.'

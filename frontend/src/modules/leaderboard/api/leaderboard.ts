@@ -1,9 +1,9 @@
 import {
   authUnauthorizedErrorKey,
-  getAccessToken,
   handleAuthExpired,
   isUnauthorizedApiResponse,
 } from '@/modules/auth/api/auth'
+import { buildAuthHeaders } from '@/lib/apiHeaders'
 import type { LeaderboardDateRange, LeaderboardEmbedConfig, LeaderboardResponse } from '../types'
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? '/api'
@@ -12,7 +12,6 @@ const endpoint = (path: string): string => `${apiBaseUrl.replace(/\/$/, '')}${pa
 type ErrorPayload = { message?: string }
 
 const requestJson = async <T>(path: string, options: RequestInit = {}): Promise<T> => {
-  const token = getAccessToken()
   let response: Response
   try {
     response = await fetch(endpoint(path), {
@@ -20,7 +19,7 @@ const requestJson = async <T>(path: string, options: RequestInit = {}): Promise<
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...buildAuthHeaders(),
         ...(options.headers ?? {}),
       },
     })

@@ -126,3 +126,35 @@ func TestWorkspaceDeleteSQLDocumentsCurrentFallbackAndLocks(t *testing.T) {
 		t.Fatal("account row must be locked under user/account scope")
 	}
 }
+
+func TestCreateLegacyAccountsSQLDoesNotResurrectDeletedWorkspaces(t *testing.T) {
+	sql := createLegacyAccountsForTableSQL(workspaceTableDescriptor{
+		Name:            "upstream_sites",
+		WorkspaceColumn: "admin_account_id",
+	})
+	if !strings.Contains(sql, "NOT EXISTS") || !strings.Contains(sql, "admin_accounts") {
+		t.Fatal("legacy creation must skip users who already own any admin workspace")
+	}
+	if strings.Contains(sql, "DO UPDATE") {
+		t.Fatal("legacy creation must not upsert-touch deleted workspaces back into activity")
+	}
+	if !strings.Contains(sql, "DO NOTHING") {
+		t.Fatal("legacy creation conflict path must be no-op")
+	}
+}
+
+func TestAssignLegacyRowsSQLFallsBackToExistingWorkspace(t *testing.T) {
+	sql := assignLegacyRowsForTableSQL(workspaceTableDescriptor{
+		Name:            "upstream_sites",
+		WorkspaceColumn: "admin_account_id",
+	})
+	if !strings.Contains(sql, "DISTINCT ON (user_id)") {
+		t.Fatal("empty workspace rows must pick a deterministic preferred account")
+	}
+	if !strings.Contains(sql, "platform = 'legacy'") {
+		t.Fatal("assignment should still prefer a remaining legacy workspace when present")
+	}
+	if !strings.Contains(sql, "created_at ASC") {
+		t.Fatal("without legacy, assignment should fall back to the oldest real workspace")
+	}
+}

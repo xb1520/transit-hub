@@ -477,12 +477,24 @@ export default {
     },
     adminAccounts: {
       title: '选择工作区',
-      subtitle: '选择一个管理员工作区以继续，或添加新的工作区。',
+      subtitle: '选择本浏览器要打开的管理员工作区，或添加新的工作区。不同浏览器可同时使用不同工作区。',
       empty: '暂无工作区，添加第一个工作区开始使用。',
-      currentLabel: '当前工作区',
+      currentLabel: '本浏览器当前工作区',
+      openCurrent: '进入工作区',
+      switchTo: '切换到此工作区',
       addWorkspace: '添加工作区',
       addWorkspaceHint: '连接新的站点管理员账号',
       creating: '正在创建工作区...',
+      rename: {
+        actionLabel: '重命名工作区 {name}',
+        title: '重命名工作区',
+        description: '为工作区设置便于区分的名称，例如「生产站」或「内网测试」。',
+        nameLabel: '工作区名称',
+        namePlaceholder: '输入工作区名称',
+        cancel: '取消',
+        confirm: '保存',
+        saving: '保存中...'
+      },
       delete: {
         actionLabel: '删除工作区 {name}',
         title: '删除 {name}',
@@ -499,6 +511,7 @@ export default {
       errors: {
         noCurrentAccount: '请先选择一个工作区。',
         notFound: '工作区不存在。',
+        nameRequired: '请输入工作区名称。',
         deleteFailed: '删除工作区失败，请重新输入确认短语后再试。',
         request: '操作失败，请稍后重试。',
         network: '网络异常，请检查连接后重试。'

@@ -249,7 +249,10 @@ func (s *Service) Login(ctx context.Context, userID string, req LoginRequest) (S
 		}
 	}
 
-	return statusFromRecord(record, true), nil
+	status := statusFromRecord(record, true)
+	// 返回新建/切换后的工作区 ID，供浏览器前端写入本地选择，避免仍沿用旧 header。
+	status.AdminAccountID = adminAccount.ID
+	return status, nil
 }
 
 // Logout 退出当前 admin 账户（仅清除仪表盘 admin 会话，不影响 TransitHub 后台登录）。

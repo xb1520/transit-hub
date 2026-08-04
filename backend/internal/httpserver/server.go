@@ -424,7 +424,13 @@ func (s *Server) Handler() http.Handler {
 				httpjson.WriteError(w, http.StatusUnauthorized, "auth.errors.unauthorized")
 				return
 			}
-			r = r.WithContext(authctx.WithUserID(r.Context(), user.ID))
+			ctx := authctx.WithUserID(r.Context(), user.ID)
+			// Prefer the browser-local workspace header so different frontends
+			// for the same user can open independent workspaces concurrently.
+			if accountID := strings.TrimSpace(r.Header.Get(authctx.AdminAccountIDHeader)); accountID != "" {
+				ctx = authctx.WithAdminAccountID(ctx, accountID)
+			}
+			r = r.WithContext(ctx)
 		}
 		s.mux.ServeHTTP(w, r)
 	})))
@@ -536,7 +542,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, "+authctx.AdminAccountIDHeader)
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

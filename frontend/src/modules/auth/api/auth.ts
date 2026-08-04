@@ -6,6 +6,7 @@ import type {
   RegisterRequest,
 } from '../types/auth'
 import { resetWorkspaceCheck } from '@/lib/workspaceGuard'
+import { clearSelectedWorkspaceId } from '@/lib/workspaceSelection'
 
 export const authTokenStorageKey = 'transithub.auth.accessToken'
 export const authUnauthorizedErrorKey = 'auth.errors.unauthorized'
@@ -72,8 +73,9 @@ export const getAccessToken = (): string | null => localStorage.getItem(authToke
 
 export const clearAccessToken = (): void => {
   localStorage.removeItem(authTokenStorageKey)
-  // 清除 token 时同步重置 workspace 路由守卫缓存，
+  // 清除 token 时同步重置 workspace 路由守卫缓存与本浏览器工作区选择，
   // 防止下次登录（可能是不同用户）复用旧 workspace 状态。
+  clearSelectedWorkspaceId()
   resetWorkspaceCheck()
 }
 

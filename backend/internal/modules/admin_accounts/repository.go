@@ -147,7 +147,8 @@ func (r *Repository) AssignLegacyRows(ctx context.Context) error {
 	return r.assignLegacyRows(ctx)
 }
 
-// createLegacyAccounts 为已有业务数据但尚无 admin account 的用户创建 legacy workspace。
+// createLegacyAccounts 仅为「有业务数据但尚无任何 admin account」的用户创建
+// legacy workspace。用户一旦拥有真实工作区并删除了 legacy，重启/升级后不得再复活。
 func (r *Repository) createLegacyAccounts(ctx context.Context) error {
 	for _, table := range legacyWorkspaceTables {
 		if err := r.createLegacyAccountsForTable(ctx, table); err != nil {
@@ -157,33 +158,57 @@ func (r *Repository) createLegacyAccounts(ctx context.Context) error {
 	return nil
 }
 
-func (r *Repository) createLegacyAccountsForTable(ctx context.Context, table workspaceTableDescriptor) error {
-	exists, err := r.tableExists(ctx, table.Name)
-	if err != nil || !exists {
-		return err
-	}
-	_, err = r.db.Exec(ctx, fmt.Sprintf(`
+// createLegacyAccountsForTableSQL 仅用于迁移：只给「表内有数据且尚无任何工作区」的用户
+// 创建 platform=legacy 的占位工作区。绝不能按「表内有任意数据」筛选，否则删除后会在
+// 每次启动时被重新插入。
+func createLegacyAccountsForTableSQL(table workspaceTableDescriptor) string {
+	return fmt.Sprintf(`
 		WITH scoped_users AS (
-			SELECT DISTINCT user_id FROM %s WHERE user_id <> ''
+			SELECT DISTINCT t.user_id
+			FROM %s AS t
+			WHERE t.user_id <> ''
+			  AND NOT EXISTS (
+				SELECT 1 FROM admin_accounts AS a WHERE a.user_id = t.user_id
+			  )
 		), legacy AS (
 			SELECT users.id AS user_id, 'adminacct_' || encode(sha256(convert_to(users.id || '|legacy||legacy', 'UTF8')), 'hex') AS account_id
 			FROM users JOIN scoped_users ON scoped_users.user_id = users.id
 		)
 		INSERT INTO admin_accounts (id, user_id, platform, base_url, identity, display_name, auth_method, last_used_at, created_at, updated_at)
 		SELECT account_id, user_id, 'legacy', '', 'legacy', 'Legacy workspace', 'legacy', now(), now(), now() FROM legacy
-		ON CONFLICT (user_id, platform, base_url, identity) DO UPDATE SET updated_at = EXCLUDED.updated_at
-	`, table.Name))
+		ON CONFLICT (user_id, platform, base_url, identity) DO NOTHING
+	`, table.Name)
+}
+
+func (r *Repository) createLegacyAccountsForTable(ctx context.Context, table workspaceTableDescriptor) error {
+	exists, err := r.tableExists(ctx, table.Name)
+	if err != nil || !exists {
+		return err
+	}
+	_, err = r.db.Exec(ctx, createLegacyAccountsForTableSQL(table))
 	return err
 }
 
-// assignLegacyRows 将 admin_account_id 为空的旧业务行归属到用户的第一个工作区（legacy workspace）。
+// assignLegacyRows 将 workspace 字段为空的旧业务行补归属。
 // 不删除旧数据，只补值。
 //
-// 关键设计：旧数据始终归属到 platform='legacy' 的工作区（即第一个工作区），
-// 而非 users.current_admin_account_id。这保证即使用户已有多个 workspace 并
-// 切换到了非 legacy 的工作区，历史数据也不会散落到其他 workspace。
+// 归属优先级：
+//  1. platform='legacy' 的迁移工作区（若仍存在）
+//  2. 否则用户已有工作区中创建最早的一个
+//
+// 这样即使用户已删除 Legacy workspace，残留的空归属行也会落到真实工作区，
+// 而不会在启动时再次强制创建 legacy。
 func (r *Repository) assignLegacyRows(ctx context.Context) error {
-	if _, err := r.db.Exec(ctx, `UPDATE users SET current_admin_account_id = legacy.id FROM admin_accounts AS legacy WHERE users.id = legacy.user_id AND users.current_admin_account_id = '' AND legacy.platform = 'legacy'`); err != nil {
+	if _, err := r.db.Exec(ctx, `UPDATE users SET current_admin_account_id = preferred.id
+		FROM (
+			SELECT DISTINCT ON (user_id) id, user_id
+			FROM admin_accounts
+			ORDER BY user_id,
+				CASE WHEN platform = 'legacy' THEN 0 ELSE 1 END,
+				created_at ASC,
+				id ASC
+		) AS preferred
+		WHERE users.id = preferred.user_id AND users.current_admin_account_id = ''`); err != nil {
 		return err
 	}
 	for _, table := range legacyWorkspaceTables {
@@ -194,12 +219,28 @@ func (r *Repository) assignLegacyRows(ctx context.Context) error {
 	return nil
 }
 
+// assignLegacyRowsForTableSQL 把空 workspace 字段补到用户的首选工作区。
+func assignLegacyRowsForTableSQL(table workspaceTableDescriptor) string {
+	return fmt.Sprintf(`UPDATE %s AS target
+		SET %s = preferred.id
+		FROM (
+			SELECT DISTINCT ON (user_id) id, user_id
+			FROM admin_accounts
+			ORDER BY user_id,
+				CASE WHEN platform = 'legacy' THEN 0 ELSE 1 END,
+				created_at ASC,
+				id ASC
+		) AS preferred
+		WHERE target.user_id = preferred.user_id
+		  AND target.%s = ''`, table.Name, table.WorkspaceColumn, table.WorkspaceColumn)
+}
+
 func (r *Repository) assignLegacyRowsForTable(ctx context.Context, table workspaceTableDescriptor) error {
 	exists, err := r.tableExists(ctx, table.Name)
 	if err != nil || !exists {
 		return err
 	}
-	_, err = r.db.Exec(ctx, fmt.Sprintf(`UPDATE %s SET %s = legacy.id FROM admin_accounts AS legacy WHERE %s.user_id = legacy.user_id AND %s.%s = '' AND legacy.platform = 'legacy'`, table.Name, table.WorkspaceColumn, table.Name, table.Name, table.WorkspaceColumn))
+	_, err = r.db.Exec(ctx, assignLegacyRowsForTableSQL(table))
 	return err
 }
 
@@ -228,6 +269,23 @@ func (r *Repository) List(ctx context.Context, userID string) ([]Account, error)
 
 func (r *Repository) Current(ctx context.Context, userID string) (*Account, error) {
 	row := r.db.QueryRow(ctx, `SELECT a.id, a.user_id, a.platform, a.base_url, a.identity, a.display_name, a.auth_method, true AS current, a.last_used_at, a.created_at, a.updated_at FROM users JOIN admin_accounts AS a ON a.id = users.current_admin_account_id AND a.user_id = users.id WHERE users.id = $1`, userID)
+	var account Account
+	if err := row.Scan(&account.ID, &account.UserID, &account.Platform, &account.BaseURL, &account.Identity, &account.DisplayName, &account.AuthMethod, &account.Current, &account.LastUsedAt, &account.CreatedAt, &account.UpdatedAt); err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &account, nil
+}
+
+// GetForUser returns a workspace owned by the user, or nil when missing/unowned.
+func (r *Repository) GetForUser(ctx context.Context, userID string, accountID string) (*Account, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, nil
+	}
+	row := r.db.QueryRow(ctx, `SELECT a.id, a.user_id, a.platform, a.base_url, a.identity, a.display_name, a.auth_method, a.id = users.current_admin_account_id AS current, a.last_used_at, a.created_at, a.updated_at FROM admin_accounts AS a JOIN users ON users.id = a.user_id WHERE a.user_id = $1 AND a.id = $2`, userID, accountID)
 	var account Account
 	if err := row.Scan(&account.ID, &account.UserID, &account.Platform, &account.BaseURL, &account.Identity, &account.DisplayName, &account.AuthMethod, &account.Current, &account.LastUsedAt, &account.CreatedAt, &account.UpdatedAt); err != nil {
 		if err == pgx.ErrNoRows {
