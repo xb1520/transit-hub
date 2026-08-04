@@ -1,6 +1,9 @@
 package upstream
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestHasAnyMetricValue(t *testing.T) {
 	empty := Metrics{}
@@ -92,6 +95,67 @@ func TestSuggestRechargeTag_Sub2APITypes(t *testing.T) {
 	}
 	if suggestRechargeTag(Sub2APIBalanceHistoryItem{Type: "balance"}) != "" {
 		t.Fatal("nil amount should not tag")
+	}
+}
+
+func TestBusinessDayWindow(t *testing.T) {
+	start, end, err := businessDayWindow("2026-08-04")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if start.In(BusinessLocation()).Format("2006-01-02 15:04:05") != "2026-08-04 00:00:00" {
+		t.Fatalf("start = %v", start)
+	}
+	if end.Sub(start) != 24*time.Hour {
+		t.Fatalf("window length = %v, want 24h", end.Sub(start))
+	}
+	// 半开区间：当日 19:28 计入，次日 00:00 不计入
+	mid := start.Add(19*time.Hour + 28*time.Minute)
+	if !( !mid.Before(start) && mid.Before(end) ) {
+		t.Fatalf("mid %v should be inside window [%v, %v)", mid, start, end)
+	}
+	if _, _, err := businessDayWindow("not-a-date"); err == nil {
+		t.Fatal("expected parse error")
+	}
+}
+
+func TestIsImplausibleBusinessDate(t *testing.T) {
+	if !isImplausibleBusinessDate("1970-01-01") {
+		t.Fatal("epoch date should be implausible")
+	}
+	if !isImplausibleBusinessDate("1999-12-31") {
+		t.Fatal("pre-2000 should be implausible")
+	}
+	if !isImplausibleBusinessDate("") {
+		t.Fatal("empty should be implausible")
+	}
+	if isImplausibleBusinessDate("2026-08-04") {
+		t.Fatal("normal business date should be plausible")
+	}
+}
+
+func TestShouldRepairAutoBusinessDate(t *testing.T) {
+	autoEpoch := LedgerRecord{Source: LedgerSourceAuto, Status: LedgerStatusConfirmed, BusinessDate: "1970-01-01"}
+	if !shouldRepairAutoBusinessDate(autoEpoch, "2026-08-04") {
+		t.Fatal("auto epoch mark should be repaired to real date")
+	}
+	// 已是合理日期：不反复改写（避免覆盖用户/系统已确认的业务日）
+	autoOK := LedgerRecord{Source: LedgerSourceAuto, Status: LedgerStatusConfirmed, BusinessDate: "2026-08-03"}
+	if shouldRepairAutoBusinessDate(autoOK, "2026-08-04") {
+		t.Fatal("plausible existing date must not be overwritten")
+	}
+	// 非 auto 源不修
+	manual := LedgerRecord{Source: LedgerSourceManual, Status: LedgerStatusConfirmed, BusinessDate: "1970-01-01"}
+	if shouldRepairAutoBusinessDate(manual, "2026-08-04") {
+		t.Fatal("manual marks must not be repaired")
+	}
+	// 新日期也不合理则不修
+	if shouldRepairAutoBusinessDate(autoEpoch, "1970-01-01") {
+		t.Fatal("should not repair to another implausible date")
+	}
+	// 相同日期不修
+	if shouldRepairAutoBusinessDate(autoEpoch, "1970-01-01") {
+		t.Fatal("same date should not repair")
 	}
 }
 

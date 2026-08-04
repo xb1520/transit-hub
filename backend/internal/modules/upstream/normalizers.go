@@ -151,6 +151,8 @@ func firstStringy(value any, keys []string) string {
 // parseFlexibleTime 尽量把常见的时间表示形式解析为 time.Time：RFC3339 及常见的
 // "yyyy-MM-dd HH:mm:ss"/"yyyy-MM-dd" 字符串、unix 秒/毫秒时间戳（含字符串形式的时间戳）。
 // 无法识别的值返回 nil，交由调用方视为字段不可用，而不是拼凑一个可能错误的时间。
+// 0 / 负数 unix 时间戳视为「未设置」（new-api 的 complete_time 未完成时常为 0），
+// 避免被解析成 1970-01-01。
 func parseFlexibleTime(value any) *time.Time {
 	switch typed := value.(type) {
 	case string:
@@ -165,16 +167,43 @@ func parseFlexibleTime(value any) *time.Time {
 			}
 		}
 		if seconds, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
-			parsed := unixFlexible(seconds)
-			return &parsed
+			return unixFlexiblePtr(seconds)
 		}
 		return nil
 	case float64:
-		parsed := unixFlexible(int64(typed))
-		return &parsed
+		return unixFlexiblePtr(int64(typed))
+	case int64:
+		return unixFlexiblePtr(typed)
+	case int:
+		return unixFlexiblePtr(int64(typed))
+	case json.Number:
+		if seconds, err := typed.Int64(); err == nil {
+			return unixFlexiblePtr(seconds)
+		}
+		if f, err := typed.Float64(); err == nil {
+			return unixFlexiblePtr(int64(f))
+		}
+		return nil
 	default:
 		return nil
 	}
+}
+
+// firstFlexibleTime 按 keys 顺序取第一个能成功解析的时间字段。
+// 用于 complete_time=0 时回退 create_time 等场景（firstAny 会命中 0 且不再试后续字段）。
+func firstFlexibleTime(value any, keys []string) *time.Time {
+	record, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, key := range keys {
+		if v, exists := record[key]; exists && v != nil {
+			if t := parseFlexibleTime(v); t != nil {
+				return t
+			}
+		}
+	}
+	return nil
 }
 
 // unixFlexible 猜测 unix 时间戳的精度：数值大于 1e12 视为毫秒，否则视为秒。
@@ -183,6 +212,15 @@ func unixFlexible(value int64) time.Time {
 		return time.UnixMilli(value)
 	}
 	return time.Unix(value, 0)
+}
+
+// unixFlexiblePtr 与 unixFlexible 相同，但把 0/负数视为未设置，返回 nil。
+func unixFlexiblePtr(value int64) *time.Time {
+	if value <= 0 {
+		return nil
+	}
+	parsed := unixFlexible(value)
+	return &parsed
 }
 
 func groupID(value any) string {

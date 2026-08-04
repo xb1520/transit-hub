@@ -32,10 +32,18 @@ const summary = ref<SettlementSummary | null>(null)
 const records = ref<SettlementRecord[]>([])
 const amount = ref('')
 const note = ref('')
+/** datetime-local 本地值，如 2026-08-04T19:28 */
+const settledAtLocal = ref('')
 
 const formatMoney = (n: number | null | undefined) => {
   if (n == null || Number.isNaN(n)) return '—'
   return n.toFixed(2)
+}
+
+/** 浏览器本地时区的 datetime-local 默认值（精确到分钟）。 */
+const toLocalDatetimeValue = (date = new Date()): string => {
+  const offset = date.getTimezoneOffset() * 60_000
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16)
 }
 
 const load = async () => {
@@ -54,6 +62,9 @@ const load = async () => {
     } else {
       amount.value = ''
     }
+    if (!settledAtLocal.value) {
+      settledAtLocal.value = toLocalDatetimeValue()
+    }
   } catch (err) {
     errorKey.value = err instanceof Error ? err.message : 'admin.upstream.errors.unknown'
   } finally {
@@ -62,7 +73,11 @@ const load = async () => {
 }
 
 watch(() => props.open, (open) => {
-  if (open) void load()
+  if (open) {
+    settledAtLocal.value = toLocalDatetimeValue()
+    note.value = ''
+    void load()
+  }
 })
 
 const currency = computed(() => summary.value?.settlementCurrency || props.site?.settings.settlementCurrency || 'CNY')
@@ -74,11 +89,26 @@ const submit = async () => {
     errorKey.value = 'admin.upstream.settlement.invalidAmount'
     return
   }
+  const local = settledAtLocal.value.trim()
+  if (!local) {
+    errorKey.value = 'admin.upstream.settlement.invalidSettledAt'
+    return
+  }
+  const settled = new Date(local)
+  if (Number.isNaN(settled.getTime())) {
+    errorKey.value = 'admin.upstream.settlement.invalidSettledAt'
+    return
+  }
   saving.value = true
   errorKey.value = ''
   try {
-    await createSiteSettlement(props.site.id, { amount: n, note: note.value.trim() })
+    await createSiteSettlement(props.site.id, {
+      amount: n,
+      note: note.value.trim(),
+      settledAt: settled.toISOString(),
+    })
     note.value = ''
+    settledAtLocal.value = toLocalDatetimeValue()
     await load()
     emit('updated')
   } catch (err) {
@@ -170,15 +200,27 @@ const deleteRecord = async (record: SettlementRecord) => {
 
             <div class="space-y-2 rounded-xl border border-border/50 p-4">
               <div class="text-sm font-medium">{{ t('admin.upstream.settlement.register') }}</div>
-              <div class="flex flex-col gap-2 sm:flex-row">
-                <Input v-model="amount" type="number" min="0" step="0.01" class="sm:w-40" :placeholder="t('admin.upstream.settlement.amountPlaceholder')" />
-                <Input v-model="note" class="flex-1" :placeholder="t('admin.upstream.settlement.notePlaceholder')" />
-                <Button :disabled="saving" @click="submit">
+              <div class="grid gap-2 sm:grid-cols-2">
+                <label class="space-y-1">
+                  <span class="text-xs font-medium text-muted-foreground">{{ t('admin.upstream.settlement.amountLabel') }}</span>
+                  <Input v-model="amount" type="number" min="0" step="0.01" :placeholder="t('admin.upstream.settlement.amountPlaceholder')" />
+                </label>
+                <label class="space-y-1">
+                  <span class="text-xs font-medium text-muted-foreground">{{ t('admin.upstream.settlement.settledAtLabel') }}</span>
+                  <Input v-model="settledAtLocal" type="datetime-local" />
+                </label>
+              </div>
+              <label class="block space-y-1">
+                <span class="text-xs font-medium text-muted-foreground">{{ t('admin.upstream.settlement.noteLabel') }}</span>
+                <Input v-model="note" :placeholder="t('admin.upstream.settlement.notePlaceholder')" />
+              </label>
+              <div class="flex items-center justify-between gap-2">
+                <p class="text-xs text-muted-foreground">{{ t('admin.upstream.settlement.manualHint') }}</p>
+                <Button class="shrink-0" :disabled="saving" @click="submit">
                   <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
                   {{ t('admin.upstream.settlement.submit') }}
                 </Button>
               </div>
-              <p class="text-xs text-muted-foreground">{{ t('admin.upstream.settlement.manualHint') }}</p>
             </div>
 
             <div>

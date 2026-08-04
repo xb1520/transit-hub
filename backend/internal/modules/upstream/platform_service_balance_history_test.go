@@ -150,3 +150,59 @@ func TestParseSub2APIPaymentOrderItem_FiltersUnpaid(t *testing.T) {
 		t.Fatalf("paid should parse: %+v ok=%v", item, ok)
 	}
 }
+
+// TestParseNewAPITopupItem_SkipsZeroCompleteTime 覆盖 new-api 常见坑：
+// complete_time 字段存在但为 0（未写完成时间），若优先取该字段会解析成 1970-01-01。
+// 应跳过 0 并回退 create_time。
+func TestParseNewAPITopupItem_SkipsZeroCompleteTime(t *testing.T) {
+	const createUnix = int64(1785825871) // 2026-08-04 06:44:31 UTC
+	item, ok := parseNewAPITopupItem(map[string]any{
+		"id":            1,
+		"money":         100.0,
+		"status":        "success",
+		"trade_no":      "USR4311NOXWtoS1785825871",
+		"payment_method": "wxpay",
+		"complete_time": float64(0),
+		"create_time":   float64(createUnix),
+	}, 500000)
+	if !ok {
+		t.Fatal("expected success topup to parse")
+	}
+	if item.CreatedAt == nil {
+		t.Fatal("CreatedAt should fall back to create_time, not nil")
+	}
+	if got := item.CreatedAt.Unix(); got != createUnix {
+		t.Fatalf("CreatedAt unix = %d, want %d (got wall %v)", got, createUnix, item.CreatedAt)
+	}
+}
+
+func TestParseNewAPITopupItem_PrefersCompleteTimeWhenSet(t *testing.T) {
+	const createUnix = int64(1785825800)
+	const completeUnix = int64(1785825871)
+	item, ok := parseNewAPITopupItem(map[string]any{
+		"id":            2,
+		"money":         50.0,
+		"status":        "success",
+		"trade_no":      "T2",
+		"complete_time": float64(completeUnix),
+		"create_time":   float64(createUnix),
+	}, 500000)
+	if !ok {
+		t.Fatal("expected success topup to parse")
+	}
+	if item.CreatedAt == nil || item.CreatedAt.Unix() != completeUnix {
+		t.Fatalf("should prefer complete_time when set, got %+v", item.CreatedAt)
+	}
+}
+
+func TestParseFlexibleTime_RejectsZeroUnix(t *testing.T) {
+	if t0 := parseFlexibleTime(float64(0)); t0 != nil {
+		t.Fatalf("unix 0 should be treated as unset, got %v", t0)
+	}
+	if t0 := parseFlexibleTime("0"); t0 != nil {
+		t.Fatalf("string \"0\" should be treated as unset, got %v", t0)
+	}
+	if t1 := parseFlexibleTime(float64(1785825871)); t1 == nil || t1.Unix() != 1785825871 {
+		t.Fatalf("valid unix should parse, got %+v", t1)
+	}
+}

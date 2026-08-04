@@ -823,26 +823,48 @@ func (s *Service) MarkRecharge(ctx context.Context, userID, siteID string, input
 }
 
 // InboundBreakdownToday 按上游站点汇总今日已确认进货。
+// 含：预存站账本已标记充值 + 预授信站当日 active 登记结算。
 func (s *Service) InboundBreakdownToday(ctx context.Context, userID string) (InboundBreakdownResponse, error) {
 	date := BusinessToday()
 	resp := InboundBreakdownResponse{Date: date, Sites: []InboundBreakdownItem{}}
-	if s.ledgerRepo == nil {
-		return resp, nil
-	}
 	aid, err := s.requireCurrentAdminAccountID(ctx, userID)
 	if err != nil {
 		return resp, err
 	}
-	sums, err := s.ledgerRepo.SumInboundConfirmedBySites(ctx, userID, aid, date)
-	if err != nil {
-		return resp, err
+
+	// siteID → 金额/笔数
+	merged := map[string]struct {
+		Total float64
+		Count int
+	}{}
+	if s.ledgerRepo != nil {
+		sums, err := s.ledgerRepo.SumInboundConfirmedBySites(ctx, userID, aid, date)
+		if err != nil {
+			return resp, err
+		}
+		for siteID, sum := range sums {
+			merged[siteID] = sum
+		}
 	}
+	if s.settlementRepo != nil {
+		settled, err := s.settlementRepo.SumActiveBySitesOnBusinessDate(ctx, userID, aid, date)
+		if err != nil {
+			return resp, err
+		}
+		for siteID, sum := range settled {
+			cur := merged[siteID]
+			cur.Total += sum.Total
+			cur.Count += sum.Count
+			merged[siteID] = cur
+		}
+	}
+
 	sites := s.List(ctx, userID)
 	byID := make(map[string]Response, len(sites))
 	for _, site := range sites {
 		byID[site.ID] = site
 	}
-	for siteID, sum := range sums {
+	for siteID, sum := range merged {
 		item := InboundBreakdownItem{
 			SiteID:     siteID,
 			AmountCost: sum.Total,
@@ -1020,23 +1042,38 @@ func tagToLedgerKind(tag string) string {
 }
 
 // TodayInbound 汇总当前工作区业务日已确认进货（成本口径）。
+// = 账本 confirmed 充值类 + 预授信站当日 active 登记结算。
 func (s *Service) TodayInbound(ctx context.Context, userID string) (float64, error) {
-	if s.ledgerRepo == nil {
-		return 0, nil
-	}
 	aid, err := s.requireCurrentAdminAccountID(ctx, userID)
 	if err != nil {
 		return 0, err
 	}
-	return s.ledgerRepo.SumTopupsConfirmed(ctx, userID, aid, BusinessToday())
+	return s.inboundOnDate(ctx, userID, aid, BusinessToday())
 }
 
 // InboundOnDate 汇总指定工作区业务日已确认进货（供午夜快照）。
 func (s *Service) InboundOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error) {
-	if s.ledgerRepo == nil {
-		return 0, nil
+	return s.inboundOnDate(ctx, userID, adminAccountID, date)
+}
+
+// inboundOnDate 合并预存充值账本与预授信结算。
+func (s *Service) inboundOnDate(ctx context.Context, userID, adminAccountID, date string) (float64, error) {
+	var total float64
+	if s.ledgerRepo != nil {
+		ledgerTotal, err := s.ledgerRepo.SumTopupsConfirmed(ctx, userID, adminAccountID, date)
+		if err != nil {
+			return 0, err
+		}
+		total += ledgerTotal
 	}
-	return s.ledgerRepo.SumTopupsConfirmed(ctx, userID, adminAccountID, date)
+	if s.settlementRepo != nil {
+		settledTotal, err := s.settlementRepo.SumActiveOnBusinessDate(ctx, userID, adminAccountID, date)
+		if err != nil {
+			return 0, err
+		}
+		total += settledTotal
+	}
+	return total, nil
 }
 
 // ProcessLedgerAfterSync 同步后按类型自动打标并写入账本：
@@ -1075,7 +1112,8 @@ func (s *Service) ProcessLedgerAfterSync(
 }
 
 // autoMarkHistoryItems 将平台流水自动写入账本。onlyToday=true 时只处理业务今日。
-// 已有同 ref 标记（含用户手改赠送）一律跳过，不覆盖。
+// 已有同 ref 标记默认跳过（保留用户手改标签）；但对「业务日明显不合理」的自动标记
+// （如 complete_time=0 曾被解析成 1970-01-01）会就地修正 business_date，保留 kind/金额。
 func (s *Service) autoMarkHistoryItems(
 	ctx context.Context,
 	userID, adminAccountID, siteID string,
@@ -1102,13 +1140,29 @@ func (s *Service) autoMarkHistoryItems(
 			continue
 		}
 		ref := platformLedgerRef(platformID)
-		if _, exists := existing[ref]; exists {
-			continue // 保留手改与既有标记
-		}
 		bizDate := bizToday
 		if item.CreatedAt != nil {
 			bizDate = item.CreatedAt.In(BusinessLocation()).Format("2006-01-02")
 		}
+
+		if existingRec, exists := existing[ref]; exists {
+			// 修复 epoch 业务日：不改 kind（用户可能已手改为 gift/rebate）
+			if shouldRepairAutoBusinessDate(existingRec, bizDate) {
+				rec := existingRec
+				rec.BusinessDate = bizDate
+				rec.UpdatedAt = now
+				if err := s.ledgerRepo.UpsertAutoByRef(ctx, rec); err != nil {
+					log.Printf("upstream ledger: repair business_date failed site_id=%s ref=%s from=%s to=%s err=%v",
+						siteID, ref, existingRec.BusinessDate, bizDate, err)
+					continue
+				}
+				log.Printf("upstream ledger: repaired business_date site_id=%s ref=%s from=%s to=%s",
+					siteID, ref, existingRec.BusinessDate, bizDate)
+				existing[ref] = rec
+			}
+			continue
+		}
+
 		if onlyToday && bizDate != bizToday {
 			continue
 		}
@@ -1149,6 +1203,39 @@ func (s *Service) autoMarkHistoryItems(
 		}
 		existing[ref] = rec
 	}
+}
+
+// isImplausibleBusinessDate 判断业务日是否明显不合理（unix 0 / 缺省日期被写进账本）。
+// 本产品不存在 2000 年以前的真实进货，可安全用于修复历史解析 bug。
+func isImplausibleBusinessDate(date string) bool {
+	date = strings.TrimSpace(date)
+	if date == "" {
+		return true
+	}
+	t, err := time.ParseInLocation("2006-01-02", date, BusinessLocation())
+	if err != nil {
+		return true
+	}
+	return t.Year() < 2000
+}
+
+// shouldRepairAutoBusinessDate 是否应把已有自动标记的业务日纠正为平台真实时间。
+// 仅修正 source=auto 且旧日期不合理、新日期合理的记录，避免覆盖用户有意改过的日期。
+func shouldRepairAutoBusinessDate(existing LedgerRecord, newDate string) bool {
+	if existing.Source != LedgerSourceAuto {
+		return false
+	}
+	if existing.Status == LedgerStatusVoided {
+		return false
+	}
+	newDate = strings.TrimSpace(newDate)
+	if newDate == "" || newDate == existing.BusinessDate {
+		return false
+	}
+	if isImplausibleBusinessDate(newDate) {
+		return false
+	}
+	return isImplausibleBusinessDate(existing.BusinessDate)
 }
 
 func hasAnyMetricValue(m Metrics) bool {

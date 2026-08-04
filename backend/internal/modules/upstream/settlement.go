@@ -112,6 +112,78 @@ func (r *SettlementRepository) SumActiveBySites(ctx context.Context, userID, adm
 	return result, rows.Err()
 }
 
+// businessDayWindow 返回业务日 [start, end) 的半开区间（timestamptz 边界）。
+func businessDayWindow(businessDate string) (start time.Time, end time.Time, err error) {
+	loc := BusinessLocation()
+	start, err = time.ParseInLocation("2006-01-02", strings.TrimSpace(businessDate), loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return start, start.Add(24 * time.Hour), nil
+}
+
+// SumActiveOnBusinessDate 汇总某业务日 active 结算金额（成本口径，按 settled_at 落在业务日）。
+// 预授信站线下付款登记后应计入「今日进货」。
+func (r *SettlementRepository) SumActiveOnBusinessDate(ctx context.Context, userID, adminAccountID, businessDate string) (float64, error) {
+	if r == nil || r.db == nil {
+		return 0, nil
+	}
+	start, end, err := businessDayWindow(businessDate)
+	if err != nil {
+		return 0, err
+	}
+	var total float64
+	err = r.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(amount), 0)
+		FROM upstream_settlement_records
+		WHERE user_id = $1 AND admin_account_id = $2 AND status = $3
+			AND settled_at >= $4 AND settled_at < $5
+	`, userID, adminAccountID, SettlementStatusActive, start, end).Scan(&total)
+	return total, err
+}
+
+// SumActiveBySitesOnBusinessDate 按站点汇总某业务日 active 结算（金额 + 笔数）。
+func (r *SettlementRepository) SumActiveBySitesOnBusinessDate(ctx context.Context, userID, adminAccountID, businessDate string) (map[string]struct {
+	Total float64
+	Count int
+}, error) {
+	out := make(map[string]struct {
+		Total float64
+		Count int
+	})
+	if r == nil || r.db == nil {
+		return out, nil
+	}
+	start, end, err := businessDayWindow(businessDate)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT site_id, COALESCE(SUM(amount), 0), COUNT(*)
+		FROM upstream_settlement_records
+		WHERE user_id = $1 AND admin_account_id = $2 AND status = $3
+			AND settled_at >= $4 AND settled_at < $5
+		GROUP BY site_id
+	`, userID, adminAccountID, SettlementStatusActive, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var siteID string
+		var total float64
+		var count int
+		if err := rows.Scan(&siteID, &total, &count); err != nil {
+			return nil, err
+		}
+		out[siteID] = struct {
+			Total float64
+			Count int
+		}{Total: total, Count: count}
+	}
+	return out, rows.Err()
+}
+
 func (r *SettlementRepository) Insert(ctx context.Context, record SettlementRecord) error {
 	_, err := r.db.Exec(ctx, `
 		INSERT INTO upstream_settlement_records (

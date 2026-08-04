@@ -9,7 +9,7 @@ type MetricsResponse struct {
 	SiteBalance     float64 `json:"siteBalance"`     // 站点用户成本侧需兑付余额（含赠送/返利剩余）
 	TodayPurchase   float64 `json:"todayPurchase"`   // 兼容字段 = TodayCost（历史趋势列 today_purchase）
 	TodayCost       float64 `json:"todayCost"`       // 今日成本：上游今日消耗 × 倍率之和
-	TodayInbound    float64 `json:"todayInbound"`    // 今日进货：账本 confirmed topup_* 之和
+	TodayInbound    float64 `json:"todayInbound"`    // 今日进货：账本 confirmed topup_* + 预授信当日结算
 	NetProfit       float64 `json:"netProfit"`       // 今日净利润：todayProfit - todayCost
 	UpstreamBalance float64 `json:"upstreamBalance"` // 上游预存备付（不含预授信账面）
 	GroupCount      int     `json:"groupCount"`      // 管理员站点分组总数

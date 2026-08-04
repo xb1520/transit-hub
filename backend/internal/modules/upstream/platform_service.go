@@ -3115,8 +3115,8 @@ func parseNewAPITopupItem(value any, quotaPerUnit float64) (Sub2APIBalanceHistor
 	if tradeNo != "" {
 		noteParts = append(noteParts, tradeNo)
 	}
-	// create_time / complete_time 多为 unix 秒
-	created := parseFlexibleTime(firstAny(value, []string{"complete_time", "completeTime", "create_time", "createTime", "created_at", "createdAt"}))
+	// create_time / complete_time 多为 unix 秒；complete_time 未完成时常为 0，需跳过并回退 create_time
+	created := firstFlexibleTime(value, []string{"complete_time", "completeTime", "create_time", "createTime", "created_at", "createdAt"})
 	return Sub2APIBalanceHistoryItem{
 		ID:        "topup:" + id,
 		Type:      "balance", // new-api 在线充值 → 自动标充值
@@ -3175,7 +3175,7 @@ func parseSub2APIPaymentOrderItem(value any) (Sub2APIBalanceHistoryItem, bool) {
 	if itemType == "" {
 		itemType = "payment"
 	}
-	created := parseFlexibleTime(firstAny(value, []string{"paid_at", "paidAt", "completed_at", "completedAt", "created_at", "createdAt"}))
+	created := firstFlexibleTime(value, []string{"paid_at", "paidAt", "completed_at", "completedAt", "created_at", "createdAt"})
 	return Sub2APIBalanceHistoryItem{
 		ID:        "pay:" + id,
 		Type:      itemType,
@@ -3226,7 +3226,7 @@ func parseSub2APIRedeemHistoryItem(value any) (Sub2APIBalanceHistoryItem, bool) 
 	} else if codeType != "" {
 		note = codeType
 	}
-	created := parseFlexibleTime(firstAny(value, []string{"used_at", "usedAt", "created_at", "createdAt"}))
+	created := firstFlexibleTime(value, []string{"used_at", "usedAt", "created_at", "createdAt"})
 	return Sub2APIBalanceHistoryItem{
 		ID:        "redeem:" + id,
 		Type:      codeType,
@@ -3302,8 +3302,8 @@ func parseSub2APIAdminUser(value any) Sub2APIAdminUser {
 		v := int(*rpmLimit)
 		user.RPMLimit = &v
 	}
-	user.CreatedAt = parseFlexibleTime(firstAny(value, sub2APIUserCreatedAtKeys))
-	user.LastUsedAt = parseFlexibleTime(firstAny(value, sub2APIUserLastUsedAtKeys))
+	user.CreatedAt = firstFlexibleTime(value, sub2APIUserCreatedAtKeys)
+	user.LastUsedAt = firstFlexibleTime(value, sub2APIUserLastUsedAtKeys)
 	return user
 }
 
@@ -3315,6 +3315,6 @@ func parseSub2APIBalanceHistoryItem(value any) Sub2APIBalanceHistoryItem {
 	if note := firstString(value, []string{"notes", "note", "remark"}); note != nil {
 		item.Note = *note
 	}
-	item.CreatedAt = parseFlexibleTime(firstAny(value, sub2APIBalanceHistoryTimeKeys))
+	item.CreatedAt = firstFlexibleTime(value, sub2APIBalanceHistoryTimeKeys)
 	return item
 }
