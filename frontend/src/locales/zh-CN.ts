@@ -1520,7 +1520,16 @@ export default {
           action: '刷新数据',
           refreshing: '刷新中...',
           countdown: '{seconds} 秒后刷新',
-          disabled: '未开启自动刷新'
+          disabled: '未开启自动刷新',
+          openAria: '配置自动刷新',
+          panelTitle: '自动刷新',
+          panelHelp: '开启后将按设定间隔自动同步上游站点数据，最低 60 秒。',
+          enable: '启用自动刷新',
+          interval: '刷新间隔',
+          seconds: '秒',
+          save: '保存',
+          saving: '保存中...',
+          cancel: '取消',
         },
       modal: {
         title: '新增上游站点',

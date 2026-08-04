@@ -1,16 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Search, Plus, CheckCircle2, XCircle, X, Loader2, AlertCircle, Trash2, Edit2, LayoutGrid, List, RefreshCw, Settings2, Receipt, PackagePlus } from 'lucide-vue-next'
+import { Search, Plus, CheckCircle2, XCircle, X, Loader2, AlertCircle, Trash2, Edit2, LayoutGrid, List, RefreshCw, Settings2, Receipt, PackagePlus, Timer, ChevronDown } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tooltip } from '@/components/ui/tooltip'
-import { getStrategySettings } from '../api/settings'
+import { getStrategySettings, saveStrategySettings } from '../api/settings'
 import { useUpstreamSites } from '../composables/useUpstreamSites'
 import SiteSettingsModal from '../components/upstream/SiteSettingsModal.vue'
 import SettlementModal from '../components/upstream/SettlementModal.vue'
 import LedgerModal from '../components/upstream/LedgerModal.vue'
 import SubscriptionTopupModal from '../components/upstream/SubscriptionTopupModal.vue'
+import type { StrategySettings } from '../types/settings'
 import type { UpstreamGroupInfo, UpstreamMetricValue, UpstreamSite, UpstreamSiteForm, UpstreamStatus, UpstreamSubscriptionInfo } from '../types/upstream'
 
 const { t, locale } = useI18n()
@@ -26,6 +27,14 @@ const remainingSeconds = ref(0)
 let countdownTimer: ReturnType<typeof window.setInterval> | null = null
 const nextRefreshAtStorageKey = 'transit-hub:upstream-next-refresh-at'
 const viewModeStorageKey = 'transit-hub:upstream-view-mode'
+const minimumRefreshInterval = 60
+const isRefreshPanelOpen = ref(false)
+const isSavingRefresh = ref(false)
+const refreshPanelError = ref('')
+const draftEnableRefresh = ref(false)
+const draftRefreshInterval = ref(String(minimumRefreshInterval))
+const strategySettingsCache = ref<StrategySettings | null>(null)
+const refreshPanelRoot = ref<HTMLElement | null>(null)
 
 type ViewMode = 'card' | 'list'
 const readStoredViewMode = (): ViewMode => {
@@ -46,19 +55,37 @@ const setViewMode = (mode: ViewMode) => {
   }
 }
 
+const autoRefreshEnabled = computed(() => refreshIntervalSeconds.value != null && refreshIntervalSeconds.value > 0)
+
 const countdownDisplay = computed(() => {
-  if (!refreshIntervalSeconds.value) return t('admin.upstream.refresh.disabled')
+  if (!autoRefreshEnabled.value) return t('admin.upstream.refresh.disabled')
   return t('admin.upstream.refresh.countdown', { seconds: remainingSeconds.value })
 })
 
 const readNextRefreshAt = (): number | null => {
-  const value = Number.parseInt(window.localStorage.getItem(nextRefreshAtStorageKey) ?? '', 10)
-  if (!Number.isFinite(value) || value <= Date.now()) return null
-  return value
+  try {
+    const value = Number.parseInt(window.localStorage.getItem(nextRefreshAtStorageKey) ?? '', 10)
+    if (!Number.isFinite(value) || value <= Date.now()) return null
+    return value
+  } catch {
+    return null
+  }
 }
 
 const writeNextRefreshAt = (timestamp: number) => {
-  window.localStorage.setItem(nextRefreshAtStorageKey, String(timestamp))
+  try {
+    window.localStorage.setItem(nextRefreshAtStorageKey, String(timestamp))
+  } catch {
+    // 隐私模式等写失败时忽略
+  }
+}
+
+const clearNextRefreshAt = () => {
+  try {
+    window.localStorage.removeItem(nextRefreshAtStorageKey)
+  } catch {
+    // 隐私模式等写失败时忽略
+  }
 }
 
 const updateRemainingSeconds = () => {
@@ -78,7 +105,13 @@ const runRefresh = async () => {
   scheduleNextRefresh()
 }
 
+const stopCountdown = () => {
+  if (countdownTimer) window.clearInterval(countdownTimer)
+  countdownTimer = null
+}
+
 const startCountdown = (seconds: number) => {
+  stopCountdown()
   refreshIntervalSeconds.value = seconds
   const nextRefreshAt = readNextRefreshAt()
   if (!nextRefreshAt || nextRefreshAt > Date.now() + seconds * 1000) scheduleNextRefresh()
@@ -90,18 +123,95 @@ const startCountdown = (seconds: number) => {
   }, 1000)
 }
 
-const stopCountdown = () => {
-  if (countdownTimer) window.clearInterval(countdownTimer)
-  countdownTimer = null
+const applyRefreshSettingsLocally = (enabled: boolean, interval: number) => {
+  stopCountdown()
+  if (enabled) {
+    startCountdown(Math.max(interval, minimumRefreshInterval))
+    return
+  }
+  refreshIntervalSeconds.value = null
+  remainingSeconds.value = 0
+  clearNextRefreshAt()
 }
 
 const loadRefreshSettings = async () => {
   try {
     const settings = await getStrategySettings()
-    if (!settings.enableRefreshInterval) return
-    startCountdown(Math.max(settings.refreshInterval, 60))
+    strategySettingsCache.value = settings
+    if (!settings.enableRefreshInterval) {
+      applyRefreshSettingsLocally(false, settings.refreshInterval)
+      return
+    }
+    applyRefreshSettingsLocally(true, Math.max(settings.refreshInterval, minimumRefreshInterval))
+  } catch {
+    applyRefreshSettingsLocally(false, minimumRefreshInterval)
+  }
+}
+
+const syncDraftFromSettings = (settings: StrategySettings) => {
+  draftEnableRefresh.value = settings.enableRefreshInterval
+  draftRefreshInterval.value = String(Math.max(settings.refreshInterval, minimumRefreshInterval))
+}
+
+const closeRefreshPanel = () => {
+  isRefreshPanelOpen.value = false
+  refreshPanelError.value = ''
+}
+
+const toggleRefreshPanel = async () => {
+  if (isRefreshPanelOpen.value) {
+    closeRefreshPanel()
+    return
+  }
+  isRefreshPanelOpen.value = true
+  refreshPanelError.value = ''
+  try {
+    // 打开时重新拉取，避免系统设置页改过策略后本地缓存过期
+    const settings = await getStrategySettings()
+    strategySettingsCache.value = settings
+    syncDraftFromSettings(settings)
+  } catch {
+    draftEnableRefresh.value = autoRefreshEnabled.value
+    draftRefreshInterval.value = String(refreshIntervalSeconds.value ?? minimumRefreshInterval)
+  }
+}
+
+const handleRefreshPanelOutsideClick = (event: MouseEvent) => {
+  if (!isRefreshPanelOpen.value) return
+  const root = refreshPanelRoot.value
+  if (root && event.target instanceof Node && !root.contains(event.target)) {
+    closeRefreshPanel()
+  }
+}
+
+const handleRefreshPanelKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && isRefreshPanelOpen.value) closeRefreshPanel()
+}
+
+const saveRefreshSettings = async () => {
+  if (isSavingRefresh.value) return
+  isSavingRefresh.value = true
+  refreshPanelError.value = ''
+  try {
+    // 保存前再读一次，只改刷新相关字段，避免覆盖余额预警等其它策略配置
+    const current = await getStrategySettings()
+    const interval = Math.max(
+      Number.parseInt(draftRefreshInterval.value, 10) || minimumRefreshInterval,
+      minimumRefreshInterval,
+    )
+    draftRefreshInterval.value = String(interval)
+    const next: StrategySettings = {
+      ...current,
+      enableRefreshInterval: draftEnableRefresh.value,
+      refreshInterval: interval,
+    }
+    strategySettingsCache.value = await saveStrategySettings(next)
+    applyRefreshSettingsLocally(draftEnableRefresh.value, interval)
+    closeRefreshPanel()
   } catch (error) {
-    refreshIntervalSeconds.value = null
+    refreshPanelError.value = error instanceof Error ? error.message : 'admin.settings.errors.unknown'
+  } finally {
+    isSavingRefresh.value = false
   }
 }
 
@@ -400,10 +510,14 @@ const lastUpdatedDisplay = (site: UpstreamSite): string => {
 
 onMounted(() => {
   void loadRefreshSettings()
+  document.addEventListener('mousedown', handleRefreshPanelOutsideClick)
+  document.addEventListener('keydown', handleRefreshPanelKeydown)
 })
 
 onBeforeUnmount(() => {
   stopCountdown()
+  document.removeEventListener('mousedown', handleRefreshPanelOutsideClick)
+  document.removeEventListener('keydown', handleRefreshPanelKeydown)
 })
 </script>
 
@@ -469,8 +583,69 @@ onBeforeUnmount(() => {
             <span v-if="sortKey === key" class="ml-0.5">{{ sortDir === 'desc' ? '↓' : '↑' }}</span>
           </button>
         </div>
-        <div class="hidden md:flex h-10 items-center rounded-xl border border-border/50 bg-surface px-3 text-xs text-muted-foreground whitespace-nowrap">
-          {{ countdownDisplay }}
+        <div ref="refreshPanelRoot" class="relative">
+          <button
+            type="button"
+            class="flex h-10 items-center gap-1.5 rounded-xl border border-border/50 bg-surface px-3 text-xs whitespace-nowrap transition-colors hover:border-primary/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+            :class="autoRefreshEnabled ? 'text-foreground' : 'text-muted-foreground'"
+            :aria-expanded="isRefreshPanelOpen"
+            :aria-haspopup="true"
+            :aria-label="t('admin.upstream.refresh.openAria')"
+            @click="toggleRefreshPanel"
+          >
+            <Timer class="h-3.5 w-3.5 shrink-0" :class="autoRefreshEnabled ? 'text-primary' : ''" />
+            <span>{{ countdownDisplay }}</span>
+            <ChevronDown class="h-3.5 w-3.5 shrink-0 opacity-60 transition-transform" :class="isRefreshPanelOpen ? 'rotate-180' : ''" />
+          </button>
+          <div
+            v-if="isRefreshPanelOpen"
+            class="absolute right-0 top-full z-30 mt-2 w-72 rounded-xl border border-border/60 bg-card p-4 shadow-lg"
+            role="dialog"
+            :aria-label="t('admin.upstream.refresh.panelTitle')"
+          >
+            <div class="space-y-3">
+              <div>
+                <h4 class="text-sm font-semibold text-foreground">{{ t('admin.upstream.refresh.panelTitle') }}</h4>
+                <p class="mt-0.5 text-xs text-muted-foreground">{{ t('admin.upstream.refresh.panelHelp') }}</p>
+              </div>
+              <label class="flex items-center justify-between gap-3">
+                <span class="text-sm text-foreground">{{ t('admin.upstream.refresh.enable') }}</span>
+                <span class="relative inline-flex items-center cursor-pointer shrink-0">
+                  <input
+                    v-model="draftEnableRefresh"
+                    type="checkbox"
+                    class="sr-only peer"
+                    :aria-label="t('admin.upstream.refresh.enable')"
+                  >
+                  <span class="peer h-6 w-11 rounded-full bg-surface-elevated peer-checked:bg-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-border after:bg-white after:transition-transform after:content-[''] peer-checked:after:translate-x-full peer-checked:after:border-white" />
+                </span>
+              </label>
+              <div v-if="draftEnableRefresh" class="flex items-center gap-2">
+                <span class="text-sm text-muted-foreground whitespace-nowrap">{{ t('admin.upstream.refresh.interval') }}</span>
+                <Input
+                  v-model="draftRefreshInterval"
+                  type="number"
+                  :min="minimumRefreshInterval"
+                  step="10"
+                  class="h-9 w-24"
+                  :aria-label="t('admin.upstream.refresh.interval')"
+                />
+                <span class="text-sm text-muted-foreground whitespace-nowrap">{{ t('admin.upstream.refresh.seconds') }}</span>
+              </div>
+              <p v-if="refreshPanelError" class="text-xs text-destructive">
+                {{ t(refreshPanelError) }}
+              </p>
+              <div class="flex items-center justify-end gap-2 pt-1">
+                <Button type="button" variant="secondary" class="h-8 px-3" :disabled="isSavingRefresh" @click="closeRefreshPanel">
+                  {{ t('admin.upstream.refresh.cancel') }}
+                </Button>
+                <Button type="button" class="h-8 px-3 gap-1.5" :disabled="isSavingRefresh" @click="saveRefreshSettings">
+                  <Loader2 v-if="isSavingRefresh" class="h-3.5 w-3.5 animate-spin" />
+                  {{ isSavingRefresh ? t('admin.upstream.refresh.saving') : t('admin.upstream.refresh.save') }}
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
         <Button :disabled="isRefreshing" @click="runRefresh" variant="secondary" class="h-10 flex-1 gap-2 px-4 sm:flex-none">
           <Loader2 v-if="isRefreshing" class="w-4 h-4 animate-spin" />

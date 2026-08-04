@@ -1520,7 +1520,16 @@ export default {
           action: 'Refresh Data',
           refreshing: 'Refreshing...',
           countdown: 'Refresh in {seconds}s',
-          disabled: 'Auto refresh disabled'
+          disabled: 'Auto refresh disabled',
+          openAria: 'Configure auto refresh',
+          panelTitle: 'Auto refresh',
+          panelHelp: 'When enabled, upstream site data syncs automatically. Minimum interval is 60 seconds.',
+          enable: 'Enable auto refresh',
+          interval: 'Interval',
+          seconds: 'sec',
+          save: 'Save',
+          saving: 'Saving...',
+          cancel: 'Cancel',
         },
       modal: {
         title: 'Add Upstream Site',
