@@ -1348,6 +1348,7 @@ export default {
         remoteActionOn: '远端动作已开启',
         allGroupsScope: '全部分组',
         modelTargetCount: '{count} 个模型目标',
+        budgetUsage: '今日预算 {used}/{total} 次',
         strategyModes: {
           health_probe: '健康探活',
           multiplier_only: '仅倍率优先级'
@@ -1380,7 +1381,8 @@ export default {
         maxProbeTokensLabel: '最大 token',
         probePromptPlaceholder: '探活 prompt（留空使用默认值）',
         probeIntervalLabel: '探活间隔（秒）',
-        dailyBudgetLabel: '每日探活预算',
+        dailyBudgetLabel: '每日探活预算（次）',
+        dailyBudgetUsage: '今日已消耗 {used}/{total} 次，剩余 {remaining} 次',
         failureThresholdLabel: '失败阈值',
         successThresholdLabel: '恢复成功阈值',
         cooldownLabel: '冷却时间（秒）',
@@ -1408,7 +1410,7 @@ export default {
           modelTargets: '这里配置该策略要探活的模型列表，自动调度和手动探活都会按这些模型逐一执行探活请求。',
           provider: '一个探活策略只能选择一个 provider（openai / anthropic / gemini / custom），下方新增的所有模型探活目标都会自动使用这个 provider，避免同一策略内混用不同厂商的模型。',
           probeInterval: '自动调度会按"上次探活时间 + 该间隔"判断是否到期；连续探活失败时后端还会额外叠加 2/5/10 分钟的递增退避。',
-          dailyBudget: '限制当前 workspace 每天最多执行多少次真实探活请求；预算耗尽后会跳过真实探活请求，避免消耗过高，不代表系统异常。',
+          dailyBudget: '单位是「次」：本策略每天最多执行多少次真实模型探活请求（按中国自然日 UTC+8 重置）。每探活一个模型计 1 次，与 token/金额无关。预算耗尽后会跳过真实探活，避免消耗过高，不代表系统异常。',
           failureThreshold: '连续软失败达到该次数后会暂停/降级对应链路；某些硬失败（如鉴权失败）可能不经过降级直接暂停。',
           successThreshold: '观察期内连续探活成功达到该次数后，才会判定链路真正恢复并回到健康状态。',
           cooldown: '链路被暂停后，在这段冷却时间结束前，调度器不会对其发起自动探活。',
@@ -1442,7 +1444,7 @@ export default {
             },
             budget: {
               title: '5. 预算规则',
-              description: '每条策略都配置了"每日探活预算"，用于限制当前 workspace 每天最多执行多少次真实探活请求。预算耗尽后，调度器会跳过真实探活请求，也不会写入新的探活事件——即使某个模型已经到期，也可能持续显示"已到期，等待调度"而没有新事件产生，这是预算限制导致的正常现象，不代表系统故障。'
+              description: '每条策略都配置了"每日探活预算"，单位是真实模型探活请求「次数」（不是 token/金额）：每探活一个模型计 1 次，按中国自然日（UTC+8）重置。预算耗尽后，调度器会跳过真实探活请求，也不会写入新的探活事件——即使某个模型已经到期，也可能持续显示"已到期，等待调度"而没有新事件产生，这是预算限制导致的正常现象，不代表系统故障。'
             },
             stateTransition: {
               title: '6. 状态变化',

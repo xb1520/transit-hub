@@ -135,6 +135,10 @@ watch(() => props.policies.map(policy => policy.id).join('\u0000'), () => {
                     <template v-else>
                       · {{ t(`${prefix}.modelTargetCount`, { count: policy.modelTargets.filter(m => m.enabled).length }) }}
                       · {{ policy.probeIntervalSeconds }}s
+                      · {{ t(`${prefix}.budgetUsage`, {
+                        used: policy.dailyProbeBudgetUsed ?? 0,
+                        total: policy.dailyProbeBudget,
+                      }) }}
                     </template>
                   </p>
                 </div>

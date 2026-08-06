@@ -369,6 +369,19 @@ const handleSave = () => {
                     <HelpTooltip :text="t(`${prefix}.tooltips.dailyBudget`)" />
                   </label>
                   <input v-model.number="dailyProbeBudget" type="number" min="1" class="h-9 w-full rounded-lg border border-border/60 bg-background px-3 text-sm text-foreground" />
+                  <p
+                    v-if="isEditing"
+                    class="text-[11px] leading-4"
+                    :class="(policy?.dailyProbeBudgetUsed ?? 0) >= dailyProbeBudget
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-muted-foreground'"
+                  >
+                    {{ t(`${prefix}.dailyBudgetUsage`, {
+                      used: policy?.dailyProbeBudgetUsed ?? 0,
+                      total: dailyProbeBudget,
+                      remaining: Math.max(0, dailyProbeBudget - (policy?.dailyProbeBudgetUsed ?? 0)),
+                    }) }}
+                  </p>
                 </div>
                 <div class="space-y-1.5">
                   <label class="flex items-center gap-1 text-xs font-medium text-muted-foreground">

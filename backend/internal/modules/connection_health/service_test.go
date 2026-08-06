@@ -233,6 +233,38 @@ func TestBuildPolicyAndTargets_MultiplierOnlyDropsEveryProbeBehavior(t *testing.
 	}
 }
 
+func TestListPolicies_AttachesDailyProbeBudgetUsed(t *testing.T) {
+	repo := newFakeRepository()
+	repo.policies = []Policy{
+		{ID: "p1", UserID: "user1", AdminAccountID: "ws1", Name: "probe", Enabled: true, DailyProbeBudget: 100},
+		{ID: "p2", UserID: "user1", AdminAccountID: "ws1", Name: "idle", Enabled: true, DailyProbeBudget: 50},
+	}
+	repo.events = []ConnectionHealthEvent{
+		{ID: "e1", UserID: "user1", AdminAccountID: "ws1", PolicyID: "p1", Result: string(ResultOK)},
+		{ID: "e2", UserID: "user1", AdminAccountID: "ws1", PolicyID: "p1", Result: string(ResultServerError)},
+		{ID: "e3", UserID: "user1", AdminAccountID: "ws1", PolicyID: "p2", Result: string(ResultOK)},
+	}
+	// 已原子预占但尚未落事件的预算也要计入展示。
+	dayStart := probeBudgetDayStart(time.Now())
+	repo.budgetClaims["user1|ws1|p1|"+dayStart.Format(time.RFC3339)] = 3
+
+	service := &Service{repo: repo, accounts: fakeAdminAccountResolver{id: "ws1"}}
+	policies, err := service.ListPolicies(context.Background(), "user1")
+	if err != nil {
+		t.Fatalf("ListPolicies() error = %v", err)
+	}
+	byID := map[string]Policy{}
+	for _, policy := range policies {
+		byID[policy.ID] = policy
+	}
+	if byID["p1"].DailyProbeBudgetUsed != 3 {
+		t.Fatalf("p1 used budget want 3 (claims override events), got %d", byID["p1"].DailyProbeBudgetUsed)
+	}
+	if byID["p2"].DailyProbeBudgetUsed != 1 {
+		t.Fatalf("p2 used budget want 1, got %d", byID["p2"].DailyProbeBudgetUsed)
+	}
+}
+
 func TestSavePolicy_OmittedStrategyModePreservesExistingMultiplierOnlyMode(t *testing.T) {
 	repo := newFakeRepository()
 	repo.policies = []Policy{{

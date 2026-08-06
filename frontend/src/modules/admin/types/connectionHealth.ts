@@ -247,7 +247,10 @@ export interface ConnectionHealthPolicy {
   autoRemoteActionEnabled: boolean
   priorityMode?: ConnectionHealthPriorityMode
   strategyMode?: ConnectionHealthStrategyMode
+  /** 每日真实探活请求次数上限（单位：次/天，中国自然日 UTC+8 重置）。 */
   dailyProbeBudget: number
+  /** 今日已消费的真实探活次数（与 dailyProbeBudget 同单位）。 */
+  dailyProbeBudgetUsed?: number
   createdAt: string
   updatedAt: string
   modelTargets: ConnectionHealthModelTarget[]

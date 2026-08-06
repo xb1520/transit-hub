@@ -666,7 +666,43 @@ func (s *Service) ListPolicies(ctx context.Context, userID string) ([]Policy, er
 	if err != nil {
 		return nil, err
 	}
-	return s.repo.ListPolicies(ctx, userID, adminAccountID)
+	policies, err := s.repo.ListPolicies(ctx, userID, adminAccountID)
+	if err != nil {
+		return nil, err
+	}
+	s.attachPolicyBudgetUsage(ctx, userID, adminAccountID, policies)
+	return policies, nil
+}
+
+// attachPolicyBudgetUsage 为策略列表/详情附上今日已消费的真实探活次数，便于管理端展示已用预算。
+// 计数失败时记日志并保持 Used=0，避免因预算查询失败导致策略列表整体不可用。
+func (s *Service) attachPolicyBudgetUsage(ctx context.Context, userID string, adminAccountID string, policies []Policy) {
+	if len(policies) == 0 {
+		return
+	}
+	dayStart := probeBudgetDayStart(time.Now())
+	for i := range policies {
+		// multiplier_only 策略不进探活预算链路；仍查询一次以兼容历史误写事件，UI 可按模式隐藏。
+		used, err := s.repo.CountProbesToday(ctx, userID, adminAccountID, policies[i].ID, dayStart)
+		if err != nil {
+			log.Printf("[connection-health] count policy probe budget failed policy_id=%s err=%v", policies[i].ID, err)
+			continue
+		}
+		policies[i].DailyProbeBudgetUsed = used
+	}
+}
+
+func (s *Service) attachSinglePolicyBudgetUsage(ctx context.Context, policy *Policy) {
+	if policy == nil {
+		return
+	}
+	dayStart := probeBudgetDayStart(time.Now())
+	used, err := s.repo.CountProbesToday(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart)
+	if err != nil {
+		log.Printf("[connection-health] count policy probe budget failed policy_id=%s err=%v", policy.ID, err)
+		return
+	}
+	policy.DailyProbeBudgetUsed = used
 }
 
 // SavePolicy 创建或更新一条策略（含 model targets 整体替换）。id 为空时创建新策略。
@@ -713,6 +749,7 @@ func (s *Service) SavePolicy(ctx context.Context, userID string, in PolicyInput)
 	if saved == nil {
 		return Policy{}, requestError(ErrorNotFound)
 	}
+	s.attachSinglePolicyBudgetUsage(ctx, saved)
 	return *saved, nil
 }
 

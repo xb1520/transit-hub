@@ -1348,6 +1348,7 @@ export default {
         remoteActionOn: 'Remote Action On',
         allGroupsScope: 'All groups',
         modelTargetCount: '{count} model targets',
+        budgetUsage: 'Today {used}/{total} probes',
         strategyModes: {
           health_probe: 'Health Probe',
           multiplier_only: 'Multiplier Only'
@@ -1380,7 +1381,8 @@ export default {
         maxProbeTokensLabel: 'Max tokens',
         probePromptPlaceholder: 'Probe prompt (leave empty for default)',
         probeIntervalLabel: 'Probe Interval (seconds)',
-        dailyBudgetLabel: 'Daily Probe Budget',
+        dailyBudgetLabel: 'Daily Probe Budget (requests)',
+        dailyBudgetUsage: 'Used today {used}/{total}, {remaining} remaining',
         failureThresholdLabel: 'Failure Threshold',
         successThresholdLabel: 'Recovery Success Threshold',
         cooldownLabel: 'Cooldown (seconds)',
@@ -1408,7 +1410,7 @@ export default {
           modelTargets: 'The models this policy probes. Both automatic scheduling and manual probes run against exactly these models.',
           provider: 'A probe policy can only use one provider (openai / anthropic / gemini / custom). Every model target added below automatically uses this provider, so a single policy never mixes providers.',
           probeInterval: 'Automatic scheduling checks whether a model is due using "last probe time + this interval". Consecutive failures also trigger an escalating 2/5/10-minute backoff on the backend.',
-          dailyBudget: 'Caps how many real probe requests this workspace can run per day. Once the budget is used up, real probe requests are skipped to avoid excessive cost — this is expected, not a system error.',
+          dailyBudget: 'Unit is real probe requests (not tokens or money): how many live model probes this policy may run per China calendar day (UTC+8 reset). Each model probe costs 1. Once exhausted, real probes are skipped to limit cost — expected, not a system error.',
           failureThreshold: 'Consecutive soft failures reaching this count will suspend/degrade the link. Some hard failures (e.g. auth failure) may suspend it immediately without degrading first.',
           successThreshold: 'During the observation window, this many consecutive successful probes are required before the link is considered truly recovered and returns to healthy.',
           cooldown: 'After a link is suspended, the scheduler will not run automatic probes against it until this cooldown period ends.',
@@ -1442,7 +1444,7 @@ export default {
             },
             budget: {
               title: '5. Budget rules',
-              description: 'Every policy has a "daily probe budget" that caps how many real probe requests this workspace can run per day. Once the budget is exhausted, the scheduler skips real probe requests and does not write new probe events — so a model can keep showing "due, waiting for scheduler" with no new events even though it is genuinely due. This is expected behavior caused by the budget limit, not a system fault.'
+              description: 'Every policy has a "daily probe budget" measured in real model probe request count (not tokens or money): each model probe costs 1, resetting on the China calendar day (UTC+8). Once exhausted, the scheduler skips real probes and does not write new events — so a model can keep showing "due, waiting for scheduler" with no new events even though it is genuinely due. This is expected budget behavior, not a system fault.'
             },
             stateTransition: {
               title: '6. State transitions',
