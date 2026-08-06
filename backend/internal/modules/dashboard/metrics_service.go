@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -36,19 +37,30 @@ type UpstreamLister interface {
 	InboundBreakdownToday(ctx context.Context, userID string) (upstream.InboundBreakdownResponse, error)
 }
 
+// PricingMappingSource 提供「自有分组 → 上游分组」只读映射，供上游分组利润估算使用。
+// 由 my_sites 适配器注入；未注入时上游分组仅用同名自有倍率或全站利润率回退。
+type PricingMappingSource interface {
+	ListPricingTargetLinks(ctx context.Context, userID string) ([]PricingTargetLink, error)
+}
+
 // MetricsService 负责仪表盘指标的实时计算、历史快照存储与午夜调度。
 // 与同包的 Service（admin 会话管理）职责分离，共享 SessionStore 和 PlatformClient。
 type MetricsService struct {
-	store       SessionStore
-	platform    PlatformClient
-	upstreams   UpstreamLister
-	metricsRepo *MetricsRepository
-	accounts    AdminAccountService
-	sessionSync MySiteStateSync
+	store            SessionStore
+	platform         PlatformClient
+	upstreams        UpstreamLister
+	metricsRepo      *MetricsRepository
+	accounts         AdminAccountService
+	sessionSync      MySiteStateSync
+	pricingMappings  PricingMappingSource
 }
 
 func (s *MetricsService) SetMySiteSync(sync MySiteStateSync) {
 	s.sessionSync = sync
+}
+
+func (s *MetricsService) SetPricingMappingSource(source PricingMappingSource) {
+	s.pricingMappings = source
 }
 
 func (s *MetricsService) freshAdminSession(ctx context.Context, userID string, adminAccountID string, record *AdminSession) (upstream.Session, error) {
@@ -599,6 +611,376 @@ func (s *MetricsService) GroupUsageToday(ctx context.Context, userID string) (Gr
 		Total:  total,
 		Groups: items,
 	}, nil
+}
+
+// GroupProfitToday 返回今天有营收的各分组利润与利润率（仪表盘「今日净利润 / 今日利润率」下钻）。
+//
+// 口径：
+//   - 营收：与 GroupUsageToday 相同（admin 站点分组今日实际消费）
+//   - 总成本：与 LiveMetrics todayCost 相同（上游今日消耗 × 充值倍率）
+//   - 成本分摊：按 1x 归一化用量 V_i = revenue_i / max(saleMultiplier_i, ε) 比例分摊总成本，
+//     使高售卖倍率分组在相同业务量下承担更低单位成本、体现更高利润率；
+//     各分组 profit 之和 = totalRevenue - totalCost，与卡片净利一致。
+//   - 只返回 revenue > 0 的分组。
+func (s *MetricsService) GroupProfitToday(ctx context.Context, userID string) (GroupProfitTodayResponse, error) {
+	usage, err := s.GroupUsageToday(ctx, userID)
+	if err != nil {
+		return GroupProfitTodayResponse{}, err
+	}
+
+	// 售卖倍率：与分组列表同源，失败时降级为无倍率（按 1x 分摊），不阻塞利润弹窗。
+	multipliers := map[string]float64{}
+	if adminAccountID, accErr := s.requireCurrentAdminAccount(ctx, userID); accErr == nil {
+		if record, getErr := s.store.Get(ctx, userID, adminAccountID); getErr == nil && record != nil && record.Session.IsAuthenticated() {
+			if session, sessErr := s.freshAdminSession(ctx, userID, adminAccountID, record); sessErr == nil {
+				if groups, groupsErr := s.platform.FetchAdminGroups(session); groupsErr == nil {
+					for _, g := range groups {
+						name := strings.TrimSpace(g.Name)
+						if name == "" || g.Multiplier == nil || !isPositiveFinite(*g.Multiplier) {
+							continue
+						}
+						multipliers[name] = *g.Multiplier
+					}
+				} else {
+					log.Printf("dashboard group profit: fetch admin groups failed user_id=%s err=%v", userID, groupsErr)
+				}
+			}
+		}
+	}
+
+	// 今日总成本：与 LiveMetrics 的 todayCost 口径一致。
+	var totalCost float64
+	if s.upstreams != nil {
+		for _, site := range s.upstreams.List(ctx, userID) {
+			if site.RechargeRate <= 0 {
+				continue
+			}
+			if site.Metrics.TodayConsume.Value != nil {
+				totalCost += *site.Metrics.TodayConsume.Value * site.RechargeRate
+			}
+		}
+	}
+
+	type workingGroup struct {
+		name       string
+		revenue    float64
+		multiplier float64
+		volume     float64
+	}
+	working := make([]workingGroup, 0, len(usage.Groups))
+	var totalRevenue, totalVolume float64
+	for _, item := range usage.Groups {
+		revenue := item.TodayAmount
+		if revenue <= 0 || !isFinite(revenue) {
+			continue
+		}
+		name := strings.TrimSpace(item.GroupName)
+		if name == "" {
+			continue
+		}
+		mult := multipliers[name]
+		if !isPositiveFinite(mult) {
+			mult = 1
+		}
+		volume := revenue / mult
+		working = append(working, workingGroup{name: name, revenue: revenue, multiplier: mult, volume: volume})
+		totalRevenue += revenue
+		totalVolume += volume
+	}
+
+	items := make([]GroupProfitTodayItem, 0, len(working))
+	var allocatedCost float64
+	for i, g := range working {
+		var cost float64
+		if totalVolume > 0 {
+			cost = totalCost * (g.volume / totalVolume)
+		} else if totalRevenue > 0 {
+			cost = totalCost * (g.revenue / totalRevenue)
+		}
+		// 最后一组吃掉浮点残差，保证 sum(cost) == totalCost。
+		if i == len(working)-1 && len(working) > 0 {
+			cost = totalCost - allocatedCost
+		}
+		allocatedCost += cost
+		profit := g.revenue - cost
+		margin := 0.0
+		if g.revenue > 0 {
+			margin = profit / g.revenue
+		}
+		multCopy := g.multiplier
+		items = append(items, GroupProfitTodayItem{
+			GroupName:      g.name,
+			Revenue:        g.revenue,
+			Cost:           cost,
+			Profit:         profit,
+			ProfitMargin:   margin,
+			SaleMultiplier: &multCopy,
+		})
+	}
+
+	// 默认按利润从高到低，便于运营一眼看到贡献最大的分组。
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Profit != items[j].Profit {
+			return items[i].Profit > items[j].Profit
+		}
+		return items[i].GroupName < items[j].GroupName
+	})
+
+	totalProfit := totalRevenue - totalCost
+	totalMargin := 0.0
+	if totalRevenue > 0 {
+		totalMargin = totalProfit / totalRevenue
+	}
+
+	upstreamGroups, upstreamPartial := s.buildUpstreamGroupProfits(ctx, userID, multipliers, totalRevenue, totalCost, totalMargin)
+
+	return GroupProfitTodayResponse{
+		Date:            usage.Date,
+		TotalRevenue:    totalRevenue,
+		TotalCost:       totalCost,
+		TotalProfit:     totalProfit,
+		TotalMargin:     totalMargin,
+		Groups:          items,
+		UpstreamGroups:  upstreamGroups,
+		UpstreamPartial: upstreamPartial,
+	}, nil
+}
+
+// buildUpstreamGroupProfits 聚合今日有消耗的上游分组，并估算利润/利润率。
+// 口径与调价映射预算毛利率一致：margin = (sale - costMult) / sale；
+// revenue = cost * sale / costMult（cost 已是 key 实际成本）。缺倍率时回退全站利润率。
+func (s *MetricsService) buildUpstreamGroupProfits(
+	ctx context.Context,
+	userID string,
+	saleByOwnGroup map[string]float64,
+	totalRevenue, totalCost, totalMargin float64,
+) ([]UpstreamGroupProfitTodayItem, bool) {
+	if s.upstreams == nil {
+		return []UpstreamGroupProfitTodayItem{}, false
+	}
+
+	keyItems, err := s.upstreams.KeyUsageToday(ctx, userID)
+	partial := false
+	if err != nil {
+		var collectionErr *upstream.KeyUsageCollectionError
+		if !errors.As(err, &collectionErr) || collectionErr.TotalSites <= 0 || collectionErr.FailedSites >= collectionErr.TotalSites {
+			log.Printf("dashboard group profit: upstream key usage unavailable user_id=%s err=%v", userID, err)
+			return []UpstreamGroupProfitTodayItem{}, false
+		}
+		partial = true
+		log.Printf("dashboard group profit: partial upstream key usage user_id=%s failed=%d total=%d", userID, collectionErr.FailedSites, collectionErr.TotalSites)
+	}
+
+	type agg struct {
+		siteID       string
+		siteName     string
+		platform     string
+		groupName    string
+		cost         float64
+		rechargeRate float64
+	}
+	order := make([]string, 0)
+	byKey := make(map[string]*agg)
+	for _, item := range keyItems {
+		if item.TodayAmount <= 0 || !isFinite(item.TodayAmount) {
+			continue
+		}
+		groupName := strings.TrimSpace(item.GroupName)
+		if groupName == "" {
+			groupName = "Ungrouped"
+		}
+		siteID := strings.TrimSpace(item.SiteID)
+		key := siteID + "\x00" + groupName
+		row, ok := byKey[key]
+		if !ok {
+			row = &agg{
+				siteID:       siteID,
+				siteName:     item.SiteName,
+				platform:     string(item.Platform),
+				groupName:    groupName,
+				rechargeRate: item.RechargeRate,
+			}
+			byKey[key] = row
+			order = append(order, key)
+		}
+		row.cost += item.TodayAmount
+		if row.siteName == "" {
+			row.siteName = item.SiteName
+		}
+		if row.platform == "" {
+			row.platform = string(item.Platform)
+		}
+		if row.rechargeRate <= 0 && item.RechargeRate > 0 {
+			row.rechargeRate = item.RechargeRate
+		}
+	}
+
+	// 上游分组倍率：站点缓存 Metrics.Groups × rechargeRate → 有效成本倍率。
+	costMultByKey := map[string]float64{}
+	siteNameByID := map[string]string{}
+	for _, site := range s.upstreams.List(ctx, userID) {
+		siteNameByID[site.ID] = site.Name
+		if site.RechargeRate <= 0 {
+			continue
+		}
+		for _, g := range site.Metrics.Groups {
+			name := strings.TrimSpace(g.Name)
+			if name == "" || g.Multiplier == nil || !isPositiveFinite(*g.Multiplier) {
+				continue
+			}
+			costMultByKey[site.ID+"\x00"+name] = *g.Multiplier * site.RechargeRate
+		}
+	}
+
+	// 反向映射：上游 (site, group) → 关联的自有分组名。
+	reverseOwn := map[string][]string{}
+	if s.pricingMappings != nil {
+		if links, linkErr := s.pricingMappings.ListPricingTargetLinks(ctx, userID); linkErr != nil {
+			log.Printf("dashboard group profit: pricing mappings failed user_id=%s err=%v", userID, linkErr)
+		} else {
+			seenOwn := map[string]map[string]struct{}{}
+			for _, link := range links {
+				own := strings.TrimSpace(link.OwnGroup)
+				siteID := strings.TrimSpace(link.SiteID)
+				gName := strings.TrimSpace(link.GroupName)
+				if own == "" || siteID == "" || gName == "" {
+					continue
+				}
+				key := siteID + "\x00" + gName
+				if seenOwn[key] == nil {
+					seenOwn[key] = map[string]struct{}{}
+				}
+				if _, ok := seenOwn[key][own]; ok {
+					continue
+				}
+				seenOwn[key][own] = struct{}{}
+				reverseOwn[key] = append(reverseOwn[key], own)
+			}
+		}
+	}
+
+	items := make([]UpstreamGroupProfitTodayItem, 0, len(order))
+	for _, key := range order {
+		row := byKey[key]
+		if row == nil || row.cost <= 0 {
+			continue
+		}
+		if row.siteName == "" {
+			if name := siteNameByID[row.siteID]; name != "" {
+				row.siteName = name
+			} else {
+				row.siteName = row.siteID
+			}
+		}
+
+		mapped := append([]string(nil), reverseOwn[key]...)
+		var salePtr *float64
+		if sale, ok := resolveUpstreamSaleMultiplier(row.groupName, mapped, saleByOwnGroup); ok {
+			v := sale
+			salePtr = &v
+		}
+
+		var costMultPtr *float64
+		if costMult, ok := costMultByKey[key]; ok && isPositiveFinite(costMult) {
+			v := costMult
+			costMultPtr = &v
+		}
+
+		revenue, profit, margin := estimateUpstreamProfit(row.cost, salePtr, costMultPtr, totalRevenue, totalCost, totalMargin)
+		items = append(items, UpstreamGroupProfitTodayItem{
+			SiteID:          row.siteID,
+			SiteName:        row.siteName,
+			Platform:        row.platform,
+			GroupName:       row.groupName,
+			Cost:            row.cost,
+			Revenue:         revenue,
+			Profit:          profit,
+			ProfitMargin:    margin,
+			SaleMultiplier:  salePtr,
+			CostMultiplier:  costMultPtr,
+			MappedOwnGroups: mapped,
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Profit != items[j].Profit {
+			return items[i].Profit > items[j].Profit
+		}
+		if items[i].Cost != items[j].Cost {
+			return items[i].Cost > items[j].Cost
+		}
+		if items[i].SiteName != items[j].SiteName {
+			return items[i].SiteName < items[j].SiteName
+		}
+		return items[i].GroupName < items[j].GroupName
+	})
+	return items, partial
+}
+
+// resolveUpstreamSaleMultiplier 优先用调价映射关联的自有分组倍率均值，其次同名自有分组。
+func resolveUpstreamSaleMultiplier(upstreamGroup string, mappedOwn []string, saleByOwnGroup map[string]float64) (float64, bool) {
+	var sum float64
+	var n int
+	for _, own := range mappedOwn {
+		if m, ok := saleByOwnGroup[strings.TrimSpace(own)]; ok && isPositiveFinite(m) {
+			sum += m
+			n++
+		}
+	}
+	if n > 0 {
+		return sum / float64(n), true
+	}
+	if m, ok := saleByOwnGroup[strings.TrimSpace(upstreamGroup)]; ok && isPositiveFinite(m) {
+		return m, true
+	}
+	return 0, false
+}
+
+// estimateUpstreamProfit 估算上游分组营收/利润/利润率。
+// 优先：margin=(sale-costMult)/sale，revenue=cost*sale/costMult（与调价映射预算毛利率一致）。
+// 回退：用全站利润率把该上游成本反推营收，使无映射分组仍可展示。
+func estimateUpstreamProfit(
+	cost float64,
+	saleMult, costMult *float64,
+	totalRevenue, totalCost, totalMargin float64,
+) (revenue, profit, margin float64) {
+	if saleMult != nil && costMult != nil && isPositiveFinite(*saleMult) && isPositiveFinite(*costMult) {
+		margin = (*saleMult - *costMult) / *saleMult
+		revenue = cost * (*saleMult) / (*costMult)
+		profit = revenue - cost
+		return revenue, profit, margin
+	}
+	if totalRevenue > 0 && isFinite(totalMargin) {
+		margin = totalMargin
+		// revenue - cost = margin * revenue  =>  revenue = cost / (1 - margin)
+		if margin < 1 {
+			denom := 1 - margin
+			if denom > 1e-12 {
+				revenue = cost / denom
+				profit = revenue - cost
+				return revenue, profit, margin
+			}
+		}
+		// 利润率 ≥ 100% 的极端情况：按成本占比分摊全站利润。
+		if totalCost > 0 {
+			profit = (totalRevenue - totalCost) * (cost / totalCost)
+			revenue = cost + profit
+			if revenue > 0 {
+				margin = profit / revenue
+			}
+			return revenue, profit, margin
+		}
+	}
+	// 无任何参照：只展示成本，利润按 0 营收下的 -cost。
+	return 0, -cost, 0
+}
+
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func isPositiveFinite(v float64) bool {
+	return isFinite(v) && v > 0
 }
 
 // UpstreamKeyUsageToday 获取当前工作区所有上游站点中，今天有消费的 key 明细（仪表盘「今日成本」下钻）。

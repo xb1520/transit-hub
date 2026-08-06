@@ -308,6 +308,7 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	// 并复用 upstreamService 读取已同步的上游站点数据（无额外 API 调用）。
 	metricsService := dashboard.NewMetricsService(dashboardSessionStore, platformService, upstreamService, metricsRepo, adminAccountsService)
 	metricsService.SetMySiteSync(mySitesService)
+	metricsService.SetPricingMappingSource(dashboardPricingMappingSource{svc: mySitesService})
 	metricsService.StartScheduler(context.Background())
 	dashboard.RegisterRoutes(server.mux, dashboardService, metricsService)
 
@@ -320,6 +321,30 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 
 type groupRateSnapshotWriter struct {
 	service *group_rates.Service
+}
+
+// dashboardPricingMappingSource 把 my_sites 的调价映射边适配为 dashboard 只读接口。
+type dashboardPricingMappingSource struct {
+	svc *my_sites.Service
+}
+
+func (a dashboardPricingMappingSource) ListPricingTargetLinks(ctx context.Context, userID string) ([]dashboard.PricingTargetLink, error) {
+	if a.svc == nil {
+		return nil, nil
+	}
+	links, err := a.svc.ListPricingTargetLinks(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dashboard.PricingTargetLink, 0, len(links))
+	for _, link := range links {
+		out = append(out, dashboard.PricingTargetLink{
+			OwnGroup:  link.OwnGroup,
+			SiteID:    link.SiteID,
+			GroupName: link.GroupName,
+		})
+	}
+	return out, nil
 }
 
 type dashboardSessionCleaner interface {

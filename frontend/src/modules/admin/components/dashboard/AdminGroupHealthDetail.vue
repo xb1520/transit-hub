@@ -17,6 +17,7 @@ import {
   Settings2,
   ShieldCheck,
   ShieldQuestion,
+  Wallet,
   Zap,
 } from 'lucide-vue-next'
 import { Tooltip } from '@/components/ui/tooltip'
@@ -25,6 +26,7 @@ import {
   connectionHealthStateBadgeClass,
   formatConnectionHealthTime,
 } from '../../composables/useConnectionHealth'
+import { formatCny } from '../../utils/dashboard'
 import type {
   AdminGroupAccount,
   AdminGroupHealth,
@@ -33,6 +35,12 @@ import type {
 
 const props = defineProps<{
   group: AdminGroupHealth
+  /** 该分组今日消耗（admin 站点分组实际消费）；null 表示尚未加载或不可用。 */
+  todaySpend?: number | null
+  /** 上游分组名 → 今日成本（key 用量合计）。 */
+  upstreamGroupSpendToday?: Map<string, number>
+  /** 上游分组消耗是否已成功加载。 */
+  upstreamGroupSpendLoaded?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -46,7 +54,7 @@ const prefix = 'admin.connectionHealth'
 const detailPrefix = `${prefix}.groupDetail`
 const expandedTargetId = ref('')
 
-type AccountSortKey = 'priority' | 'upstreamMultiplier'
+type AccountSortKey = 'priority' | 'upstreamMultiplier' | 'upstreamSpend'
 type SortDir = 'asc' | 'desc'
 
 const sortKey = ref<AccountSortKey | null>(null)
@@ -63,7 +71,7 @@ const toggleSort = (key: AccountSortKey) => {
     return
   }
   sortKey.value = key
-  // 优先级默认升序（数值小更优先的平台更直观）；倍率默认升序（成本更低在前）。
+  // 优先级默认升序（数值小更优先的平台更直观）；倍率/消耗默认升序（成本更低在前）。
   sortDir.value = 'asc'
 }
 
@@ -75,6 +83,21 @@ const sortIndicator = (key: AccountSortKey) => {
 const monitoredCount = computed(() => props.group.monitoredAccountCount ?? props.group.accounts.filter((account) => account.hasAssignedPolicy).length)
 const lastProbeAt = computed(() => props.group.healthSummary?.lastProbeAt ?? null)
 const isNewAPI = computed(() => props.group.platform.toLowerCase().includes('new'))
+
+/** 账号关联上游分组的今日消耗；未关联或未加载完成返回 null。 */
+const accountUpstreamSpend = (account: AdminGroupAccount): number | null => {
+  if (!props.upstreamGroupSpendLoaded) return null
+  const name = (account.upstreamKeyGroupName || '').trim()
+  if (!name) return null
+  const amount = props.upstreamGroupSpendToday?.get(name)
+  return amount != null && Number.isFinite(amount) ? amount : 0
+}
+
+const formatAccountUpstreamSpend = (account: AdminGroupAccount): string => {
+  const amount = accountUpstreamSpend(account)
+  if (amount == null) return '—'
+  return formatCny(amount)
+}
 
 const strictDegradedCount = computed(() => Math.max(
   0,
@@ -103,6 +126,15 @@ const sortedAccounts = computed(() => {
     if (key === 'priority') {
       const leftVal = left.priority
       const rightVal = right.priority
+      if (leftVal == null && rightVal == null) return 0
+      if (leftVal == null) return 1
+      if (rightVal == null) return -1
+      if (leftVal === rightVal) return 0
+      return leftVal < rightVal ? -dir : dir
+    }
+    if (key === 'upstreamSpend') {
+      const leftVal = accountUpstreamSpend(left)
+      const rightVal = accountUpstreamSpend(right)
       if (leftVal == null && rightVal == null) return 0
       if (leftVal == null) return 1
       if (rightVal == null) return -1
@@ -244,7 +276,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
       </button>
     </header>
 
-    <dl class="grid border-b border-border/50 sm:grid-cols-2 xl:grid-cols-4">
+    <dl class="grid border-b border-border/50 sm:grid-cols-2 xl:grid-cols-5">
       <div class="border-b border-border/50 px-5 py-4 sm:border-r xl:border-b-0">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Radar class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.accounts`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">{{ group.accountCount }}</dd>
@@ -253,11 +285,17 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><ShieldCheck class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.monitored`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">{{ monitoredCount }}</dd>
       </div>
-      <div class="border-b border-border/50 px-5 py-4 sm:border-b-0 sm:border-r">
+      <div class="border-b border-border/50 px-5 py-4 sm:border-r xl:border-b-0">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Gauge class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.probeable`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">{{ group.healthSummary.probeableAccounts }}</dd>
       </div>
-      <div class="px-5 py-4">
+      <div class="border-b border-border/50 px-5 py-4 sm:border-b-0 xl:border-r">
+        <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Wallet class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.todaySpend`) }}</dt>
+        <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">
+          {{ todaySpend == null || !Number.isFinite(todaySpend) ? '—' : formatCny(todaySpend) }}
+        </dd>
+      </div>
+      <div class="px-5 py-4 sm:col-span-2 xl:col-span-1">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Clock3 class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.lastProbe`) }}</dt>
         <dd class="mt-1 text-sm font-medium text-foreground">{{ formatConnectionHealthTime(lastProbeAt) }}</dd>
       </div>
@@ -290,7 +328,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
         <p class="mt-3 text-sm text-muted-foreground">{{ t(`${detailPrefix}.empty`) }}</p>
       </div>
       <div v-else class="overflow-x-auto rounded-lg border border-border/60">
-        <table class="w-full min-w-[58rem] text-sm">
+        <table class="w-full min-w-[66rem] text-sm">
           <thead class="bg-surface/60 text-left text-xs text-muted-foreground">
             <tr>
               <th class="w-10 px-3 py-2.5 font-medium"><span class="sr-only">{{ t(`${detailPrefix}.columns.expand`) }}</span></th>
@@ -320,6 +358,20 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                   <span>{{ t(`${detailPrefix}.columns.upstreamMultiplier`) }}</span>
                   <ArrowUp v-if="sortIndicator('upstreamMultiplier') === 'asc'" class="h-3.5 w-3.5" />
                   <ArrowDown v-else-if="sortIndicator('upstreamMultiplier') === 'desc'" class="h-3.5 w-3.5" />
+                  <ArrowUpDown v-else class="h-3.5 w-3.5 opacity-50" />
+                </button>
+              </th>
+              <th class="px-3 py-2.5 font-medium">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded-md px-1 py-0.5 transition-colors hover:bg-surface hover:text-foreground"
+                  :class="sortKey === 'upstreamSpend' ? 'text-foreground' : ''"
+                  :title="t(`${detailPrefix}.columns.upstreamSpendHint`)"
+                  @click="toggleSort('upstreamSpend')"
+                >
+                  <span>{{ t(`${detailPrefix}.columns.upstreamSpend`) }}</span>
+                  <ArrowUp v-if="sortIndicator('upstreamSpend') === 'asc'" class="h-3.5 w-3.5" />
+                  <ArrowDown v-else-if="sortIndicator('upstreamSpend') === 'desc'" class="h-3.5 w-3.5" />
                   <ArrowUpDown v-else class="h-3.5 w-3.5 opacity-50" />
                 </button>
               </th>
@@ -399,6 +451,17 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                     {{ account.upstreamKeyGroupName }}
                   </span>
                 </td>
+                <td class="px-3 py-3 tabular-nums text-foreground">
+                  <span
+                    class="text-sm"
+                    :class="accountUpstreamSpend(account) == null ? 'text-muted-foreground' : ''"
+                    :title="account.upstreamKeyGroupName
+                      ? t(`${detailPrefix}.columns.upstreamSpendFor`, { group: account.upstreamKeyGroupName })
+                      : t(`${detailPrefix}.upstreamMultiplierPending`)"
+                  >
+                    {{ formatAccountUpstreamSpend(account) }}
+                  </span>
+                </td>
                 <td class="px-3 py-3">
                   <div class="flex items-center justify-end gap-1">
                     <Tooltip :text="t(`${prefix}.actions.probe`)">
@@ -427,7 +490,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                 </td>
               </tr>
               <tr v-if="expandedTargetId === account.targetId" class="border-t border-border/40 bg-surface/25">
-                <td colspan="7" class="px-12 py-4">
+                <td colspan="8" class="px-12 py-4">
                   <div v-if="account.modelHealth.length === 0 && unprobedModels(account).length === 0" class="text-xs text-muted-foreground">{{ t(`${detailPrefix}.models.empty`) }}</div>
                   <div v-else class="grid gap-2 lg:grid-cols-2">
                     <div v-for="model in account.modelHealth" :key="model.modelName" class="rounded-lg border border-border/50 bg-background px-3 py-2.5">

@@ -634,6 +634,40 @@ export default {
           asc: 'Amount: Low to High'
         }
       },
+      groupProfit: {
+        titleProfit: "Today's Net Profit by Group",
+        titleMargin: "Today's Margin by Group",
+        subtitle: '{ownCount} own · {upstreamCount} upstream · Net profit {profit} · Margin {margin}',
+        hint: 'Total revenue {revenue}. Own-group cost is allocated by 1x-normalized volume; upstream groups use real key spend and estimate profit from sale/cost multipliers.',
+        upstreamHint: 'Only upstream groups with spend today. With pricing mappings, margin uses (sale − cost) / sale; otherwise the site-wide margin is used.',
+        upstreamPartial: 'Some upstream sites failed to report key usage; the upstream list may be incomplete.',
+        upstreamEmpty: 'No upstream group spend today, or key usage is temporarily unavailable.',
+        mappedOwn: 'Mapped own groups: {groups}',
+        close: 'Close',
+        empty: 'No groups with usage today.',
+        loadError: 'Failed to load group profit data.',
+        retry: 'Retry',
+        sections: {
+          own: 'My groups',
+          ownCount: '{count} with revenue',
+          upstream: 'Upstream groups',
+          upstreamCount: '{count} with spend'
+        },
+        columns: {
+          groupName: 'Group',
+          upstreamGroup: 'Upstream group',
+          site: 'Upstream site',
+          revenue: 'Revenue',
+          estRevenue: 'Est. revenue',
+          cost: 'Cost',
+          profit: 'Profit',
+          margin: 'Margin'
+        },
+        sort: {
+          desc: 'Profit: High to Low',
+          asc: 'Profit: Low to High'
+        }
+      },
       todayInbound: {
         title: "Today's Inbound Breakdown",
         subtitle: 'Total {total} · {date}',
@@ -1030,6 +1064,7 @@ export default {
         platform: 'Platform',
         type: 'Type',
         multiplier: 'Multiplier',
+        todaySpend: "Today's spend",
         accounts: 'Accounts',
         accountsUnit: '',
         status: 'Group Status',
@@ -1042,7 +1077,8 @@ export default {
         noProbe: '{count} pending probe'
       },
       groupList: {
-        monitored: 'Monitored {count}/{total}'
+        monitored: 'Monitored {count}/{total}',
+        todaySpend: 'Today {amount}'
       },
       groupDetail: {
         multiplierPriority: 'Multiplier priority',
@@ -1061,7 +1097,8 @@ export default {
           accounts: 'Accounts / Channels',
           monitored: 'Auto-monitored',
           probeable: 'Manual probe ready',
-          lastProbe: 'Last Probe'
+          lastProbe: 'Last Probe',
+          todaySpend: "Today's spend"
         },
         statusBreakdown: {
           title: 'Current Group Probe States',
@@ -1090,6 +1127,9 @@ export default {
           multiplier: 'Effective Multiplier',
           strategyMultiplier: 'My Group Multiplier',
           upstreamMultiplier: 'Upstream API Key Multiplier',
+          upstreamSpend: 'Upstream group spend',
+          upstreamSpendHint: "Today's cost for the upstream API key group linked to this account (summed across keys in the group)",
+          upstreamSpendFor: 'Today\'s cost for upstream group "{group}"',
           actions: 'Actions'
         },
         upstreamMultiplierPending: 'Shown after linking',

@@ -49,6 +49,14 @@ type UpstreamGroupRef struct {
 	GroupName string `json:"groupName"`
 }
 
+// PricingTargetLink 是「自有分组 → 上游分组」的一条只读映射边，
+// 供仪表盘上游分组利润估算等跨模块只读场景使用（不含自动调价配置）。
+type PricingTargetLink struct {
+	OwnGroup  string `json:"ownGroup"`
+	SiteID    string `json:"siteId"`
+	GroupName string `json:"groupName"`
+}
+
 // State 用户的分组映射持久化状态，存储于 my_site_states 表。
 type State struct {
 	UserID         string           `json:"-"`

@@ -1052,6 +1052,67 @@ func (s *Service) currentAdminAccountID(ctx context.Context, userID string) (str
 	return s.accounts.RequireCurrentID(ctx, userID)
 }
 
+// ListPricingTargetLinks 返回当前工作区「自有分组 → 上游分组」的只读映射边。
+// 仅读本地 my_site_states + real_connections，不请求上游 admin API，失败时返回空列表而非阻断调用方。
+func (s *Service) ListPricingTargetLinks(ctx context.Context, userID string) ([]PricingTargetLink, error) {
+	adminAccountID, err := s.currentAdminAccountID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	state, err := s.repository.Get(ctx, userID, adminAccountID)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	links := make([]PricingTargetLink, 0)
+	add := func(ownGroup, siteID, groupName string) {
+		ownGroup = strings.TrimSpace(ownGroup)
+		siteID = strings.TrimSpace(siteID)
+		groupName = strings.TrimSpace(groupName)
+		if ownGroup == "" || siteID == "" || groupName == "" {
+			return
+		}
+		key := ownGroup + "\x00" + siteID + "\x00" + groupName
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		links = append(links, PricingTargetLink{OwnGroup: ownGroup, SiteID: siteID, GroupName: groupName})
+	}
+
+	if state != nil {
+		for _, mapping := range state.Mappings {
+			for _, target := range mapping.UpstreamTargets {
+				add(mapping.OwnGroup, target.SiteID, target.GroupName)
+			}
+		}
+	}
+	if s.connRepository != nil {
+		connections, listErr := s.connRepository.ListRealConnections(ctx, userID, adminAccountID)
+		if listErr != nil {
+			log.Printf("[my-sites] list pricing links: real connections failed user_id=%s err=%v", userID, listErr)
+		} else {
+			for _, conn := range connections {
+				for _, ownName := range conn.OwnGroupNames {
+					add(ownName, conn.UpstreamSiteID, conn.UpstreamGroupName)
+				}
+			}
+		}
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		if links[i].OwnGroup != links[j].OwnGroup {
+			return links[i].OwnGroup < links[j].OwnGroup
+		}
+		if links[i].SiteID != links[j].SiteID {
+			return links[i].SiteID < links[j].SiteID
+		}
+		return links[i].GroupName < links[j].GroupName
+	})
+	return links, nil
+}
+
 // floatOrDefault 解引用指针，nil 时返回默认值，非 nil 时返回实际值（含 0）。
 func floatOrDefault(p *float64, defaultVal float64) float64 {
 	if p == nil {

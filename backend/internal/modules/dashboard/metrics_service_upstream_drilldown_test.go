@@ -14,9 +14,13 @@ type fakeUpstreamLister struct {
 	keyUsageErr   error
 	balanceItems  []upstream.BalanceBreakdownItem
 	balanceErr    error
+	listItems     []upstream.Response
 }
 
 func (f *fakeUpstreamLister) List(ctx context.Context, userID string) []upstream.Response {
+	if f.listItems != nil {
+		return f.listItems
+	}
 	return nil
 }
 

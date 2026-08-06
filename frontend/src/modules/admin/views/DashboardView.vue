@@ -27,6 +27,7 @@ import AdminLoginModal from '../components/dashboard/AdminLoginModal.vue'
 import SiteBalanceModal from '../components/dashboard/SiteBalanceModal.vue'
 import DashboardEChart from '../components/dashboard/DashboardEChart.vue'
 import GroupUsageTodayModal from '../components/dashboard/GroupUsageTodayModal.vue'
+import GroupProfitTodayModal from '../components/dashboard/GroupProfitTodayModal.vue'
 import StatCard from '../components/dashboard/StatCard.vue'
 import UpstreamBalanceBreakdownModal from '../components/dashboard/UpstreamBalanceBreakdownModal.vue'
 import UpstreamKeyUsageTodayModal from '../components/dashboard/UpstreamKeyUsageTodayModal.vue'
@@ -104,6 +105,8 @@ const adminLoginInitialValue = computed(() => ({
 
 const siteBalanceOpen = ref(false)
 const groupUsageTodayOpen = ref(false)
+const groupProfitTodayOpen = ref(false)
+const groupProfitFocus = ref<'profit' | 'margin'>('profit')
 const upstreamKeyUsageTodayOpen = ref(false)
 const upstreamBalanceBreakdownOpen = ref(false)
 const todayInboundBreakdownOpen = ref(false)
@@ -113,6 +116,11 @@ const closeSiteBalance = () => { siteBalanceOpen.value = false }
 const onSiteBalanceUpdated = () => { void loadAllData({ skipStatusCheck: true }) }
 const openGroupUsageToday = () => { groupUsageTodayOpen.value = true }
 const closeGroupUsageToday = () => { groupUsageTodayOpen.value = false }
+const openGroupProfitToday = (focus: 'profit' | 'margin' = 'profit') => {
+  groupProfitFocus.value = focus
+  groupProfitTodayOpen.value = true
+}
+const closeGroupProfitToday = () => { groupProfitTodayOpen.value = false }
 const openUpstreamKeyUsageToday = () => { upstreamKeyUsageTodayOpen.value = true }
 const closeUpstreamKeyUsageToday = () => { upstreamKeyUsageTodayOpen.value = false }
 const openUpstreamBalanceBreakdown = () => { upstreamBalanceBreakdownOpen.value = true }
@@ -128,6 +136,12 @@ const handleMetricCardClick = (key: string) => {
       break
     case 'todayPurchase':
       openUpstreamKeyUsageToday()
+      break
+    case 'netProfit':
+      openGroupProfitToday('profit')
+      break
+    case 'profitMargin':
+      openGroupProfitToday('margin')
       break
     case 'todayInbound':
       openTodayInboundBreakdown()
@@ -344,7 +358,7 @@ const cards = computed<DashboardCoreCard[]>(() => {
       secondaryValue: parts.secondary,
       deltaDirection: delta.direction,
       deltaText: deltaParts.primary,
-      clickable: key === 'todayProfit' || key === 'todayPurchase' || key === 'todayInbound',
+      clickable: key === 'todayProfit' || key === 'todayPurchase' || key === 'netProfit' || key === 'todayInbound',
       negativeWhenUp: key === 'todayPurchase' || key === 'todayInbound',
     }]
   })
@@ -357,7 +371,7 @@ const cards = computed<DashboardCoreCard[]>(() => {
     value: percentFormatter.value.format(profitMargin.value / 100),
     deltaDirection: marginDelta.direction,
     deltaText: t('admin.dashboard.delta.percentagePoints', { value: numberFormatter.value.format(Math.abs(marginDelta.amount)) }),
-    clickable: false,
+    clickable: true,
     negativeWhenUp: false,
   })
   return result
@@ -1051,6 +1065,7 @@ const lastProbeLabel = computed(() => {
     />
     <SiteBalanceModal :open="siteBalanceOpen" @close="closeSiteBalance" @updated="onSiteBalanceUpdated" />
     <GroupUsageTodayModal :open="groupUsageTodayOpen" @close="closeGroupUsageToday" />
+    <GroupProfitTodayModal :open="groupProfitTodayOpen" :focus="groupProfitFocus" @close="closeGroupProfitToday" />
     <UpstreamKeyUsageTodayModal :open="upstreamKeyUsageTodayOpen" @close="closeUpstreamKeyUsageToday" />
     <TodayInboundBreakdownModal :open="todayInboundBreakdownOpen" @close="closeTodayInboundBreakdown" />
     <UpstreamBalanceBreakdownModal :open="upstreamBalanceBreakdownOpen" @close="closeUpstreamBalanceBreakdown" />

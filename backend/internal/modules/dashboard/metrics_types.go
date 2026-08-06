@@ -98,6 +98,60 @@ type GroupUsageTodayItem struct {
 	TodayAmount float64 `json:"todayAmount"`
 }
 
+// GroupProfitTodayResponse 是 GET /api/dashboard/group-profit-today 返回的
+// 「今日净利润 / 今日利润率」下钻：今天有消耗的自有分组与上游分组利润/利润率。
+// 自有分组成本按「1x 归一化用量」分摊今日总成本，使各分组合计与仪表盘净利口径一致。
+// 上游分组以 key 今日实际成本为准，营收按售卖/成本倍率估算（与调价映射预算毛利率同公式）。
+type GroupProfitTodayResponse struct {
+	Date         string                 `json:"date"`
+	TotalRevenue float64                `json:"totalRevenue"`
+	TotalCost    float64                `json:"totalCost"`
+	TotalProfit  float64                `json:"totalProfit"`
+	// TotalMargin 为 totalProfit / totalRevenue；无营收时为 0。
+	TotalMargin float64 `json:"totalMargin"`
+	// Groups 自有（admin）分组，仅 revenue > 0。
+	Groups []GroupProfitTodayItem `json:"groups"`
+	// UpstreamGroups 已接入且今日有消耗的上游分组。
+	UpstreamGroups []UpstreamGroupProfitTodayItem `json:"upstreamGroups"`
+	// UpstreamPartial 表示部分上游站点 key 用量采集失败，上游列表可能不完整。
+	UpstreamPartial bool `json:"upstreamPartial,omitempty"`
+}
+
+// GroupProfitTodayItem 是单个有今日营收的自有分组利润明细。
+// ProfitMargin 为利润/营收（0~1 比例，前端再格式化为百分比）。
+type GroupProfitTodayItem struct {
+	GroupName      string   `json:"groupName"`
+	Revenue        float64  `json:"revenue"`
+	Cost           float64  `json:"cost"`
+	Profit         float64  `json:"profit"`
+	ProfitMargin   float64  `json:"profitMargin"`
+	SaleMultiplier *float64 `json:"saleMultiplier,omitempty"`
+}
+
+// UpstreamGroupProfitTodayItem 是单个今日有消耗的上游分组利润明细。
+// Cost 为 key 用量合计（已 × 站点 rechargeRate）；Revenue/Profit 在缺少倍率时按全站利润率回退估算。
+type UpstreamGroupProfitTodayItem struct {
+	SiteID         string   `json:"siteId"`
+	SiteName       string   `json:"siteName"`
+	Platform       string   `json:"platform"`
+	GroupName      string   `json:"groupName"`
+	Cost           float64  `json:"cost"`
+	Revenue        float64  `json:"revenue"`
+	Profit         float64  `json:"profit"`
+	ProfitMargin   float64  `json:"profitMargin"`
+	SaleMultiplier *float64 `json:"saleMultiplier,omitempty"`
+	CostMultiplier *float64 `json:"costMultiplier,omitempty"`
+	// MappedOwnGroups 参与售卖倍率推断的自有分组名（来自调价映射 / 真实对接）。
+	MappedOwnGroups []string `json:"mappedOwnGroups,omitempty"`
+}
+
+// PricingTargetLink 是仪表盘读取的「自有分组 → 上游分组」映射边（与 my_sites 结构对齐）。
+type PricingTargetLink struct {
+	OwnGroup  string
+	SiteID    string
+	GroupName string
+}
+
 // UpstreamKeyUsageTodayResponse 是 GET /api/dashboard/upstream-key-usage-today 返回的
 // 「今日成本」下钻明细：当前工作区所有上游站点中，今天有消费的 key 列表。
 type UpstreamKeyUsageTodayResponse struct {

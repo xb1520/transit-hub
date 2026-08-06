@@ -16,8 +16,10 @@ import {
   ShieldCheck,
 } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
+import { getGroupUsageToday, getUpstreamKeyUsageToday } from '../api/dashboardAdmin'
 import { listUpstreamSites } from '../api/upstream'
 import { connectionHealthMessageKey, useConnectionHealth } from '../composables/useConnectionHealth'
+import { formatCny } from '../utils/dashboard'
 import AdminGroupHealthDetail from '../components/dashboard/AdminGroupHealthDetail.vue'
 import ConnectionHealthEventsDialog from '../components/dashboard/ConnectionHealthEventsDialog.vue'
 import GroupHealthSetupDrawer from '../components/dashboard/GroupHealthSetupDrawer.vue'
@@ -56,6 +58,14 @@ const selectedGroupId = ref('')
 const selectedConnectionId = ref('')
 const eventsDialogOpen = ref(false)
 const siteNameMap = ref<Map<string, string>>(new Map())
+/** 自有分组名 → 今日消耗（与仪表盘「今日营收」同源，admin 站点分组今日实际消费）。 */
+const groupSpendToday = ref<Map<string, number>>(new Map())
+/** 是否已成功拉取过自有分组今日消耗；未加载成功时展示占位，避免把「未知」显示成 ¥0。 */
+const groupSpendLoaded = ref(false)
+/** 上游分组名 → 今日成本（key 用量按分组合计，与「今日成本」同源）。 */
+const upstreamGroupSpendToday = ref<Map<string, number>>(new Map())
+/** 是否已成功拉取过上游分组消耗。 */
+const upstreamGroupSpendLoaded = ref(false)
 
 const groupTypes = ['public', 'exclusive', 'subscription']
 const groupTypeLabel = (type: string): string => t(`admin.connectionHealth.groupTypes.${groupTypes.includes(type) ? type : 'public'}`)
@@ -71,6 +81,17 @@ const formatGroupMultiplier = (group: AdminGroupHealth): string => {
   if (!match) return display
   const parsed = Number(match[1])
   return Number.isFinite(parsed) ? `${Number(parsed.toFixed(3))}x` : display
+}
+
+const groupTodaySpend = (group: AdminGroupHealth): number | null => {
+  if (!groupSpendLoaded.value) return null
+  const amount = groupSpendToday.value.get(group.name)
+  return amount != null && Number.isFinite(amount) ? amount : 0
+}
+
+const formatGroupTodaySpend = (group: AdminGroupHealth): string => {
+  const amount = groupTodaySpend(group)
+  return amount == null ? '—' : formatCny(amount)
 }
 
 const filteredGroups = computed(() => {
@@ -107,11 +128,46 @@ const loadSiteNames = async () => {
   }
 }
 
+const loadGroupSpendToday = async () => {
+  try {
+    const response = await getGroupUsageToday()
+    const next = new Map<string, number>()
+    for (const item of response.groups ?? []) {
+      const name = (item.groupName || '').trim()
+      if (!name) continue
+      next.set(name, (next.get(name) ?? 0) + (item.todayAmount ?? 0))
+    }
+    groupSpendToday.value = next
+    groupSpendLoaded.value = true
+  } catch {
+    // 今日消耗是附加信息，失败时保留上次数据或空表，不阻塞健康主流程。
+  }
+}
+
+const loadUpstreamGroupSpendToday = async () => {
+  try {
+    const response = await getUpstreamKeyUsageToday()
+    const next = new Map<string, number>()
+    for (const item of response.keys ?? []) {
+      const name = (item.groupName || '').trim() || 'Ungrouped'
+      const amount = item.todayAmount ?? 0
+      if (!Number.isFinite(amount) || amount <= 0) continue
+      next.set(name, (next.get(name) ?? 0) + amount)
+    }
+    upstreamGroupSpendToday.value = next
+    upstreamGroupSpendLoaded.value = true
+  } catch {
+    // 上游分组消耗是附加信息，失败时保留上次数据，不阻塞健康主流程。
+  }
+}
+
 onMounted(() => {
   void loadAll()
   void loadEvents()
   void loadPolicies()
   void loadSiteNames()
+  void loadGroupSpendToday()
+  void loadUpstreamGroupSpendToday()
 })
 
 const documentVisibility = useDocumentVisibility()
@@ -120,7 +176,12 @@ const autoRefresh = async () => {
   if (documentVisibility.value !== 'visible' || autoRefreshInFlight) return
   autoRefreshInFlight = true
   try {
-    await Promise.all([loadAll({ silent: true }), loadEvents(selectedConnectionId.value || undefined)])
+    await Promise.all([
+      loadAll({ silent: true }),
+      loadEvents(selectedConnectionId.value || undefined),
+      loadGroupSpendToday(),
+      loadUpstreamGroupSpendToday(),
+    ])
   } finally {
     autoRefreshInFlight = false
   }
@@ -132,7 +193,7 @@ watch(documentVisibility, (visibility) => {
 })
 
 const refresh = async () => {
-  await Promise.all([loadAll(), loadPolicies(), loadEvents()])
+  await Promise.all([loadAll(), loadPolicies(), loadEvents(), loadGroupSpendToday(), loadUpstreamGroupSpendToday()])
 }
 
 const siteName = (siteId: string): string => siteNameMap.value.get(siteId) ?? siteId
@@ -369,7 +430,10 @@ const handleDeletePolicy = async (policy: ConnectionHealthPolicy) => {
                   </span>
                   <span class="mt-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
                     <span>{{ t('admin.connectionHealth.groupList.monitored', { count: group.monitoredAccountCount ?? 0, total: group.accountCount }) }}</span>
-                    <span>{{ formatGroupMultiplier(group) }}</span>
+                    <span class="shrink-0 tabular-nums">{{ formatGroupMultiplier(group) }}</span>
+                  </span>
+                  <span class="mt-0.5 block truncate text-[11px] tabular-nums text-muted-foreground/90">
+                    {{ t('admin.connectionHealth.groupList.todaySpend', { amount: formatGroupTodaySpend(group) }) }}
                   </span>
                 </span>
               </button>
@@ -384,6 +448,9 @@ const handleDeletePolicy = async (policy: ConnectionHealthPolicy) => {
         <AdminGroupHealthDetail
           v-else
           :group="selectedGroup"
+          :today-spend="groupTodaySpend(selectedGroup)"
+          :upstream-group-spend-today="upstreamGroupSpendToday"
+          :upstream-group-spend-loaded="upstreamGroupSpendLoaded"
           @setup="openSetup"
           @probe="onProbeAccount"
           @view-events="onViewEventsAccount"

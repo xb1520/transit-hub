@@ -181,6 +181,49 @@ export interface GroupUsageTodayResponse {
 export const getGroupUsageToday = async (): Promise<GroupUsageTodayResponse> =>
   requestJson<GroupUsageTodayResponse>('/dashboard/group-usage-today')
 
+/** 自有分组的今日利润明细（「今日净利润 / 今日利润率」下钻）。 */
+export interface GroupProfitTodayItem {
+  groupName: string
+  revenue: number
+  cost: number
+  profit: number
+  /** 利润/营收，0~1 比例。 */
+  profitMargin: number
+  saleMultiplier?: number | null
+}
+
+/** 上游分组的今日利润明细（有消耗才返回）。 */
+export interface UpstreamGroupProfitTodayItem {
+  siteId: string
+  siteName: string
+  platform: string
+  groupName: string
+  cost: number
+  revenue: number
+  profit: number
+  profitMargin: number
+  saleMultiplier?: number | null
+  costMultiplier?: number | null
+  mappedOwnGroups?: string[]
+}
+
+/** 分组今日利润下钻响应（自有分组 + 上游分组）。 */
+export interface GroupProfitTodayResponse {
+  date: string
+  totalRevenue: number
+  totalCost: number
+  totalProfit: number
+  totalMargin: number
+  groups: GroupProfitTodayItem[]
+  upstreamGroups?: UpstreamGroupProfitTodayItem[]
+  /** 部分上游站点 key 用量采集失败时为 true。 */
+  upstreamPartial?: boolean
+}
+
+/** 获取今天有消耗的自有/上游分组利润与利润率。仅在弹窗打开时按需调用。 */
+export const getGroupProfitToday = async (): Promise<GroupProfitTodayResponse> =>
+  requestJson<GroupProfitTodayResponse>('/dashboard/group-profit-today')
+
 /** 单个 key 的今日消费明细（「今日成本」下钻）。TodayAmount 已乘以站点 rechargeRate，RawAmount 为上游平台原始金额。 */
 export interface UpstreamKeyUsageTodayItem {
   siteId: string

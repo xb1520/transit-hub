@@ -634,6 +634,40 @@ export default {
           asc: '金额从低到高'
         }
       },
+      groupProfit: {
+        titleProfit: '今日净利润分组明细',
+        titleMargin: '今日利润率分组明细',
+        subtitle: '自有 {ownCount} 组 · 上游 {upstreamCount} 组 · 净利润 {profit} · 利润率 {margin}',
+        hint: '今日营收合计 {revenue}。自有分组成本按 1x 归一化用量分摊；上游分组以 key 实际消耗为准，利润按售卖/成本倍率估算。',
+        upstreamHint: '仅展示今日有消耗的上游分组。有调价映射时按「售卖倍率 − 成本倍率」估算；否则回退全站利润率。',
+        upstreamPartial: '部分上游站点用量暂时无法读取，上游分组列表可能不完整。',
+        upstreamEmpty: '今日暂无上游分组消耗，或上游 key 用量暂不可用。',
+        mappedOwn: '映射自有分组：{groups}',
+        close: '关闭',
+        empty: '今日尚无分组消耗。',
+        loadError: '加载分组利润失败。',
+        retry: '重试',
+        sections: {
+          own: '我的分组',
+          ownCount: '{count} 个有营收',
+          upstream: '上游分组',
+          upstreamCount: '{count} 个有消耗'
+        },
+        columns: {
+          groupName: '分组名称',
+          upstreamGroup: '上游分组',
+          site: '上游站点',
+          revenue: '今日营收',
+          estRevenue: '估算营收',
+          cost: '成本',
+          profit: '利润',
+          margin: '利润率'
+        },
+        sort: {
+          desc: '利润从高到低',
+          asc: '利润从低到高'
+        }
+      },
       todayInbound: {
         title: '今日进货明细',
         subtitle: '合计 {total} · {date}',
@@ -1030,6 +1064,7 @@ export default {
         platform: '平台',
         type: '类型',
         multiplier: '倍率',
+        todaySpend: '今日消耗',
         accounts: '账号数',
         accountsUnit: '个',
         status: '分组状态',
@@ -1042,7 +1077,8 @@ export default {
         noProbe: '{count} 个待探活'
       },
       groupList: {
-        monitored: '已监控 {count}/{total}'
+        monitored: '已监控 {count}/{total}',
+        todaySpend: '今日 {amount}'
       },
       groupDetail: {
         multiplierPriority: '按倍率排序',
@@ -1061,7 +1097,8 @@ export default {
           accounts: '账号/渠道',
           monitored: '自动监控',
           probeable: '可手动探活',
-          lastProbe: '最近探活'
+          lastProbe: '最近探活',
+          todaySpend: '今日消耗'
         },
         statusBreakdown: {
           title: '当前分组探活状态',
@@ -1090,6 +1127,9 @@ export default {
           multiplier: '有效倍率',
           strategyMultiplier: '我的分组倍率',
           upstreamMultiplier: '上游 API Key 倍率',
+          upstreamSpend: '上游分组消耗',
+          upstreamSpendHint: '该账号关联的上游 API Key 所属分组今日成本（同分组多 key 合计）',
+          upstreamSpendFor: '上游分组「{group}」今日成本',
           actions: '操作'
         },
         upstreamMultiplierPending: '关联后展示倍率',
