@@ -144,6 +144,10 @@ export interface AdminGroupAccount {
   /** 上次写入上游的模型白名单（逗号分隔） */
   modelLimitsApplied?: string
   modelLimitsOriginal?: string
+  /** 该账号今日真实探活费用（CNY） */
+  todayProbeCostCny?: number
+  /** 该账号今日真实探活费用（上游平台 USD 口径） */
+  todayProbeCostUsd?: number
 }
 
 export interface AdminGroupHealth {
@@ -170,6 +174,10 @@ export interface AdminGroupHealth {
   // accountsError 非空（i18n key）表示该分组账号列表加载失败，其余分组不受影响。
   accountsError?: string
   accounts: AdminGroupAccount[]
+  /** 我的分组今日真实探活费用合计（CNY） */
+  todayProbeCostCny?: number
+  /** 我的分组今日真实探活费用合计（上游平台 USD 口径） */
+  todayProbeCostUsd?: number
 }
 
 export interface ConnectionHealthEvent {
@@ -249,14 +257,16 @@ export interface ConnectionHealthPolicy {
   strategyMode?: ConnectionHealthStrategyMode
   /** 每日真实探活请求次数上限（单位：次/天，中国自然日 UTC+8 重置）。 */
   dailyProbeBudget: number
-  /** 每日探活金额预算上限（USD）；0 表示不按金额限流，仍统计展示已消耗金额。 */
+  /** 每日探活金额预算上限（CNY）；0 表示不按金额限流，仍统计展示已消耗金额。 */
   dailyProbeBudgetCost?: number
-  /** 估算费率：USD / 千 tokens。无上游 usage 时按 max_tokens 估算。 */
+  /** @deprecated 已废弃：费用按上游真实倍率/响应 actual_cost 计算。 */
   probeCostPer1kTokens?: number
   /** 今日已消费的真实探活次数（与 dailyProbeBudget 同单位）。 */
   dailyProbeBudgetUsed?: number
-  /** 今日已累计估算探活费用（USD）。 */
+  /** 今日已累计真实探活费用（CNY）。 */
   dailyProbeBudgetCostUsed?: number
+  /** 今日已累计真实探活费用（上游平台 USD 口径）。 */
+  dailyProbeBudgetCostUsedUsd?: number
   createdAt: string
   updatedAt: string
   modelTargets: ConnectionHealthModelTarget[]
@@ -314,6 +324,7 @@ export interface PolicyInput {
   strategyMode?: ConnectionHealthStrategyMode
   dailyProbeBudget?: number
   dailyProbeBudgetCost?: number
+  /** @deprecated 已废弃，后端忽略。 */
   probeCostPer1kTokens?: number
   modelTargets: ModelTargetInput[]
 }

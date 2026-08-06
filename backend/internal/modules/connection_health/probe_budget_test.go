@@ -51,26 +51,45 @@ func TestProbeOnce_StopsRealProbingAfterDailyBudgetExhausted(t *testing.T) {
 	}
 }
 
-func TestEstimateProbeCost_UsesUsageTokens(t *testing.T) {
-	cost := estimateProbeCost(ProbeOutcome{TotalTokens: 500}, 1, 0.002)
-	// 500/1000 * 0.002 = 0.001
-	if cost < 0.00099 || cost > 0.00101 {
-		t.Fatalf("cost = %v, want ~0.001", cost)
+func TestComputeProbeCost_UsesUsageTokensAndGroupRatio(t *testing.T) {
+	// 500 tokens / 500000 * 1.3 group = 0.0013 USD；recharge 7 → 0.0091 CNY
+	cost := computeProbeCost(ProbeOutcome{TotalTokens: 500}, 1, 1.3, 7)
+	if cost.USD < 0.00129 || cost.USD > 0.00131 {
+		t.Fatalf("usd = %v, want ~0.0013", cost.USD)
+	}
+	if cost.CNY < 0.0090 || cost.CNY > 0.0092 {
+		t.Fatalf("cny = %v, want ~0.0091", cost.CNY)
 	}
 }
 
-func TestEstimateProbeCost_FallsBackToMaxTokens(t *testing.T) {
-	cost := estimateProbeCost(ProbeOutcome{}, 4, 0.002)
-	// tokens = 4+16 = 20 → 20/1000 * 0.002 = 0.00004
-	if cost < 0.000039 || cost > 0.000041 {
-		t.Fatalf("cost = %v, want ~0.00004", cost)
+func TestComputeProbeCost_PrefersActualCost(t *testing.T) {
+	cost := computeProbeCost(ProbeOutcome{TotalTokens: 500, ActualCostUSD: 0.05}, 1, 2, 7)
+	if cost.USD < 0.049 || cost.USD > 0.051 {
+		t.Fatalf("usd = %v, want actual 0.05", cost.USD)
+	}
+	if cost.CNY < 0.34 || cost.CNY > 0.36 {
+		t.Fatalf("cny = %v, want ~0.35", cost.CNY)
+	}
+}
+
+func TestComputeProbeCost_FallsBackToMaxTokens(t *testing.T) {
+	// tokens = 4+16 = 20 → 20/500000 * 1 = 0.00004 USD
+	cost := computeProbeCost(ProbeOutcome{}, 4, 1, 1)
+	if cost.USD < 0.000039 || cost.USD > 0.000041 {
+		t.Fatalf("usd = %v, want ~0.00004", cost.USD)
+	}
+	if cost.CNY != cost.USD {
+		t.Fatalf("cny = %v, want equal usd when rate=1", cost.CNY)
 	}
 }
 
 func TestParseProbeUsageTokens(t *testing.T) {
-	body := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
-	p, c, total := parseProbeUsageTokens(body)
+	body := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"actual_cost":0.012}}`)
+	p, c, total, actual := parseProbeUsage(body)
 	if p != 10 || c != 2 || total != 12 {
 		t.Fatalf("got prompt=%d completion=%d total=%d", p, c, total)
+	}
+	if actual < 0.011 || actual > 0.013 {
+		t.Fatalf("actual cost = %v, want ~0.012", actual)
 	}
 }

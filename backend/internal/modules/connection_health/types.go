@@ -189,15 +189,18 @@ type Policy struct {
 	// DailyProbeBudget 是该策略每天允许的真实探活请求次数上限（单位：次/天，按中国自然日 UTC+8 重置）。
 	// 每发起一次真实模型探活消费 1。默认 1000。
 	DailyProbeBudget int `json:"dailyProbeBudget"`
-	// DailyProbeBudgetCost 是每日探活金额预算上限（USD/成本口径）。0 表示不按金额限流，仍统计展示已消耗金额。
+	// DailyProbeBudgetCost 是每日探活金额预算上限（CNY）。0 表示不按金额限流，仍统计展示已消耗金额。
+	// 使用 CNY 是因为各上游站点 USD 口径可能不一致，充值倍率不同。
 	DailyProbeBudgetCost float64 `json:"dailyProbeBudgetCost"`
-	// ProbeCostPer1kTokens 用于估算单次探活费用：cost ≈ tokens/1000 × 本值。默认 0.002。
-	// 优先用上游返回的 usage tokens；无 usage 时按 max_tokens + 预估 prompt 估算。
-	ProbeCostPer1kTokens float64 `json:"probeCostPer1kTokens"`
+	// ProbeCostPer1kTokens 已废弃：费用改为按上游真实倍率/响应 actual_cost 计算，不再使用可配置估算费率。
+	// 字段保留仅为兼容旧客户端 JSON 与数据库列，读写时忽略。
+	ProbeCostPer1kTokens float64 `json:"probeCostPer1kTokens,omitempty"`
 	// DailyProbeBudgetUsed 不是数据库列：查询时装载的「今日已消费探活次数」。
 	DailyProbeBudgetUsed int `json:"dailyProbeBudgetUsed"`
-	// DailyProbeBudgetCostUsed 不是数据库列：今日已累计估算探活费用（USD）。
+	// DailyProbeBudgetCostUsed 不是数据库列：今日已累计真实探活费用（CNY）。
 	DailyProbeBudgetCostUsed float64 `json:"dailyProbeBudgetCostUsed"`
+	// DailyProbeBudgetCostUsedUsd 不是数据库列：今日已累计真实探活费用（上游平台 USD 口径）。
+	DailyProbeBudgetCostUsedUsd float64 `json:"dailyProbeBudgetCostUsedUsd"`
 	CreatedAt                time.Time `json:"createdAt"`
 	UpdatedAt                time.Time `json:"updatedAt"`
 	// ModelTargets 不是数据库列，是查询时一并装载的关联目标（connection_health_model_targets）。
@@ -266,7 +269,10 @@ type ConnectionHealthEvent struct {
 	ErrorKey          string
 	ErrorDetail       string
 	RemoteAction      string
-	CreatedAt         time.Time
+	// CostUSD / CostCNY 是该次真实探活的记账费用；非探活事件为 0。
+	CostUSD   float64
+	CostCNY   float64
+	CreatedAt time.Time
 }
 
 // ProbeOutcome 是一次真实探活的结果，供状态机和事件记录消费。
@@ -274,12 +280,21 @@ type ProbeOutcome struct {
 	Result    ResultKey
 	LatencyMs int
 	Detail    string
-	// 上游 usage（若响应带 usage 字段）；用于探活费用估算。
+	// 上游 usage（若响应带 usage 字段）；用于真实探活费用计算。
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
-	// EstimatedCost 是本次探活估算费用（USD），由 runner/调用方按策略费率写入。
-	EstimatedCost float64
+	// ActualCostUSD 是上游响应中的真实费用（平台 USD 口径）。>0 时优先于 tokens×倍率推算。
+	ActualCostUSD float64
+	// CostUSD / CostCNY 是本次探活最终记账费用（调用方按上游倍率写入）。
+	CostUSD float64
+	CostCNY float64
+}
+
+// ProbeCost 是单次探活的双币种真实费用。
+type ProbeCost struct {
+	USD float64
+	CNY float64
 }
 
 // MySitesReader 是 connection_health 对 my_sites 模块的全部只读依赖，

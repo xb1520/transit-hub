@@ -100,8 +100,9 @@ type GroupUsageTodayItem struct {
 
 // GroupProfitTodayResponse 是 GET /api/dashboard/group-profit-today 返回的
 // 「今日净利润 / 今日利润率」下钻：今天有消耗的自有分组与上游分组利润/利润率。
-// 自有分组成本按「1x 归一化用量」分摊今日总成本，使各分组合计与仪表盘净利口径一致。
+// 自有分组成本 = 调价映射关联的上游 key 实耗之和（与分组健康「上游分组消耗」同源）；
 // 上游分组以 key 今日实际成本为准，营收按售卖/成本倍率估算（与调价映射预算毛利率同公式）。
+// TotalCost 优先为 key 用量合计；key 不可用时回退站点 TodayConsume × 充值倍率。
 type GroupProfitTodayResponse struct {
 	Date         string                 `json:"date"`
 	TotalRevenue float64                `json:"totalRevenue"`
@@ -109,7 +110,7 @@ type GroupProfitTodayResponse struct {
 	TotalProfit  float64                `json:"totalProfit"`
 	// TotalMargin 为 totalProfit / totalRevenue；无营收时为 0。
 	TotalMargin float64 `json:"totalMargin"`
-	// Groups 自有（admin）分组，仅 revenue > 0。
+	// Groups 自有（admin）分组：revenue > 0 或关联上游成本 > 0。
 	Groups []GroupProfitTodayItem `json:"groups"`
 	// UpstreamGroups 已接入且今日有消耗的上游分组。
 	UpstreamGroups []UpstreamGroupProfitTodayItem `json:"upstreamGroups"`
@@ -117,8 +118,8 @@ type GroupProfitTodayResponse struct {
 	UpstreamPartial bool `json:"upstreamPartial,omitempty"`
 }
 
-// GroupProfitTodayItem 是单个有今日营收的自有分组利润明细。
-// ProfitMargin 为利润/营收（0~1 比例，前端再格式化为百分比）。
+// GroupProfitTodayItem 是单个自有分组利润明细。
+// Cost 为关联上游 key 实耗之和；ProfitMargin 为利润/营收（0~1，无营收时为 0）。
 type GroupProfitTodayItem struct {
 	GroupName      string   `json:"groupName"`
 	Revenue        float64  `json:"revenue"`

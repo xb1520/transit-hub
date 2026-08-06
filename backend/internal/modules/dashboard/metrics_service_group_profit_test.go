@@ -8,104 +8,152 @@ import (
 	"transithub/backend/internal/modules/upstream"
 )
 
-// TestGroupProfitToday_VolumeBasedAllocation 验证：
-// 1) 只返回 revenue > 0 的分组
-// 2) 成本按 1x 归一化用量分摊
-// 3) 各分组 profit 之和 = totalRevenue - totalCost
-// 4) 高倍率分组利润率更高（同等营收下承担更少成本）
-func TestGroupProfitToday_VolumeBasedAllocation(t *testing.T) {
+// TestGroupProfitToday_OwnCostFromMappedUpstreamKeys 验证：
+// 1) 自有分组成本 = 调价映射关联的上游 key 实耗之和（不再 1x 归一化分摊）
+// 2) 只返回 revenue > 0 或 cost > 0 的分组
+// 3) 利润 = 营收 − 关联上游成本
+func TestGroupProfitToday_OwnCostFromMappedUpstreamKeys(t *testing.T) {
 	store := newFakeSessionStore()
 	store.set("user-1", "account-1", AdminSession{Session: authenticatedSession()})
 	accounts := &fakeAdminAccounts{current: map[string]string{"user-1": "account-1"}}
 
 	multA := 2.0
 	multB := 1.0
+	multC := 0.72
 	platform := &fakePlatformClient{
 		groups: []upstream.GroupInfo{
 			{Name: "vip", Multiplier: &multA},
 			{Name: "default", Multiplier: &multB},
-			{Name: "idle", Multiplier: &multB},
+			{Name: "Claude Max 混合", Multiplier: &multC},
 		},
 		dailyStats: []upstream.GroupDailyStat{
 			{GroupName: "vip", TodayActualCost: 100},
 			{GroupName: "default", TodayActualCost: 100},
-			{GroupName: "idle", TodayActualCost: 0},
+			{GroupName: "Claude Max 混合", TodayActualCost: 7.19},
 		},
 	}
 
-	consume := 60.0
 	upstreams := &fakeUpstreamLister{
 		listItems: []upstream.Response{
+			{ID: "site-a", Name: "Upstream A", RechargeRate: 2},
+		},
+		keyUsageItems: []upstream.KeyUsageTodayItem{
+			// vip 关联 cheap：成本 40
 			{
-				RechargeRate: 2,
-				Metrics: upstream.Metrics{
-					TodayConsume: upstream.MetricValue{Value: &consume},
-				},
+				SiteID: "site-a", SiteName: "Upstream A", Platform: upstream.PlatformSub2API,
+				KeyID: "k1", GroupName: "cheap", TodayAmount: 40, RechargeRate: 2,
+			},
+			// default 关联 mid：成本 80
+			{
+				SiteID: "site-a", SiteName: "Upstream A", Platform: upstream.PlatformSub2API,
+				KeyID: "k2", GroupName: "mid", TodayAmount: 80, RechargeRate: 2,
+			},
+			// Claude Max 关联 Claude Code 特价：成本 6.74（与分组健康上游列对齐）
+			{
+				SiteID: "site-a", SiteName: "Upstream A", Platform: upstream.PlatformSub2API,
+				KeyID: "k3", GroupName: "Claude Code 特价", TodayAmount: 6.74, RechargeRate: 2,
 			},
 		},
 	}
 
 	service := NewMetricsService(store, platform, upstreams, nil, accounts)
+	service.SetPricingMappingSource(&fakePricingMappings{
+		links: []PricingTargetLink{
+			{OwnGroup: "vip", SiteID: "site-a", GroupName: "cheap"},
+			{OwnGroup: "default", SiteID: "site-a", GroupName: "mid"},
+			{OwnGroup: "Claude Max 混合", SiteID: "site-a", GroupName: "Claude Code 特价"},
+		},
+	})
+
 	resp, err := service.GroupProfitToday(context.Background(), "user-1")
 	if err != nil {
 		t.Fatalf("GroupProfitToday failed: %v", err)
 	}
 
-	if len(resp.Groups) != 2 {
-		t.Fatalf("expected 2 groups with revenue, got %d: %+v", len(resp.Groups), resp.Groups)
+	if len(resp.Groups) != 3 {
+		t.Fatalf("expected 3 groups, got %d: %+v", len(resp.Groups), resp.Groups)
 	}
-	if resp.TotalRevenue != 200 {
-		t.Fatalf("totalRevenue = %v, want 200", resp.TotalRevenue)
+	// totalCost = key 合计 40+80+6.74
+	if math.Abs(resp.TotalCost-126.74) > 1e-9 {
+		t.Fatalf("totalCost = %v, want 126.74", resp.TotalCost)
 	}
-	// totalCost = 60 * 2 = 120
-	if resp.TotalCost != 120 {
-		t.Fatalf("totalCost = %v, want 120", resp.TotalCost)
-	}
-	if resp.TotalProfit != 80 {
-		t.Fatalf("totalProfit = %v, want 80", resp.TotalProfit)
+	if math.Abs(resp.TotalRevenue-207.19) > 1e-9 {
+		t.Fatalf("totalRevenue = %v, want 207.19", resp.TotalRevenue)
 	}
 
 	byName := map[string]GroupProfitTodayItem{}
-	var sumProfit, sumCost float64
 	for _, g := range resp.Groups {
 		byName[g.GroupName] = g
-		sumProfit += g.Profit
-		sumCost += g.Cost
-	}
-	if math.Abs(sumProfit-resp.TotalProfit) > 1e-9 {
-		t.Fatalf("sum(profit)=%v totalProfit=%v", sumProfit, resp.TotalProfit)
-	}
-	if math.Abs(sumCost-resp.TotalCost) > 1e-9 {
-		t.Fatalf("sum(cost)=%v totalCost=%v", sumCost, resp.TotalCost)
 	}
 
-	// volume vip=100/2=50, default=100/1=100, totalV=150
-	// cost vip=120*50/150=40, default=120*100/150=80
 	vip := byName["vip"]
-	def := byName["default"]
 	if math.Abs(vip.Cost-40) > 1e-9 {
-		t.Fatalf("vip.cost = %v, want 40", vip.Cost)
-	}
-	if math.Abs(def.Cost-80) > 1e-9 {
-		t.Fatalf("default.cost = %v, want 80", def.Cost)
+		t.Fatalf("vip.cost = %v, want 40 (mapped upstream key sum)", vip.Cost)
 	}
 	if math.Abs(vip.Profit-60) > 1e-9 {
 		t.Fatalf("vip.profit = %v, want 60", vip.Profit)
 	}
+
+	def := byName["default"]
+	if math.Abs(def.Cost-80) > 1e-9 {
+		t.Fatalf("default.cost = %v, want 80", def.Cost)
+	}
 	if math.Abs(def.Profit-20) > 1e-9 {
 		t.Fatalf("default.profit = %v, want 20", def.Profit)
 	}
-	// vip margin 0.6 > default margin 0.2
-	if vip.ProfitMargin <= def.ProfitMargin {
-		t.Fatalf("expected vip margin > default margin, got vip=%v default=%v", vip.ProfitMargin, def.ProfitMargin)
+
+	claude := byName["Claude Max 混合"]
+	if math.Abs(claude.Cost-6.74) > 1e-9 {
+		t.Fatalf("Claude Max cost = %v, want 6.74", claude.Cost)
 	}
-	// Sorted by profit desc: vip first
-	if resp.Groups[0].GroupName != "vip" {
-		t.Fatalf("expected vip first by profit, got %q", resp.Groups[0].GroupName)
+	if math.Abs(claude.Profit-(7.19-6.74)) > 1e-9 {
+		t.Fatalf("Claude Max profit = %v, want 0.45", claude.Profit)
 	}
 }
 
-// TestGroupProfitToday_ZeroRevenueEmpty 验证今日无营收时返回空列表且合计为 0。
+// TestGroupProfitToday_SplitCostWhenUpstreamMapsToMultipleOwn 一上游映射多自有时均分成本。
+func TestGroupProfitToday_SplitCostWhenUpstreamMapsToMultipleOwn(t *testing.T) {
+	store := newFakeSessionStore()
+	store.set("user-1", "account-1", AdminSession{Session: authenticatedSession()})
+	accounts := &fakeAdminAccounts{current: map[string]string{"user-1": "account-1"}}
+	m := 1.0
+	platform := &fakePlatformClient{
+		groups: []upstream.GroupInfo{
+			{Name: "a", Multiplier: &m},
+			{Name: "b", Multiplier: &m},
+		},
+		dailyStats: []upstream.GroupDailyStat{
+			{GroupName: "a", TodayActualCost: 50},
+			{GroupName: "b", TodayActualCost: 50},
+		},
+	}
+	upstreams := &fakeUpstreamLister{
+		listItems: []upstream.Response{{ID: "site-a", Name: "A", RechargeRate: 1}},
+		keyUsageItems: []upstream.KeyUsageTodayItem{
+			{SiteID: "site-a", SiteName: "A", KeyID: "k1", GroupName: "shared", TodayAmount: 100, RechargeRate: 1},
+		},
+	}
+	service := NewMetricsService(store, platform, upstreams, nil, accounts)
+	service.SetPricingMappingSource(&fakePricingMappings{
+		links: []PricingTargetLink{
+			{OwnGroup: "a", SiteID: "site-a", GroupName: "shared"},
+			{OwnGroup: "b", SiteID: "site-a", GroupName: "shared"},
+		},
+	})
+	resp, err := service.GroupProfitToday(context.Background(), "user-1")
+	if err != nil {
+		t.Fatalf("GroupProfitToday failed: %v", err)
+	}
+	byName := map[string]GroupProfitTodayItem{}
+	for _, g := range resp.Groups {
+		byName[g.GroupName] = g
+	}
+	if math.Abs(byName["a"].Cost-50) > 1e-9 || math.Abs(byName["b"].Cost-50) > 1e-9 {
+		t.Fatalf("expected 50/50 split, got a=%v b=%v", byName["a"].Cost, byName["b"].Cost)
+	}
+}
+
+// TestGroupProfitToday_ZeroRevenueEmpty 验证今日无营收且无上游成本时返回空列表。
 func TestGroupProfitToday_ZeroRevenueEmpty(t *testing.T) {
 	store := newFakeSessionStore()
 	store.set("user-1", "account-1", AdminSession{Session: authenticatedSession()})
@@ -153,7 +201,6 @@ func TestGroupProfitToday_UpstreamGroupsFromKeyUsage(t *testing.T) {
 	}
 
 	upstreamGroupMult := 0.5
-	consume := 40.0
 	upstreams := &fakeUpstreamLister{
 		listItems: []upstream.Response{
 			{
@@ -161,7 +208,6 @@ func TestGroupProfitToday_UpstreamGroupsFromKeyUsage(t *testing.T) {
 				Name:         "Upstream A",
 				RechargeRate: 2,
 				Metrics: upstream.Metrics{
-					TodayConsume: upstream.MetricValue{Value: &consume},
 					Groups: []upstream.GroupInfo{
 						{Name: "cheap", Multiplier: &upstreamGroupMult},
 					},
@@ -233,5 +279,9 @@ func TestGroupProfitToday_UpstreamGroupsFromKeyUsage(t *testing.T) {
 	}
 	if len(u.MappedOwnGroups) != 1 || u.MappedOwnGroups[0] != "vip" {
 		t.Fatalf("mapped own groups = %v, want [vip]", u.MappedOwnGroups)
+	}
+	// 自有 vip 成本应等于关联上游 cheap 的 60
+	if len(resp.Groups) != 1 || math.Abs(resp.Groups[0].Cost-60) > 1e-9 {
+		t.Fatalf("own vip cost = %+v, want cost 60", resp.Groups)
 	}
 }

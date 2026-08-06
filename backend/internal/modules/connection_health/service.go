@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"transithub/backend/internal/modules/my_sites"
+	"transithub/backend/internal/modules/upstream"
 )
 
 // healthRepository 是 Service 对存储层的全部依赖，由 *Repository 结构性满足。
@@ -28,7 +29,8 @@ type healthRepository interface {
 	CountProbesToday(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time) (int, error)
 	GetProbeBudgetUsage(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time) (ProbeBudgetUsage, error)
 	TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int, costLimit float64) (bool, error)
-	AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, cost float64) error
+	AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, costCNY float64, costUSD float64) error
+	SumProbeCostTodayByConnection(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) (map[string]ProbeCostByTarget, error)
 	TryAcquireSchedulerLease(ctx context.Context) (release func(), acquired bool, err error)
 	AcquireTargetLease(ctx context.Context, targetID string) (release func(), err error)
 	ListEnabledPolicies(ctx context.Context) ([]Policy, error)
@@ -659,10 +661,11 @@ type PolicyInput struct {
 	AutoRemoteActionEnabled bool               `json:"autoRemoteActionEnabled"`
 	PriorityMode            string             `json:"priorityMode"`
 	StrategyMode            string             `json:"strategyMode"`
-	DailyProbeBudget        int                `json:"dailyProbeBudget"`
-	DailyProbeBudgetCost    float64            `json:"dailyProbeBudgetCost"`
-	ProbeCostPer1kTokens    float64            `json:"probeCostPer1kTokens"`
-	ModelTargets            []ModelTargetInput `json:"modelTargets"`
+	DailyProbeBudget     int                `json:"dailyProbeBudget"`
+	DailyProbeBudgetCost float64            `json:"dailyProbeBudgetCost"`
+	// ProbeCostPer1kTokens 已废弃，忽略。
+	ProbeCostPer1kTokens float64            `json:"probeCostPer1kTokens,omitempty"`
+	ModelTargets         []ModelTargetInput `json:"modelTargets"`
 }
 
 func (s *Service) ListPolicies(ctx context.Context, userID string) ([]Policy, error) {
@@ -678,7 +681,7 @@ func (s *Service) ListPolicies(ctx context.Context, userID string) ([]Policy, er
 	return policies, nil
 }
 
-// attachPolicyBudgetUsage 为策略列表/详情附上今日已消费次数与估算金额，便于管理端展示已用预算。
+// attachPolicyBudgetUsage 为策略列表/详情附上今日已消费次数与真实金额（CNY/USD），便于管理端展示已用预算。
 // 查询失败时记日志并保持 0，避免因预算查询失败导致策略列表整体不可用。
 func (s *Service) attachPolicyBudgetUsage(ctx context.Context, userID string, adminAccountID string, policies []Policy) {
 	if len(policies) == 0 {
@@ -694,6 +697,7 @@ func (s *Service) attachPolicyBudgetUsage(ctx context.Context, userID string, ad
 		}
 		policies[i].DailyProbeBudgetUsed = usage.Used
 		policies[i].DailyProbeBudgetCostUsed = usage.UsedCost
+		policies[i].DailyProbeBudgetCostUsedUsd = usage.UsedCostUSD
 	}
 }
 
@@ -709,6 +713,7 @@ func (s *Service) attachSinglePolicyBudgetUsage(ctx context.Context, policy *Pol
 	}
 	policy.DailyProbeBudgetUsed = usage.Used
 	policy.DailyProbeBudgetCostUsed = usage.UsedCost
+	policy.DailyProbeBudgetCostUsedUsd = usage.UsedCostUSD
 }
 
 // SavePolicy 创建或更新一条策略（含 model targets 整体替换）。id 为空时创建新策略。
@@ -789,7 +794,8 @@ func buildPolicyAndTargets(userID string, adminAccountID string, id string, in P
 		StrategyMode:         strategyMode,
 		DailyProbeBudget:     defaultInt(in.DailyProbeBudget, 1000),
 		DailyProbeBudgetCost: maxFloat64(0, in.DailyProbeBudgetCost),
-		ProbeCostPer1kTokens: defaultProbeCostPer1k(in.ProbeCostPer1kTokens),
+		// 估算费率已废弃；列保留兼容，固定写默认值避免旧库非空约束问题。
+		ProbeCostPer1kTokens: defaultProbeCostPer1k(0),
 	}
 	if strategyMode == StrategyModeMultiplierOnly {
 		// 仅倍率策略不拥有任何探活行为。即使错误或旧客户端同时提交了探活字段，也在服务端
@@ -953,7 +959,7 @@ func (s *Service) DisableConnection(ctx context.Context, userID string, connecti
 		if err := s.repo.UpsertState(ctx, st); err != nil {
 			return err
 		}
-		s.recordEvent(ctx, *conn, "", st.ModelName, "manual_disable", string(fromState), string(StateDisabled), nil, "", "", remoteAction)
+		s.recordEvent(ctx, *conn, "", st.ModelName, "manual_disable", string(fromState), string(StateDisabled), nil, "", "", remoteAction, 0, 0)
 	}
 	return nil
 }
@@ -1001,7 +1007,7 @@ func (s *Service) RestoreConnection(ctx context.Context, userID string, connecti
 		if err := s.repo.UpsertState(ctx, st); err != nil {
 			return err
 		}
-		s.recordEvent(ctx, *conn, "", st.ModelName, "manual_restore", string(fromState), string(StateObserving), nil, "", "", remoteAction)
+		s.recordEvent(ctx, *conn, "", st.ModelName, "manual_restore", string(fromState), string(StateObserving), nil, "", "", remoteAction, 0, 0)
 	}
 	return nil
 }
@@ -1037,8 +1043,11 @@ func (s *Service) probeOnce(ctx context.Context, conn my_sites.RealConnection, p
 		BaseURL: site.BaseURL, UpstreamKey: conn.UpstreamKey, ProviderFamily: target.ProviderFamily,
 		ModelName: target.ModelName, MaxTokens: target.MaxProbeTokens, ProbePrompt: target.ProbePrompt,
 	})
-	outcome.EstimatedCost = estimateProbeCost(outcome, target.MaxProbeTokens, policy.ProbeCostPer1kTokens)
-	if addErr := s.repo.AddProbeBudgetCost(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart, outcome.EstimatedCost); addErr != nil {
+	groupRatio, rechargeRate := s.connectionProbeCostRates(ctx, conn, site)
+	cost := computeProbeCost(outcome, target.MaxProbeTokens, groupRatio, rechargeRate)
+	outcome.CostUSD = cost.USD
+	outcome.CostCNY = cost.CNY
+	if addErr := s.repo.AddProbeBudgetCost(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart, cost.CNY, cost.USD); addErr != nil {
 		log.Printf("[connection-health] add probe budget cost failed policy_id=%s err=%v", policy.ID, addErr)
 	}
 
@@ -1102,7 +1111,7 @@ func (s *Service) probeOnce(ctx context.Context, conn my_sites.RealConnection, p
 	if err := s.repo.UpsertState(ctx, next); err != nil {
 		return nil, err
 	}
-	s.recordEvent(ctx, conn, policy.ID, target.ModelName, string(outcome.Result), string(current.State), string(next.State), &latencyMs, next.LastErrorKey, next.LastErrorDetail, remoteAction)
+	s.recordEvent(ctx, conn, policy.ID, target.ModelName, string(outcome.Result), string(current.State), string(next.State), &latencyMs, next.LastErrorKey, next.LastErrorDetail, remoteAction, outcome.CostUSD, outcome.CostCNY)
 
 	return &next, nil
 }
@@ -1128,7 +1137,7 @@ func (s *Service) defaultState(conn my_sites.RealConnection, modelName string) C
 	}
 }
 
-func (s *Service) recordEvent(ctx context.Context, conn my_sites.RealConnection, policyID string, modelName string, result string, fromState string, toState string, latencyMs *int, errorKey string, errorDetail string, remoteAction string) {
+func (s *Service) recordEvent(ctx context.Context, conn my_sites.RealConnection, policyID string, modelName string, result string, fromState string, toState string, latencyMs *int, errorKey string, errorDetail string, remoteAction string, costUSD float64, costCNY float64) {
 	id, err := newID()
 	if err != nil {
 		log.Printf("[connection-health] generate event id failed: %v", err)
@@ -1138,10 +1147,37 @@ func (s *Service) recordEvent(ctx context.Context, conn my_sites.RealConnection,
 		ID: id, ConnectionID: conn.ID, ModelName: modelName, UserID: conn.UserID, AdminAccountID: conn.WorkspaceAdminAccountID, PolicyID: policyID,
 		UpstreamSiteID: conn.UpstreamSiteID, UpstreamGroupName: conn.UpstreamGroupName, Result: result,
 		FromState: fromState, ToState: toState, LatencyMs: latencyMs, ErrorKey: errorKey, ErrorDetail: errorDetail, RemoteAction: remoteAction,
+		CostUSD: costUSD, CostCNY: costCNY,
 	}
 	if err := s.repo.InsertEvent(ctx, event); err != nil {
 		log.Printf("[connection-health] insert event failed connection_id=%s err=%v", conn.ID, err)
 	}
+}
+
+// connectionProbeCostRates 从对接链路解析上游分组倍率与站点充值倍率，供真实探活费用记账。
+func (s *Service) connectionProbeCostRates(_ context.Context, conn my_sites.RealConnection, site *upstream.Site) (groupRatio float64, rechargeRate float64) {
+	groupRatio = 1
+	rechargeRate = 1
+	if site != nil && site.RechargeRate > 0 {
+		rechargeRate = site.RechargeRate
+	}
+	if site == nil {
+		return groupRatio, rechargeRate
+	}
+	groupID := strings.TrimSpace(conn.UpstreamGroupID)
+	groupName := strings.TrimSpace(conn.UpstreamGroupName)
+	for _, group := range site.Metrics.Groups {
+		if group.Multiplier == nil || *group.Multiplier <= 0 {
+			continue
+		}
+		if groupID != "" && strings.TrimSpace(group.ID) == groupID {
+			return *group.Multiplier, rechargeRate
+		}
+		if groupID == "" && groupName != "" && strings.EqualFold(strings.TrimSpace(group.Name), groupName) {
+			return *group.Multiplier, rechargeRate
+		}
+	}
+	return groupRatio, rechargeRate
 }
 
 type policyModelTarget struct {

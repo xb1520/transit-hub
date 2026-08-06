@@ -137,12 +137,13 @@ func classifyTransportError(err error) ResultKey {
 // classifyHTTPResponse 按状态码和响应体归类为 7 种错误分类之一，或 ok。
 func classifyHTTPResponse(status int, body []byte, upstreamKey string, latencyMs int) ProbeOutcome {
 	detail := redact(truncate(string(body), 500), upstreamKey)
-	promptTokens, completionTokens, totalTokens := parseProbeUsageTokens(body)
+	promptTokens, completionTokens, totalTokens, actualCostUSD := parseProbeUsage(body)
 
 	withUsage := func(result ResultKey, detailText string) ProbeOutcome {
 		return ProbeOutcome{
 			Result: result, LatencyMs: latencyMs, Detail: detailText,
 			PromptTokens: promptTokens, CompletionTokens: completionTokens, TotalTokens: totalTokens,
+			ActualCostUSD: actualCostUSD,
 		}
 	}
 
@@ -177,15 +178,16 @@ func classifyHTTPResponse(status int, body []byte, upstreamKey string, latencyMs
 	}
 }
 
-// parseProbeUsageTokens 从 OpenAI 兼容 chat/completions 响应中解析 usage。
+// parseProbeUsage 从 OpenAI 兼容 chat/completions 响应中解析 usage tokens 与真实费用。
 // 兼容 usage.total_tokens / prompt_tokens / completion_tokens，以及部分网关的 camelCase。
-func parseProbeUsageTokens(body []byte) (prompt, completion, total int) {
+// actualCostUSD 优先读 usage 内 actual_cost/total_cost/cost，其次顶层同名字段。
+func parseProbeUsage(body []byte) (prompt, completion, total int, actualCostUSD float64) {
 	if len(body) == 0 || !json.Valid(body) {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	usage, _ := payload["usage"].(map[string]any)
 	if usage == nil {
@@ -193,31 +195,84 @@ func parseProbeUsageTokens(body []byte) (prompt, completion, total int) {
 			usage, _ = data["usage"].(map[string]any)
 		}
 	}
-	if usage == nil {
-		return 0, 0, 0
+	if usage != nil {
+		prompt = jsonNumberAsInt(usage["prompt_tokens"])
+		if prompt == 0 {
+			prompt = jsonNumberAsInt(usage["promptTokens"])
+		}
+		if prompt == 0 {
+			prompt = jsonNumberAsInt(usage["input_tokens"])
+		}
+		completion = jsonNumberAsInt(usage["completion_tokens"])
+		if completion == 0 {
+			completion = jsonNumberAsInt(usage["completionTokens"])
+		}
+		if completion == 0 {
+			completion = jsonNumberAsInt(usage["output_tokens"])
+		}
+		total = jsonNumberAsInt(usage["total_tokens"])
+		if total == 0 {
+			total = jsonNumberAsInt(usage["totalTokens"])
+		}
+		if total == 0 {
+			total = prompt + completion
+		}
+		actualCostUSD = jsonNumberAsFloat(usage["actual_cost"])
+		if actualCostUSD <= 0 {
+			actualCostUSD = jsonNumberAsFloat(usage["actualCost"])
+		}
+		if actualCostUSD <= 0 {
+			actualCostUSD = jsonNumberAsFloat(usage["total_cost"])
+		}
+		if actualCostUSD <= 0 {
+			actualCostUSD = jsonNumberAsFloat(usage["totalCost"])
+		}
+		if actualCostUSD <= 0 {
+			actualCostUSD = jsonNumberAsFloat(usage["cost"])
+		}
 	}
-	prompt = jsonNumberAsInt(usage["prompt_tokens"])
-	if prompt == 0 {
-		prompt = jsonNumberAsInt(usage["promptTokens"])
+	if actualCostUSD <= 0 {
+		actualCostUSD = jsonNumberAsFloat(payload["actual_cost"])
 	}
-	if prompt == 0 {
-		prompt = jsonNumberAsInt(usage["input_tokens"])
+	if actualCostUSD <= 0 {
+		actualCostUSD = jsonNumberAsFloat(payload["total_cost"])
 	}
-	completion = jsonNumberAsInt(usage["completion_tokens"])
-	if completion == 0 {
-		completion = jsonNumberAsInt(usage["completionTokens"])
+	if actualCostUSD <= 0 {
+		actualCostUSD = jsonNumberAsFloat(payload["cost"])
 	}
-	if completion == 0 {
-		completion = jsonNumberAsInt(usage["output_tokens"])
+	return prompt, completion, total, actualCostUSD
+}
+
+// parseProbeUsageTokens 保留给旧测试与兼容调用。
+func parseProbeUsageTokens(body []byte) (prompt, completion, total int) {
+	p, c, t, _ := parseProbeUsage(body)
+	return p, c, t
+}
+
+func jsonNumberAsFloat(value any) float64 {
+	switch v := value.(type) {
+	case float64:
+		if v > 0 {
+			return v
+		}
+	case float32:
+		if v > 0 {
+			return float64(v)
+		}
+	case int:
+		if v > 0 {
+			return float64(v)
+		}
+	case int64:
+		if v > 0 {
+			return float64(v)
+		}
+	case json.Number:
+		if n, err := v.Float64(); err == nil && n > 0 {
+			return n
+		}
 	}
-	total = jsonNumberAsInt(usage["total_tokens"])
-	if total == 0 {
-		total = jsonNumberAsInt(usage["totalTokens"])
-	}
-	if total == 0 {
-		total = prompt + completion
-	}
-	return prompt, completion, total
+	return 0
 }
 
 func jsonNumberAsInt(value any) int {

@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { AlertTriangle, ArrowDownUp, Ban, CheckCircle2, Loader2, Plus, Settings2, ShieldCheck, Trash2, X } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Tooltip } from '@/components/ui/tooltip'
+import { useCurrencyDisplay } from '../../composables/useCurrencyDisplay'
 import type { ConnectionHealthPolicy } from '../../types/connectionHealth'
 import { resolveConnectionHealthStrategyMode } from '../../utils/connectionHealthPolicy'
 
@@ -27,10 +28,35 @@ const prefix = 'admin.connectionHealth.policies'
 const deleteCandidate = ref<ConnectionHealthPolicy | null>(null)
 const visibleDeleteError = ref('')
 const policyStrategyMode = resolveConnectionHealthStrategyMode
+const { formatMoneyParts, displayMode } = useCurrencyDisplay()
 
-const formatProbeCost = (value: number): string => {
-  if (!Number.isFinite(value)) return '$0.0000'
-  return `$${value.toFixed(4)}`
+/** 策略预算上限固定 CNY；已消耗按用户币种配置展示（有 USD 时双币种）。 */
+const formatBudgetCapCny = (value: number): string => {
+  if (!Number.isFinite(value)) return '¥0.0000'
+  return `¥${value.toFixed(4)}`
+}
+
+const formatBudgetUsed = (policy: ConnectionHealthPolicy): string => {
+  void displayMode.value
+  const cny = policy.dailyProbeBudgetCostUsed ?? 0
+  const usd = policy.dailyProbeBudgetCostUsedUsd
+  const cnyOk = Number.isFinite(cny) && cny > 0
+  const usdOk = usd != null && Number.isFinite(usd) && usd > 0
+  // 两侧齐全才走双币种；缺一侧只显示有的那侧，绝不用 rate=1 编造另一侧。
+  if (cnyOk && usdOk) {
+    const parts = formatMoneyParts({ usd: usd!, cny, rate: 1 })
+    return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
+  }
+  if (cnyOk) {
+    if (displayMode.value === 'usd') return `¥${cny.toFixed(4)}`
+    return `¥${cny.toFixed(4)}`
+  }
+  if (usdOk) {
+    if (displayMode.value === 'cny') return `$${usd!.toFixed(4)}`
+    return `$${usd!.toFixed(4)}`
+  }
+  const parts = formatMoneyParts({ usd: 0, cny: 0, rate: 1 })
+  return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
 }
 
 const requestDelete = (policy: ConnectionHealthPolicy) => {
@@ -145,9 +171,9 @@ watch(() => props.policies.map(policy => policy.id).join('\u0000'), () => {
                         total: policy.dailyProbeBudget,
                       }) }}
                       · {{ t(`${prefix}.budgetCostUsage`, {
-                        used: formatProbeCost(policy.dailyProbeBudgetCostUsed ?? 0),
+                        used: formatBudgetUsed(policy),
                         total: (policy.dailyProbeBudgetCost ?? 0) > 0
-                          ? formatProbeCost(policy.dailyProbeBudgetCost ?? 0)
+                          ? formatBudgetCapCny(policy.dailyProbeBudgetCost ?? 0)
                           : t(`${prefix}.budgetCostUnlimited`),
                       }) }}
                     </template>

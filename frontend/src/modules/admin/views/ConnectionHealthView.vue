@@ -59,6 +59,8 @@ const selectedGroupId = ref('')
 const selectedConnectionId = ref('')
 const eventsDialogOpen = ref(false)
 const siteNameMap = ref<Map<string, string>>(new Map())
+/** 上游站点充值倍率：用于探测消耗双币种展示的换算兜底（后端已给 CNY/USD 时优先用后端值）。 */
+const siteRechargeRate = ref(1)
 /** 自有分组名 → 今日消耗（与仪表盘「今日营收」同源，admin 站点分组今日实际消费）。 */
 const groupSpendToday = ref<Map<string, number>>(new Map())
 /** 是否已成功拉取过自有分组今日消耗；未加载成功时展示占位，避免把「未知」显示成 ¥0。 */
@@ -126,6 +128,11 @@ const loadSiteNames = async () => {
   try {
     const sites = await listUpstreamSites()
     siteNameMap.value = new Map(sites.map((site) => [site.id, site.name]))
+    // 取首个有效充值倍率作为展示兜底；探测费用本身已由后端按各站点倍率记账。
+    const rates = sites.map((site) => site.rechargeRate).filter((rate) => rate != null && rate > 0)
+    if (rates.length > 0) {
+      siteRechargeRate.value = rates[0]
+    }
   } catch {
     // 站点名称仅用于事件展示，失败时保留 ID，不阻塞健康主流程。
   }
@@ -326,7 +333,6 @@ const togglePolicyEnabled = async (policy: ConnectionHealthPolicy) => {
     recoveryStepPercent: policy.recoveryStepPercent,
     dailyProbeBudget: policy.dailyProbeBudget,
     dailyProbeBudgetCost: policy.dailyProbeBudgetCost ?? 0,
-    probeCostPer1kTokens: policy.probeCostPer1kTokens ?? 0.002,
     autoDegradeEnabled: policy.autoDegradeEnabled,
     autoRemoteActionEnabled: policy.autoRemoteActionEnabled,
     priorityMode: policy.priorityMode ?? 'none',
@@ -494,6 +500,7 @@ const handleDeletePolicy = async (policy: ConnectionHealthPolicy) => {
           :upstream-group-profit-today="upstreamGroupProfitToday"
           :upstream-group-spend-loaded="upstreamGroupSpendLoaded"
           :group-probe-running="groupProbeRunning"
+          :site-recharge-rate="siteRechargeRate"
           @setup="openSetup"
           @probe="onProbeAccount"
           @probe-group="onProbeGroup"

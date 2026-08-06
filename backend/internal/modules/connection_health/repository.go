@@ -209,8 +209,13 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 			PRIMARY KEY (user_id, admin_account_id, policy_id, day_start)
 		)`,
 		`ALTER TABLE connection_health_probe_budget_usage ADD COLUMN IF NOT EXISTS used_cost double precision NOT NULL DEFAULT 0`,
+		// used_cost 现为 CNY；used_cost_usd 为平台 USD 口径，供双币种展示。
+		`ALTER TABLE connection_health_probe_budget_usage ADD COLUMN IF NOT EXISTS used_cost_usd double precision NOT NULL DEFAULT 0`,
 		`ALTER TABLE connection_health_policies ADD COLUMN IF NOT EXISTS daily_probe_budget_cost double precision NOT NULL DEFAULT 0`,
+		// probe_cost_per_1k_tokens 已废弃（费用改按上游真实倍率/响应 actual_cost），列保留兼容旧库。
 		`ALTER TABLE connection_health_policies ADD COLUMN IF NOT EXISTS probe_cost_per_1k_tokens double precision NOT NULL DEFAULT 0.002`,
+		`ALTER TABLE connection_health_events ADD COLUMN IF NOT EXISTS cost_usd double precision NOT NULL DEFAULT 0`,
+		`ALTER TABLE connection_health_events ADD COLUMN IF NOT EXISTS cost_cny double precision NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS connection_health_runtime_leases (
 			lease_key text PRIMARY KEY,
 			owner_id text NOT NULL,
@@ -651,11 +656,11 @@ func (r *Repository) InsertEvent(ctx context.Context, e ConnectionHealthEvent) e
 		INSERT INTO connection_health_events (
 			id, connection_id, model_name, user_id, admin_account_id, policy_id, admin_group_id, own_group_name,
 			upstream_site_id, upstream_group_name, result, from_state, to_state,
-			latency_ms, error_key, error_detail, remote_action, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
+			latency_ms, error_key, error_detail, remote_action, cost_usd, cost_cny, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,now())
 	`, e.ID, e.ConnectionID, e.ModelName, e.UserID, e.AdminAccountID, e.PolicyID, e.AdminGroupID, e.OwnGroupName,
 		e.UpstreamSiteID, e.UpstreamGroupName, e.Result, e.FromState, e.ToState,
-		e.LatencyMs, e.ErrorKey, e.ErrorDetail, e.RemoteAction)
+		e.LatencyMs, e.ErrorKey, e.ErrorDetail, e.RemoteAction, e.CostUSD, e.CostCNY)
 	return err
 }
 
@@ -669,7 +674,7 @@ func (r *Repository) ListEventsByConnection(ctx context.Context, connectionID st
 	rows, err := r.db.Query(ctx, `
 		SELECT id, connection_id, model_name, user_id, admin_account_id, policy_id, admin_group_id, own_group_name,
 			upstream_site_id, upstream_group_name, result, from_state, to_state,
-			latency_ms, error_key, error_detail, remote_action, created_at
+			latency_ms, error_key, error_detail, remote_action, cost_usd, cost_cny, created_at
 		FROM connection_health_events WHERE connection_id = $1 AND user_id = $2 AND admin_account_id = $3 ORDER BY created_at DESC LIMIT $4
 	`, connectionID, userID, adminAccountID, limit)
 	if err != nil {
@@ -687,7 +692,7 @@ func (r *Repository) ListRecentEventsByWorkspace(ctx context.Context, userID str
 	rows, err := r.db.Query(ctx, `
 		SELECT id, connection_id, model_name, user_id, admin_account_id, policy_id, admin_group_id, own_group_name,
 			upstream_site_id, upstream_group_name, result, from_state, to_state,
-			latency_ms, error_key, error_detail, remote_action, created_at
+			latency_ms, error_key, error_detail, remote_action, cost_usd, cost_cny, created_at
 		FROM connection_health_events WHERE user_id = $1 AND admin_account_id = $2 ORDER BY created_at DESC LIMIT $3
 	`, userID, adminAccountID, limit)
 	if err != nil {
@@ -713,10 +718,19 @@ func (r *Repository) CountFailureEventsSince(ctx context.Context, userID string,
 	return count, nil
 }
 
-// ProbeBudgetUsage 是策略今日探活预算消耗快照（次数 + 估算金额）。
+// ProbeBudgetUsage 是策略今日探活预算消耗快照（次数 + 真实金额）。
+// UsedCost 为 CNY（预算限流口径）；UsedCostUSD 为上游平台 USD 口径。
 type ProbeBudgetUsage struct {
-	Used     int
-	UsedCost float64
+	Used        int
+	UsedCost    float64
+	UsedCostUSD float64
+}
+
+// ProbeCostByTarget 是某 target 今日真实探活费用合计。
+type ProbeCostByTarget struct {
+	TargetID string
+	CostCNY  float64
+	CostUSD  float64
 }
 
 // CountProbesToday 按策略统计当天真实探活次数。旧事件没有 policy_id，不再与新策略共享预算；
@@ -729,7 +743,12 @@ func (r *Repository) CountProbesToday(ctx context.Context, userID string, adminA
 	return usage.Used, nil
 }
 
-// GetProbeBudgetUsage 返回今日已用次数与已用估算金额。
+// GetProbeBudgetUsage 返回今日已用次数与已用真实金额（CNY + USD）。
+//
+// 金额以事件表 cost_cny/cost_usd 为唯一真实口径（与分组健康列表同源），避免：
+//  1) 旧版 used_cost 按「USD 估算费率」累加后被误标为 CNY；
+//  2) 新列 used_cost_usd 为 0 时双币种展示成 ¥x / $0.00。
+// 次数仍取 events 与 budget 计数的较大值，兼容预算预占。
 func (r *Repository) GetProbeBudgetUsage(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time) (ProbeBudgetUsage, error) {
 	row := r.db.QueryRow(ctx, `
 		SELECT
@@ -740,14 +759,44 @@ func (r *Repository) GetProbeBudgetUsage(ctx context.Context, userID string, adm
 				COALESCE((SELECT used FROM connection_health_probe_budget_usage
 				          WHERE user_id = $1 AND admin_account_id = $2 AND policy_id = $3 AND day_start = $4), 0)
 			)::integer,
-			COALESCE((SELECT used_cost FROM connection_health_probe_budget_usage
-			          WHERE user_id = $1 AND admin_account_id = $2 AND policy_id = $3 AND day_start = $4), 0)
+			COALESCE((SELECT SUM(cost_cny) FROM connection_health_events
+			          WHERE user_id = $1 AND admin_account_id = $2 AND policy_id = $3 AND created_at >= $4
+			            AND result = ANY($5)), 0),
+			COALESCE((SELECT SUM(cost_usd) FROM connection_health_events
+			          WHERE user_id = $1 AND admin_account_id = $2 AND policy_id = $3 AND created_at >= $4
+			            AND result = ANY($5)), 0)
 	`, userID, adminAccountID, policyID, dayStart, probeResultKeys())
 	var usage ProbeBudgetUsage
-	if err := row.Scan(&usage.Used, &usage.UsedCost); err != nil {
+	if err := row.Scan(&usage.Used, &usage.UsedCost, &usage.UsedCostUSD); err != nil {
 		return ProbeBudgetUsage{}, err
 	}
 	return usage, nil
+}
+
+// SumProbeCostTodayByConnection 按 connection_id（targetId）聚合今日真实探活费用。
+func (r *Repository) SumProbeCostTodayByConnection(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) (map[string]ProbeCostByTarget, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT connection_id,
+			COALESCE(SUM(cost_cny), 0),
+			COALESCE(SUM(cost_usd), 0)
+		FROM connection_health_events
+		WHERE user_id = $1 AND admin_account_id = $2 AND created_at >= $3
+			AND result = ANY($4)
+		GROUP BY connection_id
+	`, userID, adminAccountID, dayStart, probeResultKeys())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]ProbeCostByTarget)
+	for rows.Next() {
+		var item ProbeCostByTarget
+		if err := rows.Scan(&item.TargetID, &item.CostCNY, &item.CostUSD); err != nil {
+			return nil, err
+		}
+		out[item.TargetID] = item
+	}
+	return out, rows.Err()
 }
 
 // TryConsumeProbeBudget atomically reserves one probe (count). Optionally enforces cost budget:
@@ -765,9 +814,13 @@ func (r *Repository) TryConsumeProbeBudget(ctx context.Context, userID string, a
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO connection_health_probe_budget_usage (
-			user_id, admin_account_id, policy_id, day_start, used, used_cost, updated_at
+			user_id, admin_account_id, policy_id, day_start, used, used_cost, used_cost_usd, updated_at
 		)
-		SELECT $1, $2, $3, $4, count(*)::integer, 0, now()
+		SELECT $1, $2, $3, $4,
+			count(*)::integer,
+			COALESCE(SUM(cost_cny), 0),
+			COALESCE(SUM(cost_usd), 0),
+			now()
 		FROM connection_health_events
 		WHERE user_id = $1 AND admin_account_id = $2 AND policy_id = $3 AND created_at >= $4
 			AND result = ANY($5)
@@ -775,7 +828,30 @@ func (r *Repository) TryConsumeProbeBudget(ctx context.Context, userID string, a
 	`, userID, adminAccountID, policyID, dayStart, probeResultKeys()); err != nil {
 		return false, err
 	}
-	// 金额预算：used_cost 已达上限时拒绝再预占次数。
+	// 滚动升级：旧 used_cost 可能是「USD 估算」且 used_cost_usd=0，与真实 CNY 事件不一致。
+	// 一旦事件侧已有真实 cost_*，把预算表金额纠正为事件合计，避免限流与展示双口径。
+	if _, err := tx.Exec(ctx, `
+		UPDATE connection_health_probe_budget_usage b
+		SET
+			used_cost = e.cost_cny,
+			used_cost_usd = e.cost_usd,
+			updated_at = now()
+		FROM (
+			SELECT COALESCE(SUM(cost_cny), 0) AS cost_cny, COALESCE(SUM(cost_usd), 0) AS cost_usd
+			FROM connection_health_events
+			WHERE user_id = $1 AND admin_account_id = $2 AND policy_id = $3 AND created_at >= $4
+				AND result = ANY($5)
+		) e
+		WHERE b.user_id = $1 AND b.admin_account_id = $2 AND b.policy_id = $3 AND b.day_start = $4
+			AND (
+				(b.used_cost_usd = 0 AND b.used_cost > 0 AND e.cost_cny > 0)
+				OR (e.cost_cny > b.used_cost)
+				OR (e.cost_usd > b.used_cost_usd)
+			)
+	`, userID, adminAccountID, policyID, dayStart, probeResultKeys()); err != nil {
+		return false, err
+	}
+	// 金额预算（CNY）：used_cost 已达上限时拒绝再预占次数。
 	if costLimit > 0 {
 		var usedCost float64
 		if err := tx.QueryRow(ctx, `
@@ -813,19 +889,26 @@ func (r *Repository) TryConsumeProbeBudget(ctx context.Context, userID string, a
 	return true, nil
 }
 
-// AddProbeBudgetCost 在真实探活完成后累加估算费用（USD）。
-func (r *Repository) AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, cost float64) error {
-	if cost <= 0 || !isFiniteFloat(cost) {
+// AddProbeBudgetCost 在真实探活完成后累加真实费用。costCNY 为预算限流口径；costUSD 供双币种展示。
+func (r *Repository) AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, costCNY float64, costUSD float64) error {
+	if (costCNY <= 0 || !isFiniteFloat(costCNY)) && (costUSD <= 0 || !isFiniteFloat(costUSD)) {
 		return nil
+	}
+	if costCNY < 0 || !isFiniteFloat(costCNY) {
+		costCNY = 0
+	}
+	if costUSD < 0 || !isFiniteFloat(costUSD) {
+		costUSD = 0
 	}
 	_, err := r.db.Exec(ctx, `
 		INSERT INTO connection_health_probe_budget_usage (
-			user_id, admin_account_id, policy_id, day_start, used, used_cost, updated_at
-		) VALUES ($1, $2, $3, $4, 0, $5, now())
+			user_id, admin_account_id, policy_id, day_start, used, used_cost, used_cost_usd, updated_at
+		) VALUES ($1, $2, $3, $4, 0, $5, $6, now())
 		ON CONFLICT (user_id, admin_account_id, policy_id, day_start) DO UPDATE SET
 			used_cost = connection_health_probe_budget_usage.used_cost + EXCLUDED.used_cost,
+			used_cost_usd = connection_health_probe_budget_usage.used_cost_usd + EXCLUDED.used_cost_usd,
 			updated_at = now()
-	`, userID, adminAccountID, policyID, dayStart, cost)
+	`, userID, adminAccountID, policyID, dayStart, costCNY, costUSD)
 	return err
 }
 
@@ -945,7 +1028,7 @@ func scanEvents(rows pgx.Rows) ([]ConnectionHealthEvent, error) {
 		var e ConnectionHealthEvent
 		if err := rows.Scan(&e.ID, &e.ConnectionID, &e.ModelName, &e.UserID, &e.AdminAccountID, &e.PolicyID, &e.AdminGroupID, &e.OwnGroupName,
 			&e.UpstreamSiteID, &e.UpstreamGroupName, &e.Result, &e.FromState, &e.ToState,
-			&e.LatencyMs, &e.ErrorKey, &e.ErrorDetail, &e.RemoteAction, &e.CreatedAt); err != nil {
+			&e.LatencyMs, &e.ErrorKey, &e.ErrorDetail, &e.RemoteAction, &e.CostUSD, &e.CostCNY, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, e)

@@ -40,6 +40,10 @@ type AdminGroupHealth struct {
 	// accounts 为空，但主列表其余分组不受影响，不会整页崩溃。
 	AccountsError string              `json:"accountsError,omitempty"`
 	Accounts      []AdminGroupAccount `json:"accounts"`
+	// TodayProbeCost* 是该「我的分组」今日真实探活费用合计（各账号探活费用之和）。
+	// 双币种均由后端按上游倍率/响应 actual_cost 记账；前端按用户币种配置展示。
+	TodayProbeCostCNY float64 `json:"todayProbeCostCny"`
+	TodayProbeCostUSD float64 `json:"todayProbeCostUsd"`
 }
 
 // AdminGroupHealthSummary 是单个 admin 分组的探活健康概览，用于主列表快速展示。
@@ -105,6 +109,9 @@ type AdminGroupAccount struct {
 	ModelLimitsManaged  bool   `json:"modelLimitsManaged"`
 	ModelLimitsApplied  string `json:"modelLimitsApplied,omitempty"` // 上次写入上游的白名单
 	ModelLimitsOriginal string `json:"modelLimitsOriginal,omitempty"`
+	// TodayProbeCost* 是该账号/渠道今日真实探活费用（按 targetId 聚合事件）。
+	TodayProbeCostCNY float64 `json:"todayProbeCostCny"`
+	TodayProbeCostUSD float64 `json:"todayProbeCostUsd"`
 }
 
 type AdminGroupUnprobedModel struct {
@@ -199,6 +206,14 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 	// 真实上游 API Key 成本倍率（分组倍率 × 站点充值倍率）用于展示，并与优先级策略共用同一解析路径。
 	// 读取失败时降级为空，保证既有分组健康功能不会因为可选的倍率信息不可用而中断。
 	upstreamKeyGroups := s.upstreamKeyGroupsByAdminAccount(ctx, userID, adminAccountID, platform)
+
+	// 今日各 target 真实探活费用（按事件聚合）；失败时降级为空，不阻断主列表。
+	probeCostByTarget := map[string]ProbeCostByTarget{}
+	if costs, costErr := s.repo.SumProbeCostTodayByConnection(ctx, userID, adminAccountID, probeBudgetDayStart(time.Now())); costErr != nil {
+		log.Printf("[connection-health] sum probe cost today failed workspace=%s err=%v", adminAccountID, costErr)
+	} else if costs != nil {
+		probeCostByTarget = costs
+	}
 
 	// stateIndex[targetId][modelName] = 独立探活当前健康状态。旧的 real_connection 状态行
 	// 也会出现在这里（connection_id 为 UUID），但不会与 targetId 命名空间碰撞，互不影响。
@@ -329,6 +344,12 @@ func (s *Service) AdminGroups(ctx context.Context, userID string) ([]AdminGroupH
 			if actionState != nil {
 				item.ModelLimitsApplied = actionState.LastAppliedModels
 				item.ModelLimitsOriginal = actionState.OriginalModels
+			}
+			if cost, ok := probeCostByTarget[targetID]; ok {
+				item.TodayProbeCostCNY = cost.CostCNY
+				item.TodayProbeCostUSD = cost.CostUSD
+				health.TodayProbeCostCNY += cost.CostCNY
+				health.TodayProbeCostUSD += cost.CostUSD
 			}
 			if item.HasEnabledProbePolicy {
 				health.MonitoredAccountCount++

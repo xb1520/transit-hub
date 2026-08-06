@@ -52,6 +52,11 @@ type AdminProbeTarget struct {
 	Models                 []string `json:"models"`
 	ProbeAvailable         bool     `json:"probeAvailable"`
 	ProbeUnavailableReason string   `json:"probeUnavailableReason,omitempty"`
+	// CostGroupRatio 是上游 API Key 分组原始倍率（不含站点充值倍率）；0/缺失按 1。
+	// 用于真实探活费用：USD = tokens/quota_per_unit × groupRatio（无 actual_cost 时）。
+	CostGroupRatio float64 `json:"-"`
+	// CostRechargeRate 是上游站点充值倍率（CNY = USD × rate）；0/缺失按 1。
+	CostRechargeRate float64 `json:"-"`
 }
 
 // probeModelSpec 是一个「目标 + 具体探活模型」的组合，携带该模型来自哪条策略的探活参数。
@@ -376,6 +381,7 @@ func (s *Service) ProbeTarget(ctx context.Context, userID string, targetID strin
 	if err != nil {
 		return nil, err
 	}
+	s.attachProbeCostRates(ctx, userID, adminAccountID, string(session.Platform), &target)
 	release, err := s.repo.AcquireTargetLease(ctx, targetID)
 	if err != nil {
 		return nil, err
@@ -526,8 +532,10 @@ func (s *Service) probeTargetOnce(ctx context.Context, userID string, adminAccou
 		BaseURL: cred.BaseURL, UpstreamKey: cred.Key, ProviderFamily: providerFamily,
 		ModelName: spec.modelName, MaxTokens: spec.maxProbeTokens, ProbePrompt: spec.probePrompt,
 	})
-	outcome.EstimatedCost = estimateProbeCost(outcome, spec.maxProbeTokens, spec.policy.ProbeCostPer1kTokens)
-	if addErr := s.repo.AddProbeBudgetCost(ctx, userID, adminAccountID, spec.policy.ID, dayStart, outcome.EstimatedCost); addErr != nil {
+	cost := computeProbeCost(outcome, spec.maxProbeTokens, target.CostGroupRatio, target.CostRechargeRate)
+	outcome.CostUSD = cost.USD
+	outcome.CostCNY = cost.CNY
+	if addErr := s.repo.AddProbeBudgetCost(ctx, userID, adminAccountID, spec.policy.ID, dayStart, cost.CNY, cost.USD); addErr != nil {
 		log.Printf("[connection-health] add probe budget cost failed policy_id=%s err=%v", spec.policy.ID, addErr)
 	}
 
@@ -586,10 +594,13 @@ func probeBudgetLimit(policy Policy) int {
 	return defaultInt(policy.DailyProbeBudget, 1000)
 }
 
-// estimateProbeCost 估算单次探活费用（USD）。
-// 优先使用上游 usage.total_tokens；缺失时用 max_tokens + 16（短 prompt 预估）兜底。
-func estimateProbeCost(outcome ProbeOutcome, maxTokens int, costPer1k float64) float64 {
-	rate := defaultProbeCostPer1k(costPer1k)
+// probeQuotaPerUnit 与 new-api 默认 quota_per_unit 一致：group_ratio=1 时 tokens → 平台 USD。
+// 真实费用 = tokens / probeQuotaPerUnit × 上游分组倍率，再 × 站点充值倍率得到 CNY。
+// 不再使用可配置「估算费率（USD/千 tokens）」。
+const probeQuotaPerUnit = 500000.0
+
+// resolveProbeTokens 取上游 usage tokens；无 usage 时用 max_tokens+16 兜底（短 prompt）。
+func resolveProbeTokens(outcome ProbeOutcome, maxTokens int) int {
 	tokens := outcome.TotalTokens
 	if tokens <= 0 {
 		tokens = outcome.PromptTokens + outcome.CompletionTokens
@@ -600,11 +611,79 @@ func estimateProbeCost(outcome ProbeOutcome, maxTokens int, costPer1k float64) f
 		}
 		tokens = maxTokens + 16
 	}
-	cost := float64(tokens) / 1000.0 * rate
-	if cost < 0 || !isFiniteFloat(cost) {
-		return 0
+	return tokens
+}
+
+// computeProbeCost 计算单次探活真实费用（双币种）。
+// 优先使用上游响应 actual_cost/total_cost（平台 USD）；否则 tokens/quota × 分组倍率。
+// CNY = USD × 站点充值倍率。各上游 USD 口径可能不同，预算与主展示以 CNY 为准。
+func computeProbeCost(outcome ProbeOutcome, maxTokens int, groupRatio float64, rechargeRate float64) ProbeCost {
+	if groupRatio <= 0 || !isFiniteFloat(groupRatio) {
+		groupRatio = 1
 	}
-	return cost
+	if rechargeRate <= 0 || !isFiniteFloat(rechargeRate) {
+		rechargeRate = 1
+	}
+	var usd float64
+	if outcome.ActualCostUSD > 0 && isFiniteFloat(outcome.ActualCostUSD) {
+		// 响应已带真实费用时仍乘分组倍率？多数网关 actual_cost 已含 group_ratio，不再二次乘。
+		usd = outcome.ActualCostUSD
+	} else {
+		tokens := resolveProbeTokens(outcome, maxTokens)
+		usd = float64(tokens) / probeQuotaPerUnit * groupRatio
+	}
+	if usd < 0 || !isFiniteFloat(usd) {
+		usd = 0
+	}
+	cny := usd * rechargeRate
+	if cny < 0 || !isFiniteFloat(cny) {
+		cny = 0
+	}
+	return ProbeCost{USD: usd, CNY: cny}
+}
+
+// applyUpstreamKeyCostRates 把上游 API Key 分组倍率拆成 groupRatio + rechargeRate 写入 target。
+// costMultiplier = group × recharge（与列表「上游 API Key 倍率」同口径）；拆分后用于双币种记账。
+func applyUpstreamKeyCostRates(target *AdminProbeTarget, info upstreamKeyGroupInfo, rechargeRate float64) {
+	if target == nil {
+		return
+	}
+	rate := rechargeRate
+	if rate <= 0 || !isFiniteFloat(rate) {
+		rate = 1
+	}
+	target.CostRechargeRate = rate
+	if info.multiplier == nil || *info.multiplier <= 0 || !isFiniteFloat(*info.multiplier) {
+		target.CostGroupRatio = 1
+		return
+	}
+	// multiplier 已是 group×recharge；还原原始分组倍率。
+	target.CostGroupRatio = *info.multiplier / rate
+	if target.CostGroupRatio <= 0 || !isFiniteFloat(target.CostGroupRatio) {
+		target.CostGroupRatio = 1
+	}
+}
+
+// attachProbeCostRates 为独立探活目标补齐上游分组倍率与站点充值倍率。
+// 无法解析时按 1x 记账（仍基于真实 tokens / actual_cost，不再使用策略级估算费率）。
+func (s *Service) attachProbeCostRates(ctx context.Context, userID string, adminAccountID string, platform string, target *AdminProbeTarget) {
+	if target == nil {
+		return
+	}
+	target.CostGroupRatio = 1
+	target.CostRechargeRate = 1
+	groups := s.upstreamKeyGroupsByAdminAccount(ctx, userID, adminAccountID, platform)
+	info, ok := groups[strings.TrimSpace(target.AccountID)]
+	if !ok {
+		return
+	}
+	rate := 1.0
+	if info.siteID != "" && s.sites != nil {
+		if site, err := s.sites.GetSite(ctx, info.siteID); err == nil && site != nil && site.RechargeRate > 0 {
+			rate = site.RechargeRate
+		}
+	}
+	applyUpstreamKeyCostRates(target, info, rate)
 }
 
 func maxFloat64(a, b float64) float64 {
@@ -651,7 +730,7 @@ func (s *Service) finishTargetProbeBatch(ctx context.Context, userID string, adm
 			}
 			s.recordTargetEvent(ctx, userID, adminAccountID, eventTarget, result.spec.policy.ID, result.spec.modelName,
 				string(result.outcome.Result), string(result.previousState), string(result.state.State), &result.latencyMs,
-				result.state.LastErrorKey, result.state.LastErrorDetail, action)
+				result.state.LastErrorKey, result.state.LastErrorDetail, action, result.outcome.CostUSD, result.outcome.CostCNY)
 		}
 		return
 	}
@@ -660,7 +739,7 @@ func (s *Service) finishTargetProbeBatch(ctx context.Context, userID string, adm
 		eventTarget := targetForProbeSpec(target, result.spec)
 		s.recordTargetEvent(ctx, userID, adminAccountID, eventTarget, result.spec.policy.ID, result.spec.modelName,
 			string(result.outcome.Result), string(result.previousState), string(result.state.State), &result.latencyMs,
-			result.state.LastErrorKey, result.state.LastErrorDetail, "")
+			result.state.LastErrorKey, result.state.LastErrorDetail, "", result.outcome.CostUSD, result.outcome.CostCNY)
 	}
 }
 
@@ -694,7 +773,7 @@ func defaultTargetState(userID string, adminAccountID string, target AdminProbeT
 
 // recordTargetEvent 写入一条独立探活事件（connection_id 列存 targetId）。error_detail 已在
 // probe_runner 里脱敏，绝不含明文 key。
-func (s *Service) recordTargetEvent(ctx context.Context, userID string, adminAccountID string, target AdminProbeTarget, policyID string, modelName string, result string, fromState string, toState string, latencyMs *int, errorKey string, errorDetail string, remoteAction string) {
+func (s *Service) recordTargetEvent(ctx context.Context, userID string, adminAccountID string, target AdminProbeTarget, policyID string, modelName string, result string, fromState string, toState string, latencyMs *int, errorKey string, errorDetail string, remoteAction string, costUSD float64, costCNY float64) {
 	id, err := newID()
 	if err != nil {
 		log.Printf("[connection-health] generate target event id failed: %v", err)
@@ -705,6 +784,7 @@ func (s *Service) recordTargetEvent(ctx context.Context, userID string, adminAcc
 		PolicyID: policyID, AdminGroupID: target.AdminGroupID,
 		OwnGroupName: target.AdminGroupName, UpstreamSiteID: "", UpstreamGroupName: target.AdminGroupName, Result: result,
 		FromState: fromState, ToState: toState, LatencyMs: latencyMs, ErrorKey: errorKey, ErrorDetail: errorDetail, RemoteAction: remoteAction,
+		CostUSD: costUSD, CostCNY: costCNY,
 	}
 	if err := s.repo.InsertEvent(ctx, event); err != nil {
 		log.Printf("[connection-health] insert target event failed target_id=%s err=%v", target.TargetID, err)

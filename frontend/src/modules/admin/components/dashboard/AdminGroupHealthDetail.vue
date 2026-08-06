@@ -28,6 +28,7 @@ import {
   formatConnectionHealthTime,
 } from '../../composables/useConnectionHealth'
 import { formatCny } from '../../utils/dashboard'
+import { useCurrencyDisplay } from '../../composables/useCurrencyDisplay'
 import type {
   AdminGroupAccount,
   AdminGroupHealth,
@@ -46,7 +47,14 @@ const props = defineProps<{
   upstreamGroupSpendLoaded?: boolean
   /** 整组策略探活是否进行中。 */
   groupProbeRunning?: boolean
+  /**
+   * 站点充值倍率（CNY = USD × rate）。探测消耗后端已给双币种；
+   * rate 仅作 formatMoneyParts 缺一侧时的换算兜底。
+   */
+  siteRechargeRate?: number
 }>()
+
+const { formatMoneyParts, displayMode } = useCurrencyDisplay()
 
 const emit = defineEmits<{
   (event: 'setup', group: AdminGroupHealth): void
@@ -60,8 +68,56 @@ const prefix = 'admin.connectionHealth'
 const detailPrefix = `${prefix}.groupDetail`
 const expandedTargetId = ref('')
 
-type AccountSortKey = 'priority' | 'upstreamMultiplier' | 'upstreamSpend' | 'upstreamProfit'
+type AccountSortKey = 'priority' | 'upstreamMultiplier' | 'upstreamSpend' | 'upstreamProfit' | 'probeCost'
 type SortDir = 'asc' | 'desc'
+
+const moneyRate = computed(() => {
+  const rate = props.siteRechargeRate
+  return rate != null && rate > 0 ? rate : 1
+})
+
+/**
+ * 按用户币种配置格式化双币种金额。
+ * - 两侧齐全：按 dual/cny/usd 模式展示（不二次换算）。
+ * - 仅一侧有值：只显示那一侧，绝不用 rate 编造另一侧。
+ * - 都为 0：按模式显示 ¥0 / $0。
+ */
+const formatDualMoney = (cny: number | null | undefined, usd: number | null | undefined): string => {
+  void displayMode.value
+  const cnyVal = cny != null && Number.isFinite(cny) ? cny : null
+  const usdVal = usd != null && Number.isFinite(usd) ? usd : null
+  const cnyOk = cnyVal != null && cnyVal > 0
+  const usdOk = usdVal != null && usdVal > 0
+
+  if (cnyOk && usdOk) {
+    const parts = formatMoneyParts({ usd: usdVal!, cny: cnyVal!, rate: moneyRate.value })
+    return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
+  }
+  if (cnyOk) {
+    // 只有 CNY：即使用户选了 USD/双币种，也不用错误 rate 反推 USD。
+    return `¥${cnyVal!.toFixed(2)}`
+  }
+  if (usdOk) {
+    return `$${usdVal!.toFixed(2)}`
+  }
+  const parts = formatMoneyParts({ usd: 0, cny: 0, rate: moneyRate.value })
+  return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
+}
+
+const formatGroupProbeCost = (): string => {
+  const cny = props.group.todayProbeCostCny
+  const usd = props.group.todayProbeCostUsd
+  if ((cny == null || !Number.isFinite(cny)) && (usd == null || !Number.isFinite(usd))) {
+    return formatDualMoney(0, 0)
+  }
+  return formatDualMoney(cny ?? 0, usd ?? 0)
+}
+
+const accountProbeCostCny = (account: AdminGroupAccount): number =>
+  account.todayProbeCostCny != null && Number.isFinite(account.todayProbeCostCny) ? account.todayProbeCostCny : 0
+
+const formatAccountProbeCost = (account: AdminGroupAccount): string =>
+  formatDualMoney(account.todayProbeCostCny ?? 0, account.todayProbeCostUsd ?? 0)
 
 const sortKey = ref<AccountSortKey | null>(null)
 const sortDir = ref<SortDir>('asc')
@@ -78,7 +134,7 @@ const toggleSort = (key: AccountSortKey) => {
   }
   sortKey.value = key
   // 优先级默认升序（数值小更优先的平台更直观）；倍率/消耗默认升序（成本更低在前）；利润默认降序（贡献更大在前）。
-  sortDir.value = key === 'upstreamProfit' ? 'desc' : 'asc'
+  sortDir.value = key === 'upstreamProfit' || key === 'probeCost' ? 'desc' : 'asc'
 }
 
 const sortIndicator = (key: AccountSortKey) => {
@@ -154,6 +210,12 @@ const sortedAccounts = computed(() => {
       if (leftVal == null && rightVal == null) return 0
       if (leftVal == null) return 1
       if (rightVal == null) return -1
+      if (leftVal === rightVal) return 0
+      return leftVal < rightVal ? -dir : dir
+    }
+    if (key === 'probeCost') {
+      const leftVal = accountProbeCostCny(left)
+      const rightVal = accountProbeCostCny(right)
       if (leftVal === rightVal) return 0
       return leftVal < rightVal ? -dir : dir
     }
@@ -313,26 +375,37 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
       </div>
     </header>
 
-    <dl class="grid border-b border-border/50 sm:grid-cols-2 xl:grid-cols-5">
-      <div class="border-b border-border/50 px-5 py-4 sm:border-r xl:border-b-0">
+    <dl class="grid border-b border-border/50 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+      <div class="border-b border-border/50 px-5 py-4 sm:border-r 2xl:border-b-0">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Radar class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.accounts`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">{{ group.accountCount }}</dd>
       </div>
-      <div class="border-b border-border/50 px-5 py-4 xl:border-b-0 xl:border-r">
+      <div class="border-b border-border/50 px-5 py-4 2xl:border-b-0 2xl:border-r">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><ShieldCheck class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.monitored`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">{{ monitoredCount }}</dd>
       </div>
-      <div class="border-b border-border/50 px-5 py-4 sm:border-r xl:border-b-0">
+      <div class="border-b border-border/50 px-5 py-4 sm:border-r 2xl:border-b-0">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Gauge class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.probeable`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">{{ group.healthSummary.probeableAccounts }}</dd>
       </div>
-      <div class="border-b border-border/50 px-5 py-4 sm:border-b-0 xl:border-r">
+      <div class="border-b border-border/50 px-5 py-4 2xl:border-b-0 2xl:border-r">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Wallet class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.todaySpend`) }}</dt>
         <dd class="mt-1 text-xl font-semibold tabular-nums text-foreground">
           {{ todaySpend == null || !Number.isFinite(todaySpend) ? '—' : formatCny(todaySpend) }}
         </dd>
       </div>
-      <div class="px-5 py-4 sm:col-span-2 xl:col-span-1">
+      <div class="border-b border-border/50 px-5 py-4 sm:border-r sm:border-b-0 2xl:border-r">
+        <dt
+          class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+          :title="t(`${detailPrefix}.metrics.todayProbeCostHint`)"
+        >
+          <Zap class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.todayProbeCost`) }}
+        </dt>
+        <dd class="mt-1 text-base font-semibold tabular-nums leading-snug text-foreground sm:text-lg">
+          {{ formatGroupProbeCost() }}
+        </dd>
+      </div>
+      <div class="px-5 py-4">
         <dt class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"><Clock3 class="h-3.5 w-3.5" />{{ t(`${detailPrefix}.metrics.lastProbe`) }}</dt>
         <dd class="mt-1 text-sm font-medium text-foreground">{{ formatConnectionHealthTime(lastProbeAt) }}</dd>
       </div>
@@ -365,7 +438,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
         <p class="mt-3 text-sm text-muted-foreground">{{ t(`${detailPrefix}.empty`) }}</p>
       </div>
       <div v-else class="overflow-x-auto rounded-lg border border-border/60">
-        <table class="w-full min-w-[74rem] text-sm">
+        <table class="w-full min-w-[86rem] text-sm">
           <thead class="bg-surface/60 text-left text-xs text-muted-foreground">
             <tr>
               <th class="w-10 px-3 py-2.5 font-medium"><span class="sr-only">{{ t(`${detailPrefix}.columns.expand`) }}</span></th>
@@ -423,6 +496,20 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                   <span>{{ t(`${detailPrefix}.columns.upstreamProfit`) }}</span>
                   <ArrowUp v-if="sortIndicator('upstreamProfit') === 'asc'" class="h-3.5 w-3.5" />
                   <ArrowDown v-else-if="sortIndicator('upstreamProfit') === 'desc'" class="h-3.5 w-3.5" />
+                  <ArrowUpDown v-else class="h-3.5 w-3.5 opacity-50" />
+                </button>
+              </th>
+              <th class="px-3 py-2.5 font-medium">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded-md px-1 py-0.5 transition-colors hover:bg-surface hover:text-foreground"
+                  :class="sortKey === 'probeCost' ? 'text-foreground' : ''"
+                  :title="t(`${detailPrefix}.columns.probeCostHint`)"
+                  @click="toggleSort('probeCost')"
+                >
+                  <span>{{ t(`${detailPrefix}.columns.probeCost`) }}</span>
+                  <ArrowUp v-if="sortIndicator('probeCost') === 'asc'" class="h-3.5 w-3.5" />
+                  <ArrowDown v-else-if="sortIndicator('probeCost') === 'desc'" class="h-3.5 w-3.5" />
                   <ArrowUpDown v-else class="h-3.5 w-3.5 opacity-50" />
                 </button>
               </th>
@@ -528,6 +615,11 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                     {{ formatAccountUpstreamProfit(account) }}
                   </span>
                 </td>
+                <td class="px-3 py-3 tabular-nums text-foreground">
+                  <span class="text-sm" :title="t(`${detailPrefix}.columns.probeCostHint`)">
+                    {{ formatAccountProbeCost(account) }}
+                  </span>
+                </td>
                 <td class="px-3 py-3">
                   <div class="flex items-center justify-end gap-1">
                     <Tooltip :text="t(`${prefix}.actions.probe`)">
@@ -556,7 +648,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                 </td>
               </tr>
               <tr v-if="expandedTargetId === account.targetId" class="border-t border-border/40 bg-surface/25">
-                <td colspan="9" class="px-12 py-4">
+                <td colspan="10" class="px-12 py-4">
                   <div v-if="account.modelHealth.length === 0 && unprobedModels(account).length === 0" class="text-xs text-muted-foreground">{{ t(`${detailPrefix}.models.empty`) }}</div>
                   <div v-else class="grid gap-2 lg:grid-cols-2">
                     <div v-for="model in account.modelHealth" :key="model.modelName" class="rounded-lg border border-border/50 bg-background px-3 py-2.5">

@@ -28,6 +28,7 @@ type fakeRepository struct {
 	targetActionStates map[string]TargetActionState
 	budgetClaims       map[string]int
 	budgetCosts        map[string]float64
+	budgetCostsUSD     map[string]float64
 	savePolicyErr      error
 	deletePolicyErr    error
 }
@@ -39,6 +40,7 @@ func newFakeRepository() *fakeRepository {
 		targetActionStates: map[string]TargetActionState{},
 		budgetClaims:       map[string]int{},
 		budgetCosts:        map[string]float64{},
+		budgetCostsUSD:     map[string]float64{},
 	}
 }
 
@@ -381,7 +383,7 @@ func (f *fakeRepository) GetProbeBudgetUsage(ctx context.Context, userID string,
 		return ProbeBudgetUsage{}, err
 	}
 	key := userID + "|" + adminAccountID + "|" + policyID + "|" + dayStart.Format(time.RFC3339)
-	return ProbeBudgetUsage{Used: used, UsedCost: f.budgetCosts[key]}, nil
+	return ProbeBudgetUsage{Used: used, UsedCost: f.budgetCosts[key], UsedCostUSD: f.budgetCostsUSD[key]}, nil
 }
 
 func (f *fakeRepository) TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int, costLimit float64) (bool, error) {
@@ -405,16 +407,42 @@ func (f *fakeRepository) TryConsumeProbeBudget(ctx context.Context, userID strin
 	return true, nil
 }
 
-func (f *fakeRepository) AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, cost float64) error {
-	if cost <= 0 {
+func (f *fakeRepository) AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, costCNY float64, costUSD float64) error {
+	if costCNY <= 0 && costUSD <= 0 {
 		return nil
 	}
 	if f.budgetCosts == nil {
 		f.budgetCosts = map[string]float64{}
 	}
+	if f.budgetCostsUSD == nil {
+		f.budgetCostsUSD = map[string]float64{}
+	}
 	key := userID + "|" + adminAccountID + "|" + policyID + "|" + dayStart.Format(time.RFC3339)
-	f.budgetCosts[key] += cost
+	if costCNY > 0 {
+		f.budgetCosts[key] += costCNY
+	}
+	if costUSD > 0 {
+		f.budgetCostsUSD[key] += costUSD
+	}
 	return nil
+}
+
+func (f *fakeRepository) SumProbeCostTodayByConnection(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) (map[string]ProbeCostByTarget, error) {
+	out := map[string]ProbeCostByTarget{}
+	for _, event := range f.events {
+		if event.UserID != userID || event.AdminAccountID != adminAccountID {
+			continue
+		}
+		if !isProbeResultString(event.Result) {
+			continue
+		}
+		item := out[event.ConnectionID]
+		item.TargetID = event.ConnectionID
+		item.CostCNY += event.CostCNY
+		item.CostUSD += event.CostUSD
+		out[event.ConnectionID] = item
+	}
+	return out, nil
 }
 
 func (f *fakeRepository) TryAcquireSchedulerLease(ctx context.Context) (func(), bool, error) {

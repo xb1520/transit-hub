@@ -3,6 +3,7 @@ package connection_health
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -455,7 +456,7 @@ func (s *Service) recordTargetCredentialUnavailable(ctx context.Context, userID 
 			continue
 		}
 		eventTarget := targetForProbeSpec(target, spec)
-		s.recordTargetEvent(ctx, userID, adminAccountID, eventTarget, spec.policy.ID, spec.modelName, string(ResultUnsupported), string(next.State), string(next.State), nil, reason, "", "")
+		s.recordTargetEvent(ctx, userID, adminAccountID, eventTarget, spec.policy.ID, spec.modelName, string(ResultUnsupported), string(next.State), string(next.State), nil, reason, "", "", 0, 0)
 	}
 }
 
@@ -531,6 +532,9 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 		}
 		session := inventory.session
 		platform := string(session.Platform)
+		// 本 workspace 上游 Key 成本倍率只解析一次，避免每个 target 重复拉 Key 列表。
+		upstreamKeyGroups := s.upstreamKeyGroupsByAdminAccount(ctx, ws.userID, ws.adminAccountID, platform)
+		rechargeBySite := map[string]float64{}
 
 		// 账号/渠道可能同时属于多个 admin 分组。先按稳定 targetId 合并所有来源策略，再生成
 		// 一次任务，避免同一目标在一轮中被重复探活。
@@ -564,6 +568,23 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 					AccountWeight:      cloneIntPointer(acc.Weight),
 					ProviderFamily:     acc.Platform,
 					Models:             splitModelList(acc.Models),
+				}
+				if info, ok := upstreamKeyGroups[strings.TrimSpace(acc.ID)]; ok {
+					rate := 1.0
+					if info.siteID != "" {
+						if cached, exists := rechargeBySite[info.siteID]; exists {
+							rate = cached
+						} else if s.sites != nil {
+							if site, siteErr := s.sites.GetSite(ctx, info.siteID); siteErr == nil && site != nil && site.RechargeRate > 0 {
+								rate = site.RechargeRate
+							}
+							rechargeBySite[info.siteID] = rate
+						}
+					}
+					applyUpstreamKeyCostRates(&target, info, rate)
+				} else {
+					target.CostGroupRatio = 1
+					target.CostRechargeRate = 1
 				}
 				inheritedPolicies := assignedGroups[group.ID]
 				if excludedByWorkspace[key][group.ID][target.TargetID] {

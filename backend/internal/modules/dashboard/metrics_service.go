@@ -613,22 +613,22 @@ func (s *MetricsService) GroupUsageToday(ctx context.Context, userID string) (Gr
 	}, nil
 }
 
-// GroupProfitToday 返回今天有营收的各分组利润与利润率（仪表盘「今日净利润 / 今日利润率」下钻）。
+// GroupProfitToday 返回今天有营收/有上游成本的各分组利润与利润率（仪表盘「今日净利润 / 今日利润率」下钻）。
 //
 // 口径：
 //   - 营收：与 GroupUsageToday 相同（admin 站点分组今日实际消费）
-//   - 总成本：与 LiveMetrics todayCost 相同（上游今日消耗 × 充值倍率）
-//   - 成本分摊：按 1x 归一化用量 V_i = revenue_i / max(saleMultiplier_i, ε) 比例分摊总成本，
-//     使高售卖倍率分组在相同业务量下承担更低单位成本、体现更高利润率；
-//     各分组 profit 之和 = totalRevenue - totalCost，与卡片净利一致。
-//   - 只返回 revenue > 0 的分组。
+//   - 自有分组成本：该分组关联的上游 key 实耗之和（调价映射「自有分组 → 上游分组」；
+//     无映射时回退同名自有分组）。同一上游分到多个自有分组时均分，避免重复计入。
+//     与分组健康列表「上游分组消耗」及本接口 upstreamGroups.cost 同源。
+//   - 总成本：优先 key 用量合计；不可用时回退站点 TodayConsume × 充值倍率。
+//   - 利润：营收 − 成本；只返回 revenue > 0 或 cost > 0 的自有分组。
 func (s *MetricsService) GroupProfitToday(ctx context.Context, userID string) (GroupProfitTodayResponse, error) {
 	usage, err := s.GroupUsageToday(ctx, userID)
 	if err != nil {
 		return GroupProfitTodayResponse{}, err
 	}
 
-	// 售卖倍率：与分组列表同源，失败时降级为无倍率（按 1x 分摊），不阻塞利润弹窗。
+	// 售卖倍率：与分组列表同源，失败时降级为 1x，不阻塞利润弹窗。
 	multipliers := map[string]float64{}
 	if adminAccountID, accErr := s.requireCurrentAdminAccount(ctx, userID); accErr == nil {
 		if record, getErr := s.store.Get(ctx, userID, adminAccountID); getErr == nil && record != nil && record.Session.IsAuthenticated() {
@@ -648,61 +648,89 @@ func (s *MetricsService) GroupProfitToday(ctx context.Context, userID string) (G
 		}
 	}
 
-	// 今日总成本：与 LiveMetrics 的 todayCost 口径一致。
-	var totalCost float64
-	if s.upstreams != nil {
-		for _, site := range s.upstreams.List(ctx, userID) {
-			if site.RechargeRate <= 0 {
-				continue
-			}
-			if site.Metrics.TodayConsume.Value != nil {
-				totalCost += *site.Metrics.TodayConsume.Value * site.RechargeRate
-			}
+	// 已知自有分组名：今日有营收的 + 有售卖倍率的（用于映射回退与展示）。
+	knownOwn := map[string]struct{}{}
+	for name := range multipliers {
+		if strings.TrimSpace(name) != "" {
+			knownOwn[strings.TrimSpace(name)] = struct{}{}
 		}
 	}
-
 	type workingGroup struct {
 		name       string
 		revenue    float64
 		multiplier float64
-		volume     float64
+		cost       float64
 	}
-	working := make([]workingGroup, 0, len(usage.Groups))
-	var totalRevenue, totalVolume float64
+	byName := map[string]*workingGroup{}
+	var totalRevenue float64
 	for _, item := range usage.Groups {
 		revenue := item.TodayAmount
-		if revenue <= 0 || !isFinite(revenue) {
+		if revenue < 0 || !isFinite(revenue) {
 			continue
 		}
 		name := strings.TrimSpace(item.GroupName)
 		if name == "" {
 			continue
 		}
+		knownOwn[name] = struct{}{}
 		mult := multipliers[name]
 		if !isPositiveFinite(mult) {
 			mult = 1
 		}
-		volume := revenue / mult
-		working = append(working, workingGroup{name: name, revenue: revenue, multiplier: mult, volume: volume})
-		totalRevenue += revenue
-		totalVolume += volume
+		byName[name] = &workingGroup{name: name, revenue: revenue, multiplier: mult}
+		if revenue > 0 {
+			totalRevenue += revenue
+		}
 	}
 
-	items := make([]GroupProfitTodayItem, 0, len(working))
-	var allocatedCost float64
-	for i, g := range working {
-		var cost float64
-		if totalVolume > 0 {
-			cost = totalCost * (g.volume / totalVolume)
-		} else if totalRevenue > 0 {
-			cost = totalCost * (g.revenue / totalRevenue)
+	// 上游 key 实耗 + 调价映射：自有分组成本与 upstreamGroups 共用一次采集。
+	keyCosts, reverseOwn, keyTotalCost, keyPartial, keyOK := s.collectUpstreamKeyCosts(ctx, userID)
+	ownCostByName := allocateOwnGroupCostsFromUpstream(keyCosts, reverseOwn, knownOwn)
+	for name, g := range byName {
+		g.cost = ownCostByName[name]
+	}
+	// 有上游成本但今日无营收的自有分组也要展示（成本/利润可见）。
+	for name, cost := range ownCostByName {
+		if cost <= 0 {
+			continue
 		}
-		// 最后一组吃掉浮点残差，保证 sum(cost) == totalCost。
-		if i == len(working)-1 && len(working) > 0 {
-			cost = totalCost - allocatedCost
+		if _, exists := byName[name]; exists {
+			continue
 		}
-		allocatedCost += cost
-		profit := g.revenue - cost
+		if _, known := knownOwn[name]; !known {
+			// 仅当映射明确指向该自有名时才会进入 ownCostByName；再补一条展示行。
+			knownOwn[name] = struct{}{}
+		}
+		mult := multipliers[name]
+		if !isPositiveFinite(mult) {
+			mult = 1
+		}
+		byName[name] = &workingGroup{name: name, revenue: 0, multiplier: mult, cost: cost}
+	}
+
+	// 站点级总成本作 key 不可用时的回退；有 key 数据时以 key 合计为准，与上游分组合计对齐。
+	var siteTotalCost float64
+	if s.upstreams != nil {
+		for _, site := range s.upstreams.List(ctx, userID) {
+			if site.RechargeRate <= 0 {
+				continue
+			}
+			if site.Metrics.TodayConsume.Value != nil {
+				siteTotalCost += *site.Metrics.TodayConsume.Value * site.RechargeRate
+			}
+		}
+	}
+	totalCost := siteTotalCost
+	if keyOK {
+		totalCost = keyTotalCost
+	}
+
+	items := make([]GroupProfitTodayItem, 0, len(byName))
+	for _, g := range byName {
+		if g.revenue <= 0 && g.cost <= 0 {
+			continue
+		}
+		profit := g.revenue - g.cost
 		margin := 0.0
 		if g.revenue > 0 {
 			margin = profit / g.revenue
@@ -711,7 +739,7 @@ func (s *MetricsService) GroupProfitToday(ctx context.Context, userID string) (G
 		items = append(items, GroupProfitTodayItem{
 			GroupName:      g.name,
 			Revenue:        g.revenue,
-			Cost:           cost,
+			Cost:           g.cost,
 			Profit:         profit,
 			ProfitMargin:   margin,
 			SaleMultiplier: &multCopy,
@@ -732,7 +760,10 @@ func (s *MetricsService) GroupProfitToday(ctx context.Context, userID string) (G
 		totalMargin = totalProfit / totalRevenue
 	}
 
-	upstreamGroups, upstreamPartial := s.buildUpstreamGroupProfits(ctx, userID, multipliers, totalRevenue, totalCost, totalMargin)
+	upstreamGroups, upstreamPartial := s.buildUpstreamGroupProfits(ctx, userID, multipliers, totalRevenue, totalCost, totalMargin, keyCosts, reverseOwn)
+	if keyPartial {
+		upstreamPartial = true
+	}
 
 	return GroupProfitTodayResponse{
 		Date:            usage.Date,
@@ -746,41 +777,43 @@ func (s *MetricsService) GroupProfitToday(ctx context.Context, userID string) (G
 	}, nil
 }
 
-// buildUpstreamGroupProfits 聚合今日有消耗的上游分组，并估算利润/利润率。
-// 口径与调价映射预算毛利率一致：margin = (sale - costMult) / sale；
-// revenue = cost * sale / costMult（cost 已是 key 实际成本）。缺倍率时回退全站利润率。
-func (s *MetricsService) buildUpstreamGroupProfits(
-	ctx context.Context,
-	userID string,
-	saleByOwnGroup map[string]float64,
-	totalRevenue, totalCost, totalMargin float64,
-) ([]UpstreamGroupProfitTodayItem, bool) {
+// upstreamKeyCostRow 是 (站点, 上游分组) 维度的 key 实耗合计。
+type upstreamKeyCostRow struct {
+	siteID       string
+	siteName     string
+	platform     string
+	groupName    string
+	cost         float64
+	rechargeRate float64
+}
+
+// collectUpstreamKeyCosts 采集今日上游 key 实耗，并构建「上游 → 自有分组」映射。
+// ok=false 表示完全采不到 key 用量（自有成本需回退其它策略时用）。
+func (s *MetricsService) collectUpstreamKeyCosts(ctx context.Context, userID string) (
+	rows []upstreamKeyCostRow,
+	reverseOwn map[string][]string,
+	totalCost float64,
+	partial bool,
+	ok bool,
+) {
+	reverseOwn = map[string][]string{}
 	if s.upstreams == nil {
-		return []UpstreamGroupProfitTodayItem{}, false
+		return nil, reverseOwn, 0, false, false
 	}
 
 	keyItems, err := s.upstreams.KeyUsageToday(ctx, userID)
-	partial := false
 	if err != nil {
 		var collectionErr *upstream.KeyUsageCollectionError
 		if !errors.As(err, &collectionErr) || collectionErr.TotalSites <= 0 || collectionErr.FailedSites >= collectionErr.TotalSites {
 			log.Printf("dashboard group profit: upstream key usage unavailable user_id=%s err=%v", userID, err)
-			return []UpstreamGroupProfitTodayItem{}, false
+			return nil, reverseOwn, 0, false, false
 		}
 		partial = true
 		log.Printf("dashboard group profit: partial upstream key usage user_id=%s failed=%d total=%d", userID, collectionErr.FailedSites, collectionErr.TotalSites)
 	}
 
-	type agg struct {
-		siteID       string
-		siteName     string
-		platform     string
-		groupName    string
-		cost         float64
-		rechargeRate float64
-	}
 	order := make([]string, 0)
-	byKey := make(map[string]*agg)
+	byKey := make(map[string]*upstreamKeyCostRow)
 	for _, item := range keyItems {
 		if item.TodayAmount <= 0 || !isFinite(item.TodayAmount) {
 			continue
@@ -791,9 +824,9 @@ func (s *MetricsService) buildUpstreamGroupProfits(
 		}
 		siteID := strings.TrimSpace(item.SiteID)
 		key := siteID + "\x00" + groupName
-		row, ok := byKey[key]
-		if !ok {
-			row = &agg{
+		row, exists := byKey[key]
+		if !exists {
+			row = &upstreamKeyCostRow{
 				siteID:       siteID,
 				siteName:     item.SiteName,
 				platform:     string(item.Platform),
@@ -815,6 +848,109 @@ func (s *MetricsService) buildUpstreamGroupProfits(
 		}
 	}
 
+	rows = make([]upstreamKeyCostRow, 0, len(order))
+	for _, key := range order {
+		row := byKey[key]
+		if row == nil || row.cost <= 0 {
+			continue
+		}
+		rows = append(rows, *row)
+		totalCost += row.cost
+	}
+
+	if s.pricingMappings != nil {
+		if links, linkErr := s.pricingMappings.ListPricingTargetLinks(ctx, userID); linkErr != nil {
+			log.Printf("dashboard group profit: pricing mappings failed user_id=%s err=%v", userID, linkErr)
+		} else {
+			seenOwn := map[string]map[string]struct{}{}
+			for _, link := range links {
+				own := strings.TrimSpace(link.OwnGroup)
+				siteID := strings.TrimSpace(link.SiteID)
+				gName := strings.TrimSpace(link.GroupName)
+				if own == "" || siteID == "" || gName == "" {
+					continue
+				}
+				key := siteID + "\x00" + gName
+				if seenOwn[key] == nil {
+					seenOwn[key] = map[string]struct{}{}
+				}
+				if _, exists := seenOwn[key][own]; exists {
+					continue
+				}
+				seenOwn[key][own] = struct{}{}
+				reverseOwn[key] = append(reverseOwn[key], own)
+			}
+		}
+	}
+
+	return rows, reverseOwn, totalCost, partial, true
+}
+
+// allocateOwnGroupCostsFromUpstream 把上游 key 实耗归到自有分组。
+// 优先调价映射；无映射时仅当存在同名「已知自有分组」才整笔计入。
+// 一上游对多自有时均分，避免同一笔成本被重复加总。
+func allocateOwnGroupCostsFromUpstream(
+	rows []upstreamKeyCostRow,
+	reverseOwn map[string][]string,
+	knownOwn map[string]struct{},
+) map[string]float64 {
+	out := map[string]float64{}
+	for _, row := range rows {
+		if row.cost <= 0 {
+			continue
+		}
+		key := row.siteID + "\x00" + row.groupName
+		mapped := reverseOwn[key]
+		if len(mapped) == 0 {
+			// 无映射：仅同名且确为自有分组时回退，绝不把陌生上游组名当成自有组。
+			name := strings.TrimSpace(row.groupName)
+			if name == "" {
+				continue
+			}
+			if _, ok := knownOwn[name]; !ok {
+				continue
+			}
+			mapped = []string{name}
+		}
+		// 过滤映射到未知空名的项。
+		targets := make([]string, 0, len(mapped))
+		for _, own := range mapped {
+			own = strings.TrimSpace(own)
+			if own == "" {
+				continue
+			}
+			targets = append(targets, own)
+		}
+		if len(targets) == 0 {
+			continue
+		}
+		share := row.cost / float64(len(targets))
+		for _, own := range targets {
+			out[own] += share
+		}
+	}
+	return out
+}
+
+// buildUpstreamGroupProfits 聚合今日有消耗的上游分组，并估算利润/利润率。
+// 口径与调价映射预算毛利率一致：margin = (sale - costMult) / sale；
+// revenue = cost * sale / costMult（cost 已是 key 实际成本）。缺倍率时回退全站利润率。
+// keyCosts / reverseOwn 由调用方 collectUpstreamKeyCosts 提供，避免重复拉 key 用量。
+func (s *MetricsService) buildUpstreamGroupProfits(
+	ctx context.Context,
+	userID string,
+	saleByOwnGroup map[string]float64,
+	totalRevenue, totalCost, totalMargin float64,
+	keyCosts []upstreamKeyCostRow,
+	reverseOwn map[string][]string,
+) ([]UpstreamGroupProfitTodayItem, bool) {
+	if s.upstreams == nil || len(keyCosts) == 0 {
+		return []UpstreamGroupProfitTodayItem{}, false
+	}
+	if reverseOwn == nil {
+		reverseOwn = map[string][]string{}
+	}
+
 	// 上游分组倍率：站点缓存 Metrics.Groups × rechargeRate → 有效成本倍率。
 	costMultByKey := map[string]float64{}
 	siteNameByID := map[string]string{}
@@ -832,47 +968,20 @@ func (s *MetricsService) buildUpstreamGroupProfits(
 		}
 	}
 
-	// 反向映射：上游 (site, group) → 关联的自有分组名。
-	reverseOwn := map[string][]string{}
-	if s.pricingMappings != nil {
-		if links, linkErr := s.pricingMappings.ListPricingTargetLinks(ctx, userID); linkErr != nil {
-			log.Printf("dashboard group profit: pricing mappings failed user_id=%s err=%v", userID, linkErr)
-		} else {
-			seenOwn := map[string]map[string]struct{}{}
-			for _, link := range links {
-				own := strings.TrimSpace(link.OwnGroup)
-				siteID := strings.TrimSpace(link.SiteID)
-				gName := strings.TrimSpace(link.GroupName)
-				if own == "" || siteID == "" || gName == "" {
-					continue
-				}
-				key := siteID + "\x00" + gName
-				if seenOwn[key] == nil {
-					seenOwn[key] = map[string]struct{}{}
-				}
-				if _, ok := seenOwn[key][own]; ok {
-					continue
-				}
-				seenOwn[key][own] = struct{}{}
-				reverseOwn[key] = append(reverseOwn[key], own)
-			}
-		}
-	}
-
-	items := make([]UpstreamGroupProfitTodayItem, 0, len(order))
-	for _, key := range order {
-		row := byKey[key]
-		if row == nil || row.cost <= 0 {
+	items := make([]UpstreamGroupProfitTodayItem, 0, len(keyCosts))
+	for _, row := range keyCosts {
+		if row.cost <= 0 {
 			continue
 		}
-		if row.siteName == "" {
+		siteName := row.siteName
+		if siteName == "" {
 			if name := siteNameByID[row.siteID]; name != "" {
-				row.siteName = name
+				siteName = name
 			} else {
-				row.siteName = row.siteID
+				siteName = row.siteID
 			}
 		}
-
+		key := row.siteID + "\x00" + row.groupName
 		mapped := append([]string(nil), reverseOwn[key]...)
 		var salePtr *float64
 		if sale, ok := resolveUpstreamSaleMultiplier(row.groupName, mapped, saleByOwnGroup); ok {
@@ -889,7 +998,7 @@ func (s *MetricsService) buildUpstreamGroupProfits(
 		revenue, profit, margin := estimateUpstreamProfit(row.cost, salePtr, costMultPtr, totalRevenue, totalCost, totalMargin)
 		items = append(items, UpstreamGroupProfitTodayItem{
 			SiteID:          row.siteID,
-			SiteName:        row.siteName,
+			SiteName:        siteName,
 			Platform:        row.platform,
 			GroupName:       row.groupName,
 			Cost:            row.cost,
@@ -914,7 +1023,7 @@ func (s *MetricsService) buildUpstreamGroupProfits(
 		}
 		return items[i].GroupName < items[j].GroupName
 	})
-	return items, partial
+	return items, false
 }
 
 // resolveUpstreamSaleMultiplier 优先用调价映射关联的自有分组倍率均值，其次同名自有分组。

@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ArrowDownUp, BookOpenText, Radar, X, ShieldCheck, Plus, Trash2 } from 'lucide-vue-next'
 import { HelpTooltip } from '@/components/ui/tooltip'
+import { useCurrencyDisplay } from '../../composables/useCurrencyDisplay'
 import PolicyRunFlowDialog from './PolicyRunFlowDialog.vue'
 import type { ConnectionHealthPolicy, ConnectionHealthPriorityMode, ConnectionHealthStrategyMode, ModelTargetInput, PolicyInput } from '../../types/connectionHealth'
 import { resolveConnectionHealthStrategyMode } from '../../utils/connectionHealthPolicy'
@@ -38,7 +39,6 @@ const DEFAULTS = {
   recoveryStepPercent: 25,
   dailyProbeBudget: 1000,
   dailyProbeBudgetCost: 0,
-  probeCostPer1kTokens: 0.002,
   maxProbeTokens: 1,
 }
 
@@ -53,7 +53,6 @@ const observationSeconds = ref(DEFAULTS.observationSeconds)
 const recoveryStepPercent = ref(DEFAULTS.recoveryStepPercent)
 const dailyProbeBudget = ref(DEFAULTS.dailyProbeBudget)
 const dailyProbeBudgetCost = ref(DEFAULTS.dailyProbeBudgetCost)
-const probeCostPer1kTokens = ref(DEFAULTS.probeCostPer1kTokens)
 const autoDegradeEnabled = ref(true)
 const autoRemoteActionEnabled = ref(false)
 const priorityMode = ref<ConnectionHealthPriorityMode>('none')
@@ -70,10 +69,27 @@ const providerMismatch = ref(false)
 
 const isEditing = computed(() => !!props.policy)
 const isMultiplierOnly = computed(() => strategyMode.value === 'multiplier_only')
+const { formatMoneyParts, displayMode } = useCurrencyDisplay()
 
-const formatProbeCost = (value: number): string => {
-  if (!Number.isFinite(value)) return '$0.0000'
-  return `$${value.toFixed(4)}`
+/** 金额预算上限单位固定 CNY。 */
+const formatBudgetCapCny = (value: number): string => {
+  if (!Number.isFinite(value)) return '¥0.0000'
+  return `¥${value.toFixed(4)}`
+}
+
+/** 今日已消耗按用户币种配置展示；缺侧不展示假 $0.00，也不用 rate=1 编造。 */
+const formatBudgetUsed = (cny: number, usd?: number | null): string => {
+  void displayMode.value
+  const cnyOk = Number.isFinite(cny) && cny > 0
+  const usdOk = usd != null && Number.isFinite(usd) && usd > 0
+  if (cnyOk && usdOk) {
+    const parts = formatMoneyParts({ usd: usd!, cny, rate: 1 })
+    return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
+  }
+  if (cnyOk) return `¥${cny.toFixed(4)}`
+  if (usdOk) return `$${usd!.toFixed(4)}`
+  const parts = formatMoneyParts({ usd: 0, cny: 0, rate: 1 })
+  return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
 }
 
 const resetForm = () => {
@@ -89,9 +105,6 @@ const resetForm = () => {
   recoveryStepPercent.value = p?.recoveryStepPercent ?? DEFAULTS.recoveryStepPercent
   dailyProbeBudget.value = p?.dailyProbeBudget ?? DEFAULTS.dailyProbeBudget
   dailyProbeBudgetCost.value = p?.dailyProbeBudgetCost ?? DEFAULTS.dailyProbeBudgetCost
-  probeCostPer1kTokens.value = p?.probeCostPer1kTokens && p.probeCostPer1kTokens > 0
-    ? p.probeCostPer1kTokens
-    : DEFAULTS.probeCostPer1kTokens
   autoDegradeEnabled.value = p?.autoDegradeEnabled ?? true
   autoRemoteActionEnabled.value = autoDegradeEnabled.value && (p?.autoRemoteActionEnabled ?? false)
   priorityMode.value = p?.priorityMode === 'multiplier' ? 'multiplier' : 'none'
@@ -183,7 +196,6 @@ const handleSave = () => {
     recoveryStepPercent: recoveryStepPercent.value,
     dailyProbeBudget: dailyProbeBudget.value,
     dailyProbeBudgetCost: Math.max(0, Number(dailyProbeBudgetCost.value) || 0),
-    probeCostPer1kTokens: Math.max(0, Number(probeCostPer1kTokens.value) || DEFAULTS.probeCostPer1kTokens),
     autoDegradeEnabled: isMultiplierOnly.value ? false : autoDegradeEnabled.value,
     autoRemoteActionEnabled: isMultiplierOnly.value ? false : autoRemoteActionEnabled.value,
     priorityMode: isMultiplierOnly.value ? 'multiplier' : priorityMode.value,
@@ -412,20 +424,13 @@ const handleSave = () => {
                       : 'text-muted-foreground'"
                   >
                     {{ t(`${prefix}.dailyBudgetCostUsage`, {
-                      used: formatProbeCost(policy?.dailyProbeBudgetCostUsed ?? 0),
-                      total: dailyProbeBudgetCost > 0 ? formatProbeCost(dailyProbeBudgetCost) : t(`${prefix}.dailyBudgetCostUnlimited`),
+                      used: formatBudgetUsed(policy?.dailyProbeBudgetCostUsed ?? 0, policy?.dailyProbeBudgetCostUsedUsd),
+                      total: dailyProbeBudgetCost > 0 ? formatBudgetCapCny(dailyProbeBudgetCost) : t(`${prefix}.dailyBudgetCostUnlimited`),
                       remaining: dailyProbeBudgetCost > 0
-                        ? formatProbeCost(Math.max(0, dailyProbeBudgetCost - (policy?.dailyProbeBudgetCostUsed ?? 0)))
+                        ? formatBudgetCapCny(Math.max(0, dailyProbeBudgetCost - (policy?.dailyProbeBudgetCostUsed ?? 0)))
                         : t(`${prefix}.dailyBudgetCostUnlimited`),
                     }) }}
                   </p>
-                </div>
-                <div class="space-y-1.5">
-                  <label class="flex items-center gap-1 text-xs font-medium text-muted-foreground">
-                    {{ t(`${prefix}.probeCostPer1kLabel`) }}
-                    <HelpTooltip :text="t(`${prefix}.tooltips.probeCostPer1k`)" />
-                  </label>
-                  <input v-model.number="probeCostPer1kTokens" type="number" min="0" step="0.0001" class="h-9 w-full rounded-lg border border-border/60 bg-background px-3 text-sm text-foreground" />
                 </div>
                 <div class="space-y-1.5">
                   <label class="flex items-center gap-1 text-xs font-medium text-muted-foreground">
