@@ -50,3 +50,27 @@ func TestProbeOnce_StopsRealProbingAfterDailyBudgetExhausted(t *testing.T) {
 		t.Fatalf("one policy must not consume another policy's budget, got %d hits", hits)
 	}
 }
+
+func TestEstimateProbeCost_UsesUsageTokens(t *testing.T) {
+	cost := estimateProbeCost(ProbeOutcome{TotalTokens: 500}, 1, 0.002)
+	// 500/1000 * 0.002 = 0.001
+	if cost < 0.00099 || cost > 0.00101 {
+		t.Fatalf("cost = %v, want ~0.001", cost)
+	}
+}
+
+func TestEstimateProbeCost_FallsBackToMaxTokens(t *testing.T) {
+	cost := estimateProbeCost(ProbeOutcome{}, 4, 0.002)
+	// tokens = 4+16 = 20 → 20/1000 * 0.002 = 0.00004
+	if cost < 0.000039 || cost > 0.000041 {
+		t.Fatalf("cost = %v, want ~0.00004", cost)
+	}
+}
+
+func TestParseProbeUsageTokens(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
+	p, c, total := parseProbeUsageTokens(body)
+	if p != 10 || c != 2 || total != 12 {
+		t.Fatalf("got prompt=%d completion=%d total=%d", p, c, total)
+	}
+}

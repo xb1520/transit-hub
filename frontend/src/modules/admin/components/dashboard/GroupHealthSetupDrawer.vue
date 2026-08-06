@@ -265,6 +265,8 @@ const createQuickPolicyInput = (): PolicyInput => {
     observationSeconds: 300,
     recoveryStepPercent: 25,
     dailyProbeBudget: 1000,
+    dailyProbeBudgetCost: 0,
+    probeCostPer1kTokens: 0.002,
     autoDegradeEnabled: !multiplierOnly,
     autoRemoteActionEnabled: multiplierOnly ? false : autoRemoteActionEnabled.value,
     priorityMode: effectivePriorityMode.value,

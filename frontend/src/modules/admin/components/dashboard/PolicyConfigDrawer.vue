@@ -37,6 +37,8 @@ const DEFAULTS = {
   observationSeconds: 300,
   recoveryStepPercent: 25,
   dailyProbeBudget: 1000,
+  dailyProbeBudgetCost: 0,
+  probeCostPer1kTokens: 0.002,
   maxProbeTokens: 1,
 }
 
@@ -50,6 +52,8 @@ const cooldownSeconds = ref(DEFAULTS.cooldownSeconds)
 const observationSeconds = ref(DEFAULTS.observationSeconds)
 const recoveryStepPercent = ref(DEFAULTS.recoveryStepPercent)
 const dailyProbeBudget = ref(DEFAULTS.dailyProbeBudget)
+const dailyProbeBudgetCost = ref(DEFAULTS.dailyProbeBudgetCost)
+const probeCostPer1kTokens = ref(DEFAULTS.probeCostPer1kTokens)
 const autoDegradeEnabled = ref(true)
 const autoRemoteActionEnabled = ref(false)
 const priorityMode = ref<ConnectionHealthPriorityMode>('none')
@@ -67,6 +71,11 @@ const providerMismatch = ref(false)
 const isEditing = computed(() => !!props.policy)
 const isMultiplierOnly = computed(() => strategyMode.value === 'multiplier_only')
 
+const formatProbeCost = (value: number): string => {
+  if (!Number.isFinite(value)) return '$0.0000'
+  return `$${value.toFixed(4)}`
+}
+
 const resetForm = () => {
   const p = props.policy
   name.value = p?.name ?? ''
@@ -79,6 +88,10 @@ const resetForm = () => {
   observationSeconds.value = p?.observationSeconds ?? DEFAULTS.observationSeconds
   recoveryStepPercent.value = p?.recoveryStepPercent ?? DEFAULTS.recoveryStepPercent
   dailyProbeBudget.value = p?.dailyProbeBudget ?? DEFAULTS.dailyProbeBudget
+  dailyProbeBudgetCost.value = p?.dailyProbeBudgetCost ?? DEFAULTS.dailyProbeBudgetCost
+  probeCostPer1kTokens.value = p?.probeCostPer1kTokens && p.probeCostPer1kTokens > 0
+    ? p.probeCostPer1kTokens
+    : DEFAULTS.probeCostPer1kTokens
   autoDegradeEnabled.value = p?.autoDegradeEnabled ?? true
   autoRemoteActionEnabled.value = autoDegradeEnabled.value && (p?.autoRemoteActionEnabled ?? false)
   priorityMode.value = p?.priorityMode === 'multiplier' ? 'multiplier' : 'none'
@@ -169,6 +182,8 @@ const handleSave = () => {
     observationSeconds: observationSeconds.value,
     recoveryStepPercent: recoveryStepPercent.value,
     dailyProbeBudget: dailyProbeBudget.value,
+    dailyProbeBudgetCost: Math.max(0, Number(dailyProbeBudgetCost.value) || 0),
+    probeCostPer1kTokens: Math.max(0, Number(probeCostPer1kTokens.value) || DEFAULTS.probeCostPer1kTokens),
     autoDegradeEnabled: isMultiplierOnly.value ? false : autoDegradeEnabled.value,
     autoRemoteActionEnabled: isMultiplierOnly.value ? false : autoRemoteActionEnabled.value,
     priorityMode: isMultiplierOnly.value ? 'multiplier' : priorityMode.value,
@@ -382,6 +397,35 @@ const handleSave = () => {
                       remaining: Math.max(0, dailyProbeBudget - (policy?.dailyProbeBudgetUsed ?? 0)),
                     }) }}
                   </p>
+                </div>
+                <div class="space-y-1.5">
+                  <label class="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                    {{ t(`${prefix}.dailyBudgetCostLabel`) }}
+                    <HelpTooltip :text="t(`${prefix}.tooltips.dailyBudgetCost`)" />
+                  </label>
+                  <input v-model.number="dailyProbeBudgetCost" type="number" min="0" step="0.01" class="h-9 w-full rounded-lg border border-border/60 bg-background px-3 text-sm text-foreground" />
+                  <p
+                    v-if="isEditing"
+                    class="text-[11px] leading-4"
+                    :class="dailyProbeBudgetCost > 0 && (policy?.dailyProbeBudgetCostUsed ?? 0) >= dailyProbeBudgetCost
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-muted-foreground'"
+                  >
+                    {{ t(`${prefix}.dailyBudgetCostUsage`, {
+                      used: formatProbeCost(policy?.dailyProbeBudgetCostUsed ?? 0),
+                      total: dailyProbeBudgetCost > 0 ? formatProbeCost(dailyProbeBudgetCost) : t(`${prefix}.dailyBudgetCostUnlimited`),
+                      remaining: dailyProbeBudgetCost > 0
+                        ? formatProbeCost(Math.max(0, dailyProbeBudgetCost - (policy?.dailyProbeBudgetCostUsed ?? 0)))
+                        : t(`${prefix}.dailyBudgetCostUnlimited`),
+                    }) }}
+                  </p>
+                </div>
+                <div class="space-y-1.5">
+                  <label class="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                    {{ t(`${prefix}.probeCostPer1kLabel`) }}
+                    <HelpTooltip :text="t(`${prefix}.tooltips.probeCostPer1k`)" />
+                  </label>
+                  <input v-model.number="probeCostPer1kTokens" type="number" min="0" step="0.0001" class="h-9 w-full rounded-lg border border-border/60 bg-background px-3 text-sm text-foreground" />
                 </div>
                 <div class="space-y-1.5">
                   <label class="flex items-center gap-1 text-xs font-medium text-muted-foreground">

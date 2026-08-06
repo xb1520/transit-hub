@@ -24,15 +24,31 @@ func TestDesiredModelLimits_RemovesExcludedModels(t *testing.T) {
 func TestDesiredModelLimits_AnySuspendedIsExcluded(t *testing.T) {
 	original := "a,b,c"
 	states := []ConnectionHealthState{
-		{ModelName: "a", State: StateHealthy},
-		{ModelName: "b", State: StateObserving, LastErrorKey: ""}, // 已探测成功进入观察，应保留
+		{ModelName: "a", State: StateHealthy, CurrentWeight: 100},
+		// 恢复观察：只摘模型，不保留在白名单
+		{ModelName: "b", State: StateObserving, CurrentWeight: 0},
 		// 探活暂停（无论原因）都应摘除
-		{ModelName: "c", State: StateSuspended, LastErrorKey: string(ResultNetworkFluctuation)},
+		{ModelName: "c", State: StateSuspended, LastErrorKey: string(ResultNetworkFluctuation), CurrentWeight: 0},
 	}
 	got := desiredModelLimits(original, states, nil)
-	want := "a,b"
+	want := "a"
 	if normalizeModelListString(got) != normalizeModelListString(want) {
-		t.Fatalf("suspended models must be excluded, got %q want %q", got, want)
+		t.Fatalf("observing/suspended models must be excluded, got %q want %q", got, want)
+	}
+}
+
+func TestDesiredModelLimits_ExcludesDisabledAndZeroWeight(t *testing.T) {
+	original := "ok,disabled-one,zero-weight,recovering"
+	states := []ConnectionHealthState{
+		{ModelName: "ok", State: StateHealthy, CurrentWeight: 100},
+		{ModelName: "disabled-one", State: StateDisabled, CurrentWeight: 0},
+		{ModelName: "zero-weight", State: StateDegraded, CurrentWeight: 0},
+		{ModelName: "recovering", State: StateRecovering, CurrentWeight: 25},
+	}
+	got := desiredModelLimits(original, states, nil)
+	want := "ok,recovering"
+	if normalizeModelListString(got) != normalizeModelListString(want) {
+		t.Fatalf("desiredModelLimits = %q, want %q", got, want)
 	}
 }
 
@@ -55,21 +71,28 @@ func TestAggregateTargetStates_PartialModelExclusionDoesNotBlock(t *testing.T) {
 	states := []ConnectionHealthState{
 		{ModelName: "ok", State: StateHealthy, CurrentWeight: 100},
 		{ModelName: "bad", State: StateSuspended, CurrentWeight: 0, LastErrorKey: string(ResultModelNotFound)},
+		{ModelName: "watching", State: StateObserving, CurrentWeight: 0},
+		{ModelName: "disabled", State: StateDisabled, CurrentWeight: 0},
+		{ModelName: "zero", State: StateDegraded, CurrentWeight: 0},
 	}
-	allHealthy, blocked, _ := aggregateTargetStates(states)
-	// 摘除暂停模型不计入 allHealthy：有效模型全部健康时应可恢复账号
+	allHealthy, blocked, minWeight := aggregateTargetStates(states)
+	// 问题模型只摘除：有效模型全部健康时应可保持/恢复账号调度
 	if !allHealthy {
 		t.Fatal("expected allHealthy when only excluded models are unhealthy")
 	}
 	if blocked {
-		t.Fatal("partial model_not_found exclusion must not block whole account")
+		t.Fatal("partial model exclusion must not block whole account")
+	}
+	if minWeight != 100 {
+		t.Fatalf("minWeight should ignore excluded models, got %d", minWeight)
 	}
 }
 
 func TestAggregateTargetStates_AllExcludedBlocks(t *testing.T) {
 	states := []ConnectionHealthState{
 		{ModelName: "a", State: StateSuspended, CurrentWeight: 0, LastErrorKey: string(ResultModelNotFound)},
-		{ModelName: "b", State: StateSuspended, CurrentWeight: 0, LastErrorKey: string(ResultServerError)},
+		{ModelName: "b", State: StateObserving, CurrentWeight: 0},
+		{ModelName: "c", State: StateDisabled, CurrentWeight: 0},
 	}
 	_, blocked, _ := aggregateTargetStates(states)
 	if !blocked {
@@ -138,10 +161,20 @@ func TestReconcileTargetModelLimits_RemovesAndRestores(t *testing.T) {
 		t.Fatalf("last applied = %q", stored.LastAppliedModels)
 	}
 
-	// 2) 恢复：模拟上游当前已是上次写入，探活成功
+	// 2) 观察中仍保持摘除（不因进入 observing 就写回）
 	target.Models = []string{"gpt-4o"}
 	platform.sub2APIModelCalls = nil
 	states[1] = ConnectionHealthState{ModelName: "gpt-5.6-luna", State: StateObserving, CurrentWeight: 0}
+	action, err = svc.reconcileTargetModelLimits(context.Background(), session, target, states, stored)
+	if err != nil {
+		t.Fatalf("observing step error: %v", err)
+	}
+	if action != "" || len(platform.sub2APIModelCalls) != 0 {
+		t.Fatalf("observing must keep model excluded, action=%q calls=%+v", action, platform.sub2APIModelCalls)
+	}
+
+	// 3) 恢复：探活到 healthy 后才写回完整模型列表
+	states[1] = ConnectionHealthState{ModelName: "gpt-5.6-luna", State: StateHealthy, CurrentWeight: 100}
 	action, err = svc.reconcileTargetModelLimits(context.Background(), session, target, states, stored)
 	if err != nil {
 		t.Fatalf("restore error: %v", err)

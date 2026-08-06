@@ -26,7 +26,9 @@ type healthRepository interface {
 	ListRecentEventsByWorkspace(ctx context.Context, userID string, adminAccountID string, limit int) ([]ConnectionHealthEvent, error)
 	CountFailureEventsSince(ctx context.Context, userID string, adminAccountID string, since time.Time) (int, error)
 	CountProbesToday(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time) (int, error)
-	TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int) (bool, error)
+	GetProbeBudgetUsage(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time) (ProbeBudgetUsage, error)
+	TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int, costLimit float64) (bool, error)
+	AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, cost float64) error
 	TryAcquireSchedulerLease(ctx context.Context) (release func(), acquired bool, err error)
 	AcquireTargetLease(ctx context.Context, targetID string) (release func(), err error)
 	ListEnabledPolicies(ctx context.Context) ([]Policy, error)
@@ -658,6 +660,8 @@ type PolicyInput struct {
 	PriorityMode            string             `json:"priorityMode"`
 	StrategyMode            string             `json:"strategyMode"`
 	DailyProbeBudget        int                `json:"dailyProbeBudget"`
+	DailyProbeBudgetCost    float64            `json:"dailyProbeBudgetCost"`
+	ProbeCostPer1kTokens    float64            `json:"probeCostPer1kTokens"`
 	ModelTargets            []ModelTargetInput `json:"modelTargets"`
 }
 
@@ -674,8 +678,8 @@ func (s *Service) ListPolicies(ctx context.Context, userID string) ([]Policy, er
 	return policies, nil
 }
 
-// attachPolicyBudgetUsage 为策略列表/详情附上今日已消费的真实探活次数，便于管理端展示已用预算。
-// 计数失败时记日志并保持 Used=0，避免因预算查询失败导致策略列表整体不可用。
+// attachPolicyBudgetUsage 为策略列表/详情附上今日已消费次数与估算金额，便于管理端展示已用预算。
+// 查询失败时记日志并保持 0，避免因预算查询失败导致策略列表整体不可用。
 func (s *Service) attachPolicyBudgetUsage(ctx context.Context, userID string, adminAccountID string, policies []Policy) {
 	if len(policies) == 0 {
 		return
@@ -683,12 +687,13 @@ func (s *Service) attachPolicyBudgetUsage(ctx context.Context, userID string, ad
 	dayStart := probeBudgetDayStart(time.Now())
 	for i := range policies {
 		// multiplier_only 策略不进探活预算链路；仍查询一次以兼容历史误写事件，UI 可按模式隐藏。
-		used, err := s.repo.CountProbesToday(ctx, userID, adminAccountID, policies[i].ID, dayStart)
+		usage, err := s.repo.GetProbeBudgetUsage(ctx, userID, adminAccountID, policies[i].ID, dayStart)
 		if err != nil {
 			log.Printf("[connection-health] count policy probe budget failed policy_id=%s err=%v", policies[i].ID, err)
 			continue
 		}
-		policies[i].DailyProbeBudgetUsed = used
+		policies[i].DailyProbeBudgetUsed = usage.Used
+		policies[i].DailyProbeBudgetCostUsed = usage.UsedCost
 	}
 }
 
@@ -697,12 +702,13 @@ func (s *Service) attachSinglePolicyBudgetUsage(ctx context.Context, policy *Pol
 		return
 	}
 	dayStart := probeBudgetDayStart(time.Now())
-	used, err := s.repo.CountProbesToday(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart)
+	usage, err := s.repo.GetProbeBudgetUsage(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart)
 	if err != nil {
 		log.Printf("[connection-health] count policy probe budget failed policy_id=%s err=%v", policy.ID, err)
 		return
 	}
-	policy.DailyProbeBudgetUsed = used
+	policy.DailyProbeBudgetUsed = usage.Used
+	policy.DailyProbeBudgetCostUsed = usage.UsedCost
 }
 
 // SavePolicy 创建或更新一条策略（含 model targets 整体替换）。id 为空时创建新策略。
@@ -780,8 +786,10 @@ func buildPolicyAndTargets(userID string, adminAccountID string, id string, in P
 		CooldownSeconds: defaultInt(in.CooldownSeconds, 300), ObservationSeconds: defaultInt(in.ObservationSeconds, 300),
 		RecoveryStepPercent: defaultInt(in.RecoveryStepPercent, 25), AutoDegradeEnabled: in.AutoDegradeEnabled,
 		AutoRemoteActionEnabled: in.AutoDegradeEnabled && in.AutoRemoteActionEnabled, PriorityMode: normalizePriorityMode(in.PriorityMode),
-		StrategyMode:     strategyMode,
-		DailyProbeBudget: defaultInt(in.DailyProbeBudget, 1000),
+		StrategyMode:         strategyMode,
+		DailyProbeBudget:     defaultInt(in.DailyProbeBudget, 1000),
+		DailyProbeBudgetCost: maxFloat64(0, in.DailyProbeBudgetCost),
+		ProbeCostPer1kTokens: defaultProbeCostPer1k(in.ProbeCostPer1kTokens),
 	}
 	if strategyMode == StrategyModeMultiplierOnly {
 		// 仅倍率策略不拥有任何探活行为。即使错误或旧客户端同时提交了探活字段，也在服务端
@@ -1017,7 +1025,7 @@ func (s *Service) probeOnce(ctx context.Context, conn my_sites.RealConnection, p
 	}
 
 	dayStart := probeBudgetDayStart(time.Now())
-	allowed, err := s.repo.TryConsumeProbeBudget(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart, probeBudgetLimit(policy))
+	allowed, err := s.repo.TryConsumeProbeBudget(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart, probeBudgetLimit(policy), policy.DailyProbeBudgetCost)
 	if err != nil {
 		return nil, err
 	}
@@ -1029,6 +1037,10 @@ func (s *Service) probeOnce(ctx context.Context, conn my_sites.RealConnection, p
 		BaseURL: site.BaseURL, UpstreamKey: conn.UpstreamKey, ProviderFamily: target.ProviderFamily,
 		ModelName: target.ModelName, MaxTokens: target.MaxProbeTokens, ProbePrompt: target.ProbePrompt,
 	})
+	outcome.EstimatedCost = estimateProbeCost(outcome, target.MaxProbeTokens, policy.ProbeCostPer1kTokens)
+	if addErr := s.repo.AddProbeBudgetCost(ctx, policy.UserID, policy.AdminAccountID, policy.ID, dayStart, outcome.EstimatedCost); addErr != nil {
+		log.Printf("[connection-health] add probe budget cost failed policy_id=%s err=%v", policy.ID, addErr)
+	}
 
 	now := time.Now()
 	transitionOut := Transition(TransitionInput{

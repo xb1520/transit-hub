@@ -68,7 +68,8 @@ func (s *Service) reconcileTargetRemoteAction(
 			modelLimitStates = append(modelLimitStates, state)
 		}
 	}
-	if len(states) == 0 {
+	// 无任何本地状态时仍可能需要恢复历史 status=inactive（旧降级路径），不能直接 return。
+	if len(states) == 0 && len(statusModels) == 0 && len(modelLimitModels) == 0 {
 		return "", nil
 	}
 	statesComplete := len(statusStates) == len(statusModels) && len(statusModels) > 0
@@ -95,15 +96,28 @@ func (s *Service) reconcileTargetRemoteAction(
 	}
 	// fullyHealthy：所有受控模型都有状态且有效模型全健康（用于清理快照）。
 	// 不完整状态时仍可根据 hasHealthyEffective 恢复账号启停，避免「有健康模型却永久停用」。
-	fullyHealthy := allHealthy && (len(statusModels) == 0 || statesComplete)
+	// 无状态行时：不视为 fullyHealthy，但可走「历史 inactive 恢复」分支。
+	fullyHealthy := allHealthy && (len(statusModels) == 0 || statesComplete) && len(statusAggStates) > 0
 	// 模型限制摘除即使不阻塞账号启停，也需要 reconcile（可与启停路径独立）。
 	needsModelLimits := target.Platform == string(upstream.PlatformSub2API) && len(modelLimitModels) > 0 &&
 		(hasModelLimitExclusion(modelLimitStates) || (stored != nil && (strings.TrimSpace(stored.OriginalModels) != "" || strings.TrimSpace(stored.LastAppliedModels) != "")))
-	// 账号启停：阻塞 / 恢复中 / 已有快照 / 当前停用但已有健康有效模型（需要拉回 active）。
-	currentStatusPreview := normalizeTargetStatus(target.Platform, target.AccountStatus)
+	// 账号启停：阻塞 / 恢复中 / 已有快照 / 当前摘流但应恢复调度。
+	// Sub2API 用「调度开关」表示摘流，逻辑状态仍编码为 active/inactive。
+	currentStatusPreview := effectiveLogicalStatus(target)
+	trafficDisabled := !logicalStatusEnabled(target.Platform, currentStatusPreview)
+	// 历史 status=inactive 恢复条件（满足任一即可）：
+	// 1) 有健康有效模型；2) 本地有接管快照；3) 事件/状态里有系统降级痕迹；
+	// 4) 未判定 blocked（含尚无探活状态）——避免旧 inactive 在无人探活时永久卡住。
+	needsLegacyInactiveRestore := trafficDisabled && len(statusModels) > 0 && !blocked &&
+		(hasHealthyEffective ||
+			stored != nil ||
+			legacyTargetWasManaged(statusAggStates) ||
+			legacyTargetWasManaged(allStates) ||
+			len(statusAggStates) == 0)
 	needsStatusAction := len(statusModels) > 0 && (blocked || hasRecoveringState(statusAggStates) ||
 		(stored != nil && (stored.OriginalStatus != "" || stored.LastAppliedStatus != "")) ||
-		(!targetStatusEnabled(target.Platform, currentStatusPreview) && hasHealthyEffective))
+		(trafficDisabled && hasHealthyEffective) ||
+		needsLegacyInactiveRestore)
 	if stored != nil && (strings.TrimSpace(stored.OriginalModels) != "" || strings.TrimSpace(stored.LastAppliedModels) != "") {
 		// 已建立模型限制快照时也算「已接管」，避免丢失快照。
 		needsStatusAction = needsStatusAction || len(statusModels) > 0
@@ -119,7 +133,7 @@ func (s *Service) reconcileTargetRemoteAction(
 		return "", nil
 	}
 
-	currentStatus := normalizeTargetStatus(target.Platform, target.AccountStatus)
+	currentStatus := effectiveLogicalStatus(target)
 	currentWeight := normalizedTargetWeight(target)
 
 	// —— 仅模型限制、尚未接管启停：用轻量快照，绝不改账号 active/inactive ——
@@ -138,16 +152,18 @@ func (s *Service) reconcileTargetRemoteAction(
 	if stored == nil {
 		originalStatus := currentStatus
 		originalWeight := cloneIntPointer(currentWeight)
-		// 账号当前停用且无历史快照时：
-		// 1) 事件里有系统停用痕迹，或
-		// 2) 已有健康有效模型（常见于磁盘故障丢快照后：模型已恢复但账号仍 inactive）
-		// → 按默认启用建立快照并继续恢复，避免永久钉死在停用。
-		// 无健康模型且无系统痕迹 → 视为用户原本停用，不擅自启用。
-		if !targetStatusEnabled(target.Platform, currentStatus) {
-			if legacyTargetWasManaged(statusAggStates) || (hasHealthyEffective && !blocked) {
+		// 账号当前摘流/停用且无历史快照时：
+		// 1) 事件里有系统摘流痕迹，或
+		// 2) 已有健康有效模型，或
+		// 3) 需要历史 inactive 恢复（needsLegacyInactiveRestore）
+		// → 按默认启用建立快照并继续恢复，避免永久钉死。
+		// 明确 blocked 且无系统痕迹 → 视为用户原本停用，不擅自启用。
+		if !logicalStatusEnabled(target.Platform, currentStatus) {
+			legacyManaged := legacyTargetWasManaged(statusAggStates) || legacyTargetWasManaged(allStates)
+			if legacyManaged || (hasHealthyEffective && !blocked) || needsLegacyInactiveRestore {
 				originalStatus, originalWeight = legacyOriginalTargetState(target.Platform)
-				log.Printf("[connection-health] adopt inactive account for restore target_id=%s account_id=%s healthy=%v legacyManaged=%v",
-					target.TargetID, target.AccountID, hasHealthyEffective, legacyTargetWasManaged(statusAggStates))
+				log.Printf("[connection-health] adopt disabled account for restore target_id=%s account_id=%s healthy=%v legacyManaged=%v emptyStates=%v",
+					target.TargetID, target.AccountID, hasHealthyEffective, legacyManaged, len(statusAggStates) == 0)
 			} else if needsModelLimits {
 				// 仅模型限制：不改启停。
 				stored = &TargetActionState{
@@ -172,9 +188,9 @@ func (s *Service) reconcileTargetRemoteAction(
 			return "", err
 		}
 	} else if len(statusModels) > 0 && targetActionCheckpointConflicted(target, stored, currentStatus, currentWeight) {
-		// 当前停用 + 有健康有效模型：优先视为「写入失败/进程中断/error 残留」，不要标死 conflict。
-		// 只有账号已启用却与 lastApplied 不一致时，才当作用户手动改动并停止覆盖。
-		if !targetStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
+		// 当前摘流 + 有健康有效模型：优先视为「写入失败/进程中断/error 残留」，不要标死 conflict。
+		// 只有账号已可调度却与 lastApplied 不一致时，才当作用户手动改动并停止覆盖。
+		if !logicalStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
 			log.Printf("[connection-health] ignore status mismatch for restore target_id=%s current=%s lastApplied=%s pending=%s",
 				target.TargetID, currentStatus, stored.LastAppliedStatus, stored.PendingStatus)
 			stored.Conflict = false
@@ -194,9 +210,9 @@ func (s *Service) reconcileTargetRemoteAction(
 		}
 	}
 	if stored.Conflict {
-		// 停用且有健康模型：清掉陈旧 conflict，允许恢复。
-		if !targetStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
-			log.Printf("[connection-health] clear conflict for inactive healthy target_id=%s", target.TargetID)
+		// 摘流且有健康模型：清掉陈旧 conflict，允许恢复。
+		if !logicalStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
+			log.Printf("[connection-health] clear conflict for disabled healthy target_id=%s", target.TargetID)
 			stored.Conflict = false
 		} else if targetStateEqual(target, currentStatus, currentWeight, stored.LastAppliedStatus, stored.LastAppliedWeight) {
 			log.Printf("[connection-health] clear stale target conflict target_id=%s current=%s lastApplied=%s",
@@ -326,8 +342,8 @@ func (s *Service) restoreUnmanagedTargetActions(
 						TargetID: targetID, Platform: string(inventory.session.Platform),
 						AdminGroupID: groupInventory.group.ID, AdminGroupName: groupInventory.group.Name,
 						AccountID: account.ID, AccountName: account.Name, AccountStatus: account.Status,
-						AccountWeight: cloneIntPointer(account.Weight), ProviderFamily: account.Platform,
-						Models: splitModelList(account.Models),
+						AccountSchedulable: account.Schedulable, AccountWeight: cloneIntPointer(account.Weight),
+						ProviderFamily: account.Platform, Models: splitModelList(account.Models),
 					}
 					found = true
 				}
@@ -349,12 +365,16 @@ func (s *Service) restoreUnmanagedTargetActions(
 			// The account can remain upstream after being removed from every group. We no longer
 			// have a list snapshot for conflict detection, but restoring the captured original
 			// value is safer than leaving a system-disabled account stuck forever.
+			// 无列表快照时：LastApplied 逻辑 inactive 表示关调度（或历史 status 停用）。
+			// 恢复时 applySub2APITrafficControl 会开调度，并在 AccountStatus 非 active 时写回 active。
+			schedulable := stored.LastAppliedStatus == "active" || stored.LastAppliedStatus == "1"
 			target = AdminProbeTarget{
 				TargetID: stored.TargetID, Platform: parsed.platform, AccountID: parsed.accountID,
-				AccountStatus: stored.LastAppliedStatus, AccountWeight: cloneIntPointer(stored.LastAppliedWeight),
+				AccountStatus: stored.LastAppliedStatus, AccountSchedulable: &schedulable,
+				AccountWeight: cloneIntPointer(stored.LastAppliedWeight),
 			}
 		}
-		currentStatus := normalizeTargetStatus(target.Platform, target.AccountStatus)
+		currentStatus := effectiveLogicalStatus(target)
 		currentWeight := normalizedTargetWeight(target)
 		if stored.Conflict || (targetVisible && targetActionCheckpointConflicted(target, &stored, currentStatus, currentWeight)) {
 			stored.Conflict = true
@@ -412,7 +432,7 @@ func hasRemoteActionModel(specs []probeModelSpec) bool {
 func legacyTargetWasManaged(states []ConnectionHealthState) bool {
 	for _, state := range states {
 		switch state.LastRemoteAction {
-		case RemoteActionSub2APIStatusInactive, "newapi_channel_disabled":
+		case RemoteActionSub2APIStatusInactive, RemoteActionSub2APISchedulableOff, "newapi_channel_disabled":
 			return true
 		}
 	}
@@ -429,8 +449,9 @@ func legacyOriginalTargetState(platform string) (string, *int) {
 
 func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blocked bool, minWeight int) {
 	// 账号级健康/阻塞只看「未走模型限制摘除」的模型。
-	// 已 suspended 的模型会从白名单摘除，不得再把 allHealthy 打成 false，
-	// 否则同账号其它健康模型也无法把账号从 inactive 恢复。
+	// 问题模型（暂停/观察/禁用/权重0）只摘模型，不得因单个坏模型把整账号 allHealthy/blocked 打坏，
+	// 否则同账号其它健康模型也无法继续调度。
+	// 仅当「没有任何剩余可调度有效模型」（全被摘除）时才 blocked，关整账号调度。
 	allHealthy = true
 	minWeight = 100
 	effectiveCount := 0
@@ -447,13 +468,9 @@ func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blo
 		if state.CurrentWeight < minWeight {
 			minWeight = state.CurrentWeight
 		}
-		// observing / disabled / 权重 0 仍阻塞账号（这些不靠模型白名单摘除解决）。
-		if state.State == StateObserving || state.State == StateDisabled || state.CurrentWeight <= 0 {
-			blocked = true
-		}
 	}
 	if effectiveCount == 0 {
-		// 没有任何有效模型：若全是摘除暂停则阻塞；若完全无状态则视为健康空集。
+		// 没有任何有效模型：若全是摘除模型则阻塞整账号；若完全无状态则视为健康空集。
 		allHealthy = exclusionCount == 0
 		if exclusionCount > 0 {
 			blocked = true
@@ -462,11 +479,24 @@ func aggregateTargetStates(states []ConnectionHealthState) (allHealthy bool, blo
 	return allHealthy, blocked, minWeight
 }
 
-// isModelLimitExclusionState 判定模型是否应暂时从 sub2api「模型限制」中摘除。
-// 产品语义：凡进入「探活暂停」(suspended) 的模型都不应再被调度，直到探活恢复；
-// 不区分 model_not_found / server_error / invalid_response / network_fluctuation 等具体原因。
+// isModelLimitExclusionState 判定模型是否应暂时从 sub2api「模型限制」中摘除（只动该模型，不关整账号）。
+// 产品语义：
+//   - suspended：探活暂停
+//   - observing：恢复观察（尚未完全健康，先摘掉避免观察期误调度）
+//   - disabled：模型级禁用（UI 即便暂无入口，语义也是单模型）
+//   - 非 healthy 且 currentWeight <= 0：本地健康权重为 0，不应再被调度
+// healthy 永不因 weight 字段缺省/为 0 被误摘（旧状态行可能未写 weight）。
+// 整账号关调度仅在 aggregateTargetStates 判定「无剩余有效模型」时发生。
 func isModelLimitExclusionState(state ConnectionHealthState) bool {
-	return state.State == StateSuspended
+	switch state.State {
+	case StateHealthy:
+		return false
+	case StateSuspended, StateObserving, StateDisabled:
+		return true
+	default:
+		// degraded / recovering / 其它：权重归零才摘除
+		return state.CurrentWeight <= 0
+	}
 }
 
 func hasModelLimitExclusion(states []ConnectionHealthState) bool {
@@ -729,13 +759,14 @@ func desiredTargetState(platform string, fullyHealthy bool, blocked bool, hasHea
 			weight := 0
 			return "2", &weight
 		}
+		// Sub2API：逻辑 inactive 表示关调度（ApplyTargetState 会写成 schedulable=false）。
 		return "inactive", nil
 	}
-	// 未阻塞：只要存在健康的有效模型（或全部有效模型健康），账号应保持/恢复启用。
-	// 这样可修复「系统曾写入 inactive，或 Original 误记为 inactive」导致的永久停用。
+	// 未阻塞：只要存在健康的有效模型（或全部有效模型健康），账号应保持/恢复可调度。
+	// 这样可修复「系统曾关调度 / 误写 inactive」导致的永久摘流。
 	// 用户手动改状态会走 conflict 路径，不会进入这里覆盖。
 	if fullyHealthy || hasHealthyEffective {
-		if targetStatusEnabled(platform, stored.OriginalStatus) {
+		if logicalStatusEnabled(platform, stored.OriginalStatus) {
 			return stored.OriginalStatus, cloneIntPointer(stored.OriginalWeight)
 		}
 		return legacyOriginalTargetState(platform)
@@ -745,6 +776,28 @@ func desiredTargetState(platform string, fullyHealthy bool, blocked bool, hasHea
 		return "1", &weight
 	}
 	return "active", nil
+}
+
+// effectiveLogicalStatus 把上游真实字段折叠为逻辑启停（active/inactive）。
+// Sub2API：status 非 active → inactive；status active 但 schedulable=false → inactive（关调度摘流）。
+func effectiveLogicalStatus(target AdminProbeTarget) string {
+	if target.Platform == string(upstream.PlatformNewAPI) {
+		return normalizeTargetStatus(target.Platform, target.AccountStatus)
+	}
+	if normalizeTargetStatus(string(upstream.PlatformSub2API), target.AccountStatus) != "active" {
+		return "inactive"
+	}
+	if target.AccountSchedulable != nil && !*target.AccountSchedulable {
+		return "inactive"
+	}
+	return "active"
+}
+
+func logicalStatusEnabled(platform, logicalStatus string) bool {
+	if platform == string(upstream.PlatformNewAPI) {
+		return logicalStatus == "1" || logicalStatus == "active" || logicalStatus == "enabled"
+	}
+	return logicalStatus == "active"
 }
 
 func hasHealthyEffectiveModel(states []ConnectionHealthState) bool {

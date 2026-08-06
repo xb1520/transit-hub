@@ -249,8 +249,14 @@ export interface ConnectionHealthPolicy {
   strategyMode?: ConnectionHealthStrategyMode
   /** 每日真实探活请求次数上限（单位：次/天，中国自然日 UTC+8 重置）。 */
   dailyProbeBudget: number
+  /** 每日探活金额预算上限（USD）；0 表示不按金额限流，仍统计展示已消耗金额。 */
+  dailyProbeBudgetCost?: number
+  /** 估算费率：USD / 千 tokens。无上游 usage 时按 max_tokens 估算。 */
+  probeCostPer1kTokens?: number
   /** 今日已消费的真实探活次数（与 dailyProbeBudget 同单位）。 */
   dailyProbeBudgetUsed?: number
+  /** 今日已累计估算探活费用（USD）。 */
+  dailyProbeBudgetCostUsed?: number
   createdAt: string
   updatedAt: string
   modelTargets: ConnectionHealthModelTarget[]
@@ -307,6 +313,8 @@ export interface PolicyInput {
   priorityMode?: ConnectionHealthPriorityMode
   strategyMode?: ConnectionHealthStrategyMode
   dailyProbeBudget?: number
+  dailyProbeBudgetCost?: number
+  probeCostPer1kTokens?: number
   modelTargets: ModelTargetInput[]
 }
 

@@ -16,7 +16,8 @@ import {
   ShieldCheck,
 } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
-import { getGroupUsageToday, getUpstreamKeyUsageToday } from '../api/dashboardAdmin'
+import { getGroupProfitToday, getGroupUsageToday } from '../api/dashboardAdmin'
+import { probeAdminGroupAutomation } from '../api/connectionHealth'
 import { listUpstreamSites } from '../api/upstream'
 import { connectionHealthMessageKey, useConnectionHealth } from '../composables/useConnectionHealth'
 import { formatCny } from '../utils/dashboard'
@@ -64,7 +65,9 @@ const groupSpendToday = ref<Map<string, number>>(new Map())
 const groupSpendLoaded = ref(false)
 /** 上游分组名 → 今日成本（key 用量按分组合计，与「今日成本」同源）。 */
 const upstreamGroupSpendToday = ref<Map<string, number>>(new Map())
-/** 是否已成功拉取过上游分组消耗。 */
+/** 上游分组名 → 今日利润（与仪表盘 group-profit-today 上游口径一致）。 */
+const upstreamGroupProfitToday = ref<Map<string, number>>(new Map())
+/** 是否已成功拉取过上游分组消耗/利润。 */
 const upstreamGroupSpendLoaded = ref(false)
 
 const groupTypes = ['public', 'exclusive', 'subscription']
@@ -144,20 +147,29 @@ const loadGroupSpendToday = async () => {
   }
 }
 
-const loadUpstreamGroupSpendToday = async () => {
+/** 一次拉取上游分组成本与利润（group-profit-today 已内含 key 用量聚合）。 */
+const loadUpstreamGroupEconomicsToday = async () => {
   try {
-    const response = await getUpstreamKeyUsageToday()
-    const next = new Map<string, number>()
-    for (const item of response.keys ?? []) {
+    const response = await getGroupProfitToday()
+    const spend = new Map<string, number>()
+    const profit = new Map<string, number>()
+    for (const item of response.upstreamGroups ?? []) {
       const name = (item.groupName || '').trim() || 'Ungrouped'
-      const amount = item.todayAmount ?? 0
-      if (!Number.isFinite(amount) || amount <= 0) continue
-      next.set(name, (next.get(name) ?? 0) + amount)
+      const cost = item.cost ?? 0
+      const profitAmount = item.profit ?? 0
+      if (Number.isFinite(cost) && cost > 0) {
+        spend.set(name, (spend.get(name) ?? 0) + cost)
+      }
+      if (Number.isFinite(profitAmount)) {
+        // 同名上游分组跨站点时累加利润（与消耗汇总方式一致）。
+        profit.set(name, (profit.get(name) ?? 0) + profitAmount)
+      }
     }
-    upstreamGroupSpendToday.value = next
+    upstreamGroupSpendToday.value = spend
+    upstreamGroupProfitToday.value = profit
     upstreamGroupSpendLoaded.value = true
   } catch {
-    // 上游分组消耗是附加信息，失败时保留上次数据，不阻塞健康主流程。
+    // 上游分组经济数据是附加信息，失败时保留上次数据，不阻塞健康主流程。
   }
 }
 
@@ -167,7 +179,7 @@ onMounted(() => {
   void loadPolicies()
   void loadSiteNames()
   void loadGroupSpendToday()
-  void loadUpstreamGroupSpendToday()
+  void loadUpstreamGroupEconomicsToday()
 })
 
 const documentVisibility = useDocumentVisibility()
@@ -180,7 +192,7 @@ const autoRefresh = async () => {
       loadAll({ silent: true }),
       loadEvents(selectedConnectionId.value || undefined),
       loadGroupSpendToday(),
-      loadUpstreamGroupSpendToday(),
+      loadUpstreamGroupEconomicsToday(),
     ])
   } finally {
     autoRefreshInFlight = false
@@ -193,7 +205,7 @@ watch(documentVisibility, (visibility) => {
 })
 
 const refresh = async () => {
-  await Promise.all([loadAll(), loadPolicies(), loadEvents(), loadGroupSpendToday(), loadUpstreamGroupSpendToday()])
+  await Promise.all([loadAll(), loadPolicies(), loadEvents(), loadGroupSpendToday(), loadUpstreamGroupEconomicsToday()])
 }
 
 const siteName = (siteId: string): string => siteNameMap.value.get(siteId) ?? siteId
@@ -210,6 +222,33 @@ const openSetup = (group: AdminGroupHealth) => {
 const onSetupSaved = async () => {
   setupDrawerOpen.value = false
   await Promise.all([loadAll({ silent: true }), loadPolicies()])
+}
+
+// 整组策略探活：跑一轮完整自动化探活（写状态/事件，可触发远端动作）。
+const groupProbeRunning = ref(false)
+const groupProbeMessage = ref('')
+const groupProbeError = ref('')
+
+const onProbeGroup = async (group: AdminGroupHealth) => {
+  if (groupProbeRunning.value) return
+  groupProbeRunning.value = true
+  groupProbeMessage.value = ''
+  groupProbeError.value = ''
+  try {
+    const result = await probeAdminGroupAutomation(group.id)
+    groupProbeMessage.value = t('admin.connectionHealth.groupDetail.probeAutomationResult', {
+      probed: result.probedTargets,
+      skipped: result.skippedTargets,
+      failed: result.failedTargets,
+      total: result.totalAccounts,
+    })
+    await Promise.all([loadAll({ silent: true }), loadEvents()])
+  } catch (err) {
+    const key = err instanceof Error ? err.message : 'admin.connectionHealth.errors.unknown'
+    groupProbeError.value = readableMessage(key)
+  } finally {
+    groupProbeRunning.value = false
+  }
 }
 
 // 一次性手动探活：不写状态/事件，不触发远端动作。
@@ -286,6 +325,8 @@ const togglePolicyEnabled = async (policy: ConnectionHealthPolicy) => {
     observationSeconds: policy.observationSeconds,
     recoveryStepPercent: policy.recoveryStepPercent,
     dailyProbeBudget: policy.dailyProbeBudget,
+    dailyProbeBudgetCost: policy.dailyProbeBudgetCost ?? 0,
+    probeCostPer1kTokens: policy.probeCostPer1kTokens ?? 0.002,
     autoDegradeEnabled: policy.autoDegradeEnabled,
     autoRemoteActionEnabled: policy.autoRemoteActionEnabled,
     priorityMode: policy.priorityMode ?? 'none',
@@ -450,12 +491,17 @@ const handleDeletePolicy = async (policy: ConnectionHealthPolicy) => {
           :group="selectedGroup"
           :today-spend="groupTodaySpend(selectedGroup)"
           :upstream-group-spend-today="upstreamGroupSpendToday"
+          :upstream-group-profit-today="upstreamGroupProfitToday"
           :upstream-group-spend-loaded="upstreamGroupSpendLoaded"
+          :group-probe-running="groupProbeRunning"
           @setup="openSetup"
           @probe="onProbeAccount"
+          @probe-group="onProbeGroup"
           @view-events="onViewEventsAccount"
         />
       </div>
+      <p v-if="groupProbeError" class="mt-3 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">{{ groupProbeError }}</p>
+      <p v-else-if="groupProbeMessage" class="mt-3 rounded-lg bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-400">{{ groupProbeMessage }}</p>
     </section>
 
     <GroupHealthSetupDrawer

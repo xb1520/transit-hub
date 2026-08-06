@@ -2534,10 +2534,14 @@ func (s *PlatformService) updateSub2APIAdminAccountPriority(session Session, acc
 //
 // Credentials 为部分合并写入（Sub2API merge 进现有 credentials JSONB）。
 // 模型限制必须写 credentials.model_mapping（白名单恒等映射）；顶层 models 无效。
+//
+// Schedulable 控制「调度开关」：关闭后账号仍保持 status=active，但不再被调度；
+// 这比写 status=inactive 更安全——部分 Sub2API 管理端把 inactive 后无法再改回 normal。
 type sub2APIAdminAccountBulkUpdate struct {
 	AccountIDs  []int64        `json:"account_ids"`
 	Priority    *int           `json:"priority,omitempty"`
 	Status      *string        `json:"status,omitempty"`
+	Schedulable *bool          `json:"schedulable,omitempty"`
 	Credentials map[string]any `json:"credentials,omitempty"`
 }
 
@@ -2569,10 +2573,19 @@ func (s *PlatformService) bulkUpdateSub2APIAdminAccount(session Session, account
 }
 
 // UpdateSub2APIAdminAccountStatus 通过字段级批量接口更新 sub2api 转发账号的启用状态
-// （"active"/"inactive"），供 connection_health 模块的自动降级/恢复动作使用。
+// （"active"/"inactive"）。健康探活自动降级请优先用 UpdateSub2APIAdminAccountSchedulable，
+// 避免把账号写成 inactive 后在部分 Sub2API 管理端无法恢复。
 func (s *PlatformService) UpdateSub2APIAdminAccountStatus(session Session, accountID string, status string) error {
 	return s.bulkUpdateSub2APIAdminAccount(session, accountID, sub2APIAdminAccountBulkUpdate{
 		Status: &status,
+	})
+}
+
+// UpdateSub2APIAdminAccountSchedulable 切换 sub2api 转发账号的调度开关（schedulable）。
+// 健康探活自动降级/恢复优先使用本接口：关闭调度即可摘流，账号 status 仍保持 active。
+func (s *PlatformService) UpdateSub2APIAdminAccountSchedulable(session Session, accountID string, schedulable bool) error {
+	return s.bulkUpdateSub2APIAdminAccount(session, accountID, sub2APIAdminAccountBulkUpdate{
+		Schedulable: &schedulable,
 	})
 }
 

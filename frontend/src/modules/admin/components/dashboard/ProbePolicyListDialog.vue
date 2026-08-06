@@ -28,6 +28,11 @@ const deleteCandidate = ref<ConnectionHealthPolicy | null>(null)
 const visibleDeleteError = ref('')
 const policyStrategyMode = resolveConnectionHealthStrategyMode
 
+const formatProbeCost = (value: number): string => {
+  if (!Number.isFinite(value)) return '$0.0000'
+  return `$${value.toFixed(4)}`
+}
+
 const requestDelete = (policy: ConnectionHealthPolicy) => {
   if (props.deletingPolicyId) return
   visibleDeleteError.value = ''
@@ -138,6 +143,12 @@ watch(() => props.policies.map(policy => policy.id).join('\u0000'), () => {
                       · {{ t(`${prefix}.budgetUsage`, {
                         used: policy.dailyProbeBudgetUsed ?? 0,
                         total: policy.dailyProbeBudget,
+                      }) }}
+                      · {{ t(`${prefix}.budgetCostUsage`, {
+                        used: formatProbeCost(policy.dailyProbeBudgetCostUsed ?? 0),
+                        total: (policy.dailyProbeBudgetCost ?? 0) > 0
+                          ? formatProbeCost(policy.dailyProbeBudgetCost ?? 0)
+                          : t(`${prefix}.budgetCostUnlimited`),
                       }) }}
                     </template>
                   </p>

@@ -35,16 +35,23 @@ type fakePlatformActioner struct {
 		weight    int
 		status    int
 	}
+	// sub2APICalls 记录 status 写入（仅历史 inactive 恢复路径）。
 	sub2APICalls []struct {
 		accountID string
 		status    string
+	}
+	// sub2APISchedulableCalls 记录调度开关写入（主降级/恢复路径）。
+	sub2APISchedulableCalls []struct {
+		accountID   string
+		schedulable bool
 	}
 	sub2APIModelCalls []struct {
 		accountID string
 		models    string
 	}
-	sub2APIErr       error
-	sub2APIModelsErr error
+	sub2APIErr           error
+	sub2APISchedulableErr error
+	sub2APIModelsErr     error
 }
 
 func (f *fakePlatformActioner) UpdateNewAPIChannelWeightStatus(session upstream.Session, channelID string, weight int, status int) error {
@@ -68,6 +75,17 @@ func (f *fakePlatformActioner) UpdateSub2APIAdminAccountStatus(session upstream.
 		status    string
 	}{accountID, status})
 	return f.sub2APIErr
+}
+
+func (f *fakePlatformActioner) UpdateSub2APIAdminAccountSchedulable(session upstream.Session, accountID string, schedulable bool) error {
+	if f.panicValue != nil {
+		panic(f.panicValue)
+	}
+	f.sub2APISchedulableCalls = append(f.sub2APISchedulableCalls, struct {
+		accountID   string
+		schedulable bool
+	}{accountID, schedulable})
+	return f.sub2APISchedulableErr
 }
 
 func (f *fakePlatformActioner) UpdateSub2APIAdminAccountModels(session upstream.Session, accountID string, models string) error {
@@ -133,9 +151,9 @@ func TestActions_NewAPIDegradePanicRecovered(t *testing.T) {
 	}
 }
 
-// TestActions_Sub2APIDegradeUpdatesAccountInactive 验证 sub2api 自动降级会调用
-// UpdateSub2APIAdminAccountStatus(session, accountID, "inactive")，并返回对应的 remoteAction。
-func TestActions_Sub2APIDegradeUpdatesAccountInactive(t *testing.T) {
+// TestActions_Sub2APIDegradeTurnsSchedulableOff 验证 sub2api 自动降级只关调度开关，
+// 绝不写 status=inactive（管理端对 inactive 难以恢复）。
+func TestActions_Sub2APIDegradeTurnsSchedulableOff(t *testing.T) {
 	sites := fakeSiteLookup{site: &upstream.Site{ID: "site-1", Platform: upstream.PlatformSub2API}}
 	sessions := fakeSessionProvider{session: upstream.Session{Platform: upstream.PlatformSub2API}}
 	platform := &fakePlatformActioner{}
@@ -146,17 +164,19 @@ func TestActions_Sub2APIDegradeUpdatesAccountInactive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusInactive {
-		t.Fatalf("expected sub2api_account_status_inactive, got %s", action)
+	if action != RemoteActionSub2APISchedulableOff {
+		t.Fatalf("expected sub2api_account_schedulable_off, got %s", action)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].accountID != "sub-account-1" || platform.sub2APICalls[0].status != "inactive" {
-		t.Fatalf("expected one call with accountID=sub-account-1 status=inactive, got %+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || platform.sub2APISchedulableCalls[0].accountID != "sub-account-1" || platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=false, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 0 {
+		t.Fatalf("degrade must not write status, got %+v", platform.sub2APICalls)
 	}
 }
 
-// TestActions_Sub2APIRestoreUpdatesAccountActive 验证 sub2api 自动恢复会调用
-// UpdateSub2APIAdminAccountStatus(session, accountID, "active")，并返回对应的 remoteAction。
-func TestActions_Sub2APIRestoreUpdatesAccountActive(t *testing.T) {
+// TestActions_Sub2APIRestoreTurnsSchedulableOn 验证恢复会开调度，并顺带把历史 inactive status 拉回 active。
+func TestActions_Sub2APIRestoreTurnsSchedulableOn(t *testing.T) {
 	sites := fakeSiteLookup{site: &upstream.Site{ID: "site-1", Platform: upstream.PlatformSub2API}}
 	sessions := fakeSessionProvider{session: upstream.Session{Platform: upstream.PlatformSub2API}}
 	platform := &fakePlatformActioner{}
@@ -167,11 +187,14 @@ func TestActions_Sub2APIRestoreUpdatesAccountActive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusActive {
-		t.Fatalf("expected sub2api_account_status_active, got %s", action)
+	if action != RemoteActionSub2APISchedulableOn+","+RemoteActionSub2APIStatusActive {
+		t.Fatalf("expected schedulable_on + status_active, got %s", action)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].accountID != "sub-account-1" || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("expected one call with accountID=sub-account-1 status=active, got %+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=true, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("expected status=active recovery write, got %+v", platform.sub2APICalls)
 	}
 }
 
@@ -195,14 +218,11 @@ func TestActions_Sub2APIDoesNotUseNewAPIWeightStatus(t *testing.T) {
 	}
 }
 
-// TestActions_Sub2APIRemoteFailureIsReturned 验证平台方法返回错误时，dispatcher 不 panic，
-// 错误可被上层记录；remoteAction 必须是 sub2api_account_status_inactive_failed，不能回退成
-// unsupported——sub2api 已经支持这个动作，真的发起了调用只是失败了，和「不支持」是两回事，
-// 混为一谈会让排查者误判成平台能力问题而不是一次真实的上游调用故障。
+// TestActions_Sub2APIRemoteFailureIsReturned 验证关调度失败时返回 schedulable_off_failed，不折叠成 unsupported。
 func TestActions_Sub2APIRemoteFailureIsReturned(t *testing.T) {
 	sites := fakeSiteLookup{site: &upstream.Site{ID: "site-1", Platform: upstream.PlatformSub2API}}
 	sessions := fakeSessionProvider{session: upstream.Session{Platform: upstream.PlatformSub2API}}
-	platform := &fakePlatformActioner{sub2APIErr: errors.New("upstream 500")}
+	platform := &fakePlatformActioner{sub2APISchedulableErr: errors.New("upstream 500")}
 	dispatcher := newRemoteActionDispatcher(sites, sessions, platform)
 
 	conn := my_sites.RealConnection{UpstreamSiteID: "site-1", AdminAccountID: "sub-account-1"}
@@ -210,55 +230,58 @@ func TestActions_Sub2APIRemoteFailureIsReturned(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error to propagate")
 	}
-	if action != RemoteActionSub2APIStatusInactiveFailed {
-		t.Fatalf("expected sub2api_account_status_inactive_failed, got %s", action)
+	if action != RemoteActionSub2APISchedulableOffFailed {
+		t.Fatalf("expected sub2api_account_schedulable_off_failed, got %s", action)
 	}
 }
 
-// TestActions_Sub2APIDegradeTargetUpdatesAccountInactive 验证 target 维度的 DegradeTarget
-// 直接用调用方传入的 session + AdminProbeTarget.AccountID，不依赖 real_connections。
-func TestActions_Sub2APIDegradeTargetUpdatesAccountInactive(t *testing.T) {
+// TestActions_Sub2APIDegradeTargetTurnsSchedulableOff 验证 target 维度降级只关调度。
+func TestActions_Sub2APIDegradeTargetTurnsSchedulableOff(t *testing.T) {
 	platform := &fakePlatformActioner{}
 	dispatcher := newRemoteActionDispatcher(fakeSiteLookup{}, fakeSessionProvider{}, platform)
 
 	session := upstream.Session{Platform: upstream.PlatformSub2API}
-	target := AdminProbeTarget{TargetID: "sub2api:ws1:acc-1", Platform: string(upstream.PlatformSub2API), AccountID: "acc-1"}
+	target := AdminProbeTarget{TargetID: "sub2api:ws1:acc-1", Platform: string(upstream.PlatformSub2API), AccountID: "acc-1", AccountStatus: "active"}
 	action, err := dispatcher.DegradeTarget(context.Background(), session, target, ConnectionHealthState{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusInactive {
-		t.Fatalf("expected sub2api_account_status_inactive, got %s", action)
+	if action != RemoteActionSub2APISchedulableOff {
+		t.Fatalf("expected sub2api_account_schedulable_off, got %s", action)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].accountID != "acc-1" || platform.sub2APICalls[0].status != "inactive" {
-		t.Fatalf("expected one call with accountID=acc-1 status=inactive, got %+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || platform.sub2APISchedulableCalls[0].schedulable || platform.sub2APISchedulableCalls[0].accountID != "acc-1" {
+		t.Fatalf("expected schedulable=false for acc-1, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 0 {
+		t.Fatalf("must not write status on degrade, got %+v", platform.sub2APICalls)
 	}
 }
 
-// TestActions_Sub2APIRestoreTargetUpdatesAccountActive 验证 target 维度的 RestoreTarget。
-func TestActions_Sub2APIRestoreTargetUpdatesAccountActive(t *testing.T) {
+// TestActions_Sub2APIRestoreTargetTurnsSchedulableOn 验证 target 维度恢复开调度；status 已是 active 时不写 status。
+func TestActions_Sub2APIRestoreTargetTurnsSchedulableOn(t *testing.T) {
 	platform := &fakePlatformActioner{}
 	dispatcher := newRemoteActionDispatcher(fakeSiteLookup{}, fakeSessionProvider{}, platform)
 
 	session := upstream.Session{Platform: upstream.PlatformSub2API}
-	target := AdminProbeTarget{TargetID: "sub2api:ws1:acc-1", Platform: string(upstream.PlatformSub2API), AccountID: "acc-1"}
+	target := AdminProbeTarget{TargetID: "sub2api:ws1:acc-1", Platform: string(upstream.PlatformSub2API), AccountID: "acc-1", AccountStatus: "active"}
 	action, err := dispatcher.RestoreTarget(context.Background(), session, target, ConnectionHealthState{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusActive {
-		t.Fatalf("expected sub2api_account_status_active, got %s", action)
+	if action != RemoteActionSub2APISchedulableOn {
+		t.Fatalf("expected sub2api_account_schedulable_on, got %s", action)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].accountID != "acc-1" || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("expected one call with accountID=acc-1 status=active, got %+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=true, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 0 {
+		t.Fatalf("active status must not re-write status, got %+v", platform.sub2APICalls)
 	}
 }
 
-// TestActions_Sub2APIDegradeTargetFailureReturnsFailedAction 验证 target 维度 DegradeTarget
-// 在 UpdateSub2APIAdminAccountStatus 返回 error 时，返回 sub2api_account_status_inactive_failed
-// 而不是 unsupported（unsupported 只应表示这个平台/维度本身不支持远端动作）。
+// TestActions_Sub2APIDegradeTargetFailureReturnsFailedAction 验证关调度失败返回 failed 标记。
 func TestActions_Sub2APIDegradeTargetFailureReturnsFailedAction(t *testing.T) {
-	platform := &fakePlatformActioner{sub2APIErr: errors.New("upstream 500")}
+	platform := &fakePlatformActioner{sub2APISchedulableErr: errors.New("upstream 500")}
 	dispatcher := newRemoteActionDispatcher(fakeSiteLookup{}, fakeSessionProvider{}, platform)
 
 	session := upstream.Session{Platform: upstream.PlatformSub2API}
@@ -267,25 +290,24 @@ func TestActions_Sub2APIDegradeTargetFailureReturnsFailedAction(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error to propagate")
 	}
-	if action != RemoteActionSub2APIStatusInactiveFailed {
-		t.Fatalf("expected sub2api_account_status_inactive_failed, got %s", action)
+	if action != RemoteActionSub2APISchedulableOffFailed {
+		t.Fatalf("expected sub2api_account_schedulable_off_failed, got %s", action)
 	}
 }
 
-// TestActions_Sub2APIRestoreTargetFailureReturnsFailedAction 验证 target 维度 RestoreTarget
-// 失败时返回 sub2api_account_status_active_failed，不能回退成 unsupported。
+// TestActions_Sub2APIRestoreTargetFailureReturnsFailedAction 验证开调度失败返回 failed 标记。
 func TestActions_Sub2APIRestoreTargetFailureReturnsFailedAction(t *testing.T) {
-	platform := &fakePlatformActioner{sub2APIErr: errors.New("upstream 500")}
+	platform := &fakePlatformActioner{sub2APISchedulableErr: errors.New("upstream 500")}
 	dispatcher := newRemoteActionDispatcher(fakeSiteLookup{}, fakeSessionProvider{}, platform)
 
 	session := upstream.Session{Platform: upstream.PlatformSub2API}
-	target := AdminProbeTarget{TargetID: "sub2api:ws1:acc-1", Platform: string(upstream.PlatformSub2API), AccountID: "acc-1"}
+	target := AdminProbeTarget{TargetID: "sub2api:ws1:acc-1", Platform: string(upstream.PlatformSub2API), AccountID: "acc-1", AccountStatus: "active"}
 	action, err := dispatcher.RestoreTarget(context.Background(), session, target, ConnectionHealthState{})
 	if err == nil {
 		t.Fatalf("expected error to propagate")
 	}
-	if action != RemoteActionSub2APIStatusActiveFailed {
-		t.Fatalf("expected sub2api_account_status_active_failed, got %s", action)
+	if action != RemoteActionSub2APISchedulableOnFailed {
+		t.Fatalf("expected sub2api_account_schedulable_on_failed, got %s", action)
 	}
 }
 

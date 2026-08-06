@@ -36,6 +36,7 @@ func RegisterRoutes(mux *http.ServeMux, service *Service) {
 	mux.HandleFunc("PUT /api/connection-health/targets/{id}/policy-assignments", handler.putPolicyAssignments)
 	mux.HandleFunc("GET /api/connection-health/admin-groups/{id}/policy-configuration", handler.getAdminGroupPolicyConfiguration)
 	mux.HandleFunc("PUT /api/connection-health/admin-groups/{id}/policy-configuration", handler.putAdminGroupPolicyConfiguration)
+	mux.HandleFunc("POST /api/connection-health/admin-groups/{id}/probe-automation", handler.probeAdminGroupAutomation)
 }
 
 func (h *Handler) storedSummary(w http.ResponseWriter, r *http.Request) {
@@ -394,6 +395,21 @@ func (h *Handler) putAdminGroupPolicyConfiguration(w http.ResponseWriter, r *htt
 		return
 	}
 	result, err := h.service.SetAdminGroupPolicyConfiguration(r.Context(), userID, r.PathValue("id"), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	httpjson.Write(w, http.StatusOK, result)
+}
+
+// probeAdminGroupAutomation 手动触发整个 admin 分组的策略探活（写状态/事件，可触发远端动作）。
+func (h *Handler) probeAdminGroupAutomation(w http.ResponseWriter, r *http.Request) {
+	userID, ok := authctx.UserID(r.Context())
+	if !ok {
+		httpjson.WriteError(w, http.StatusUnauthorized, "auth.errors.unauthorized")
+		return
+	}
+	result, err := h.service.ProbeAdminGroupAutomation(r.Context(), userID, r.PathValue("id"))
 	if err != nil {
 		writeError(w, err)
 		return

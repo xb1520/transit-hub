@@ -127,6 +127,23 @@ export const getAdminGroupPolicyConfiguration = async (adminGroupId: string): Pr
     `/connection-health/admin-groups/${encodeURIComponent(adminGroupId)}/policy-configuration`,
   )
 
+/** 分组级手动策略探活汇总（写状态/事件，可触发远端动作）。 */
+export interface AdminGroupProbeAutomationResult {
+  adminGroupId: string
+  adminGroupName: string
+  probedTargets: number
+  skippedTargets: number
+  failedTargets: number
+  totalAccounts: number
+}
+
+/** 手动触发整个 admin 分组的策略探活一轮。 */
+export const probeAdminGroupAutomation = async (adminGroupId: string): Promise<AdminGroupProbeAutomationResult> =>
+  requestJson<AdminGroupProbeAutomationResult>(
+    `/connection-health/admin-groups/${encodeURIComponent(adminGroupId)}/probe-automation`,
+    { method: 'POST' },
+  )
+
 export const setAdminGroupPolicyConfiguration = async (
   adminGroupId: string,
   input: AdminGroupPolicyConfigurationInput,

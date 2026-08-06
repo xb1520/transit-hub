@@ -185,6 +185,8 @@ func (s *Service) runSchedulerTick(ctx context.Context) {
 	// 探活有冷却/间隔：已暂停模型可能本轮不会再被探测。每 tick 根据库内状态立即同步
 	// sub2api 模型限制，避免「已探活暂停但要等下一轮探测才摘除」。
 	s.syncModelLimitsFromStoredStates(ctx, policies, assignments, groupAssignments, exclusions, inventoryCache)
+	// 历史 status=inactive / 关调度账号：不依赖新探活也要 reconcile 一次，避免永久卡在管理端不可恢复的停用。
+	s.syncSub2APITrafficRestoreFromInventory(ctx, policies, assignments, groupAssignments, exclusions, inventoryCache)
 }
 
 // syncModelLimitsFromStoredStates 不发起探活，只根据库内已有健康状态同步 sub2api 模型白名单。
@@ -253,8 +255,8 @@ func (s *Service) syncModelLimitsFromStoredStates(
 						TargetID: targetID, Platform: platform,
 						AdminGroupID: groupInventory.group.ID, AdminGroupName: groupInventory.group.Name,
 						AccountID: acc.ID, AccountName: acc.Name, AccountStatus: acc.Status,
-						AccountWeight: cloneIntPointer(acc.Weight), ProviderFamily: acc.Platform,
-						Models: splitModelList(acc.Models),
+						AccountSchedulable: acc.Schedulable, AccountWeight: cloneIntPointer(acc.Weight),
+						ProviderFamily: acc.Platform, Models: splitModelList(acc.Models),
 					}
 					if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, targetID); storeErr == nil {
 						target = expandTargetModelsForProbe(target, stored)
@@ -281,6 +283,108 @@ func (s *Service) syncModelLimitsFromStoredStates(
 			}
 			if _, err := s.reconcileTargetRemoteAction(ctx, ws.userID, ws.adminAccountID, inventory.session, b.target, specs); err != nil {
 				log.Printf("[connection-health] model-limits sweep failed target_id=%s err=%v", targetID, err)
+			}
+		}
+	}
+}
+
+// syncSub2APITrafficRestoreFromInventory 不发起探活，专门扫一遍「status=inactive / 关调度」的
+// Sub2API 账号并 reconcile。用于把旧降级路径写死的 inactive 拉回 active+可调度，避免必须等下一次探活。
+func (s *Service) syncSub2APITrafficRestoreFromInventory(
+	ctx context.Context,
+	policies []Policy,
+	targetAssignments []PolicyAssignment,
+	groupAssignments []GroupPolicyAssignment,
+	exclusions []GroupTargetExclusion,
+	inventoryCache adminInventoryCache,
+) {
+	if s.platformGroups == nil || s.dispatcher == nil {
+		return
+	}
+	targetPolicies := assignedEnabledPoliciesByTarget(policies, targetAssignments)
+	groupPolicies := assignedEnabledPoliciesByGroup(policies, groupAssignments)
+	excluded := groupTargetExclusionIndex(exclusions)
+
+	type wsKey struct{ userID, adminAccountID string }
+	workspaces := make(map[wsKey]struct{})
+	for _, p := range policies {
+		if p.Enabled {
+			workspaces[wsKey{p.UserID, p.AdminAccountID}] = struct{}{}
+		}
+	}
+	for _, a := range targetAssignments {
+		workspaces[wsKey{a.UserID, a.AdminAccountID}] = struct{}{}
+	}
+	for _, a := range groupAssignments {
+		workspaces[wsKey{a.UserID, a.AdminAccountID}] = struct{}{}
+	}
+
+	for ws := range workspaces {
+		inventory, err := s.loadAdminInventory(ctx, ws.userID, ws.adminAccountID, inventoryCache)
+		if err != nil {
+			continue
+		}
+		platform := string(inventory.session.Platform)
+		if platform != string(upstream.PlatformSub2API) {
+			continue
+		}
+		type targetBundle struct {
+			target   AdminProbeTarget
+			policies []Policy
+		}
+		bundles := make(map[string]*targetBundle)
+		for _, groupInventory := range inventory.groups {
+			if groupInventory.err != nil {
+				continue
+			}
+			for _, acc := range groupInventory.accounts {
+				// 仅处理仍显示停用/关调度的账号，减少无意义写放大。
+				if normalizeTargetStatus(platform, acc.Status) == "active" && (acc.Schedulable == nil || *acc.Schedulable) {
+					continue
+				}
+				targetID := buildTargetID(platform, ws.adminAccountID, acc.ID)
+				inherited := groupPolicies[ws.userID+"|"+ws.adminAccountID][groupInventory.group.ID]
+				if excluded[ws.userID+"|"+ws.adminAccountID][groupInventory.group.ID][targetID] {
+					inherited = nil
+				}
+				effective := mergePoliciesByID(targetPolicies[ws.userID+"|"+ws.adminAccountID][targetID], inherited)
+				if len(effective) == 0 || !hasRemoteActionModel(candidateModelSpecs(splitModelList(acc.Models), effective)) {
+					continue
+				}
+				b, ok := bundles[targetID]
+				if !ok {
+					target := AdminProbeTarget{
+						TargetID: targetID, Platform: platform,
+						AdminGroupID: groupInventory.group.ID, AdminGroupName: groupInventory.group.Name,
+						AccountID: acc.ID, AccountName: acc.Name, AccountStatus: acc.Status,
+						AccountSchedulable: acc.Schedulable, AccountWeight: cloneIntPointer(acc.Weight),
+						ProviderFamily: acc.Platform, Models: splitModelList(acc.Models),
+					}
+					if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, targetID); storeErr == nil {
+						target = expandTargetModelsForProbe(target, stored)
+					}
+					b = &targetBundle{target: target}
+					bundles[targetID] = b
+				}
+				b.policies = mergePoliciesByID(b.policies, effective)
+			}
+		}
+		for targetID, b := range bundles {
+			specs := candidateModelSpecs(b.target.Models, b.policies)
+			if len(specs) == 0 {
+				// 无模型目标时仍构造一条空策略入口，让 reconcile 有机会按远端动作策略恢复 inactive。
+				for _, p := range b.policies {
+					if p.Enabled && policyRemoteActionEnabled(p) {
+						specs = append(specs, probeModelSpec{policy: p})
+						break
+					}
+				}
+			}
+			if len(specs) == 0 {
+				continue
+			}
+			if _, err := s.reconcileTargetRemoteAction(ctx, ws.userID, ws.adminAccountID, inventory.session, b.target, specs); err != nil {
+				log.Printf("[connection-health] sub2api traffic restore sweep failed target_id=%s err=%v", targetID, err)
 			}
 		}
 	}
@@ -400,6 +504,7 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 	now := time.Now()
 	modelBudget := maxJobsPerTick
 	budgetUsage := make(map[string]int)
+	budgetCostUsage := make(map[string]float64)
 	budgetLoaded := make(map[string]bool)
 	dayStart := probeBudgetDayStart(time.Now())
 
@@ -448,16 +553,17 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 			}
 			for _, acc := range groupInventory.accounts {
 				target := AdminProbeTarget{
-					TargetID:       buildTargetID(platform, ws.adminAccountID, acc.ID),
-					Platform:       platform,
-					AdminGroupID:   group.ID,
-					AdminGroupName: group.Name,
-					AccountID:      acc.ID,
-					AccountName:    acc.Name,
-					AccountStatus:  acc.Status,
-					AccountWeight:  cloneIntPointer(acc.Weight),
-					ProviderFamily: acc.Platform,
-					Models:         splitModelList(acc.Models),
+					TargetID:           buildTargetID(platform, ws.adminAccountID, acc.ID),
+					Platform:           platform,
+					AdminGroupID:       group.ID,
+					AdminGroupName:     group.Name,
+					AccountID:          acc.ID,
+					AccountName:        acc.Name,
+					AccountStatus:      acc.Status,
+					AccountSchedulable: acc.Schedulable,
+					AccountWeight:      cloneIntPointer(acc.Weight),
+					ProviderFamily:     acc.Platform,
+					Models:             splitModelList(acc.Models),
 				}
 				inheritedPolicies := assignedGroups[group.ID]
 				if excludedByWorkspace[key][group.ID][target.TargetID] {
@@ -523,15 +629,19 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 				}
 				budgetKey := ws.userID + "|" + ws.adminAccountID + "|" + spec.policy.ID
 				if !budgetLoaded[budgetKey] {
-					count, countErr := s.repo.CountProbesToday(ctx, ws.userID, ws.adminAccountID, spec.policy.ID, dayStart)
+					usage, countErr := s.repo.GetProbeBudgetUsage(ctx, ws.userID, ws.adminAccountID, spec.policy.ID, dayStart)
 					if countErr != nil {
 						log.Printf("[connection-health] count policy probe budget failed policy_id=%s err=%v", spec.policy.ID, countErr)
 						continue
 					}
-					budgetUsage[budgetKey] = count
+					budgetUsage[budgetKey] = usage.Used
+					budgetCostUsage[budgetKey] = usage.UsedCost
 					budgetLoaded[budgetKey] = true
 				}
 				if budgetUsage[budgetKey] >= probeBudgetLimit(spec.policy) {
+					continue
+				}
+				if spec.policy.DailyProbeBudgetCost > 0 && budgetCostUsage[budgetKey] >= spec.policy.DailyProbeBudgetCost {
 					continue
 				}
 				dueSpecs = append(dueSpecs, spec)

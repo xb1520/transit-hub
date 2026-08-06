@@ -28,9 +28,12 @@ type RemoteActionRunner interface {
 // 避免直接依赖 PlatformService 的其余大量方法。
 type PlatformActioner interface {
 	UpdateNewAPIChannelWeightStatus(session upstream.Session, channelID string, weight int, status int) error
-	// UpdateSub2APIAdminAccountStatus 切换 sub2api 转发账号的启用状态（active/inactive）。
-	// 第一期远端动作只做状态开关，不做 priority 权重映射（见 dispatcher 顶部说明）。
+	// UpdateSub2APIAdminAccountStatus 切换 sub2api 转发账号 status（active/inactive）。
+	// 仅用于从历史 inactive 恢复；新的自动降级请用 UpdateSub2APIAdminAccountSchedulable。
 	UpdateSub2APIAdminAccountStatus(session upstream.Session, accountID string, status string) error
+	// UpdateSub2APIAdminAccountSchedulable 切换 sub2api 转发账号调度开关。
+	// 自动降级关调度、恢复开调度，避免写 status=inactive 导致管理端无法恢复。
+	UpdateSub2APIAdminAccountSchedulable(session upstream.Session, accountID string, schedulable bool) error
 	// UpdateSub2APIAdminAccountModels 更新 sub2api 转发账号的模型限制（逗号分隔 models 字段）。
 	UpdateSub2APIAdminAccountModels(session upstream.Session, accountID string, models string) error
 }
@@ -43,21 +46,22 @@ type SessionProvider interface {
 // RemoteActionUnsupported 是没有已验证安全接口时的统一标记，绝不发明未经证实的远端请求。
 const RemoteActionUnsupported = "unsupported"
 
-// Sub2API 账号状态切换的远端动作标记：第一期远端动作只做账号 active/inactive 开关，
-// 不做 priority 权重映射——sub2api 的 priority 是调度优先级，不等同于 NewAPI 的 weight，
-// 强行映射 CurrentWeight(0-100) -> priority 会改变调度语义，线上风险较高（详见任务书）。
-// 后续如需要 priority 阶梯恢复，需要单独的产品规则，不在本次改造范围内。
+// Sub2API 远端动作标记：
+//   - 自动降级/恢复主路径改为调度开关（schedulable），不再写 status=inactive。
+//   - status_active 仍保留：仅用于把历史误写成 inactive 的账号拉回 active，便于管理端继续操作。
+//   - 不做 priority 权重映射——sub2api 的 priority 是调度优先级，不等同于 NewAPI 的 weight。
 //
-// *Failed 常量专门用来和 RemoteActionUnsupported 区分开：unsupported 表示这个平台/维度本身
-// 没有已验证的远端动作能力（不会尝试调用上游）；*Failed 表示 Sub2API 已支持该动作、也确实
-// 发起了调用，但 UpdateSub2APIAdminAccountStatus 返回了 error（GET/PUT 失败、鉴权失败、
-// 响应结构异常等）。把真实失败折叠成 unsupported 会让排查者误以为「这个平台不支持」，
-// 从而错过真正的上游调用故障。
+// *Failed 与 RemoteActionUnsupported 区分：unsupported=平台无能力；*Failed=已调用但上游失败。
 const (
+	// 兼容旧事件/快照中的 status 动作名；新写入优先用 schedulable_*。
 	RemoteActionSub2APIStatusInactive       = "sub2api_account_status_inactive"
 	RemoteActionSub2APIStatusActive         = "sub2api_account_status_active"
 	RemoteActionSub2APIStatusInactiveFailed = "sub2api_account_status_inactive_failed"
 	RemoteActionSub2APIStatusActiveFailed   = "sub2api_account_status_active_failed"
+	RemoteActionSub2APISchedulableOff       = "sub2api_account_schedulable_off"
+	RemoteActionSub2APISchedulableOn        = "sub2api_account_schedulable_on"
+	RemoteActionSub2APISchedulableOffFailed = "sub2api_account_schedulable_off_failed"
+	RemoteActionSub2APISchedulableOnFailed  = "sub2api_account_schedulable_on_failed"
 	RemoteActionSub2APIModelsUpdated        = "sub2api_account_models_updated"
 	RemoteActionSub2APIModelsUpdateFailed   = "sub2api_account_models_update_failed"
 	RemoteActionNewAPIUpdateFailed          = "newapi_channel_update_failed"
@@ -143,12 +147,7 @@ func (d *remoteActionDispatcher) DegradeTarget(ctx context.Context, session upst
 	if target.Platform != string(upstream.PlatformSub2API) {
 		return RemoteActionUnsupported, nil
 	}
-	if err := d.platform.UpdateSub2APIAdminAccountStatus(session, target.AccountID, "inactive"); err != nil {
-		// 已经进入 sub2api 支持的动作分支，真的发起了调用但失败了：必须和「不支持」区分开，
-		// 否则排查者会误以为 sub2api 从不支持这个动作。
-		return RemoteActionSub2APIStatusInactiveFailed, err
-	}
-	return RemoteActionSub2APIStatusInactive, nil
+	return d.applySub2APITrafficControl(session, target, "inactive")
 }
 
 func (d *remoteActionDispatcher) RestoreTarget(ctx context.Context, session upstream.Session, target AdminProbeTarget, state ConnectionHealthState) (remoteAction string, err error) {
@@ -175,10 +174,7 @@ func (d *remoteActionDispatcher) RestoreTarget(ctx context.Context, session upst
 	if target.Platform != string(upstream.PlatformSub2API) {
 		return RemoteActionUnsupported, nil
 	}
-	if err := d.platform.UpdateSub2APIAdminAccountStatus(session, target.AccountID, "active"); err != nil {
-		return RemoteActionSub2APIStatusActiveFailed, err
-	}
-	return RemoteActionSub2APIStatusActive, nil
+	return d.applySub2APITrafficControl(session, target, "active")
 }
 
 // ApplyTargetState 写入账号级聚合决策。旧 real_connections 仍使用 Degrade/Restore；新的
@@ -217,16 +213,33 @@ func (d *remoteActionDispatcher) ApplyTargetState(ctx context.Context, session u
 	if status == "inactive" || status == "disabled" || status == "2" {
 		resolvedStatus = "inactive"
 	}
-	if err := d.platform.UpdateSub2APIAdminAccountStatus(session, target.AccountID, resolvedStatus); err != nil {
-		if resolvedStatus == "inactive" {
-			return RemoteActionSub2APIStatusInactiveFailed, err
+	return d.applySub2APITrafficControl(session, target, resolvedStatus)
+}
+
+// applySub2APITrafficControl 把逻辑启停映射到 Sub2API 调度开关：
+//   - 降级（inactive）：只关 schedulable，绝不写 status=inactive
+//   - 恢复（active）：开 schedulable；若账号仍是历史 inactive/error，再写 status=active 以便管理端可操作
+func (d *remoteActionDispatcher) applySub2APITrafficControl(session upstream.Session, target AdminProbeTarget, desired string) (string, error) {
+	if desired == "inactive" {
+		if err := d.platform.UpdateSub2APIAdminAccountSchedulable(session, target.AccountID, false); err != nil {
+			return RemoteActionSub2APISchedulableOffFailed, err
 		}
-		return RemoteActionSub2APIStatusActiveFailed, err
+		return RemoteActionSub2APISchedulableOff, nil
 	}
-	if resolvedStatus == "inactive" {
-		return RemoteActionSub2APIStatusInactive, nil
+
+	// 恢复：先开调度。
+	if err := d.platform.UpdateSub2APIAdminAccountSchedulable(session, target.AccountID, true); err != nil {
+		return RemoteActionSub2APISchedulableOnFailed, err
 	}
-	return RemoteActionSub2APIStatusActive, nil
+	action := RemoteActionSub2APISchedulableOn
+	// 历史路径可能写过 status=inactive；管理端对 inactive 难恢复，这里顺带拉回 active。
+	if normalizeTargetStatus(string(upstream.PlatformSub2API), target.AccountStatus) != "active" {
+		if err := d.platform.UpdateSub2APIAdminAccountStatus(session, target.AccountID, "active"); err != nil {
+			return RemoteActionSub2APIStatusActiveFailed, err
+		}
+		action = RemoteActionSub2APISchedulableOn + "," + RemoteActionSub2APIStatusActive
+	}
+	return action, nil
 }
 
 // ApplyTargetModels 仅对 sub2api 账号写入 models 字段（模型限制）。其它平台返回 unsupported。
@@ -285,8 +298,8 @@ func (d *remoteActionDispatcher) restoreNewAPI(ctx context.Context, conn my_site
 }
 
 // degradeSub2API / restoreSub2API 是旧 real_connections 对接链路路径下的 sub2api 远端动作：
-// RealConnection.AdminAccountID 在 sub2api 场景下就是 sub2api admin account id（见
-// my_sites.RealConnection 字段注释），只切换账号 active/inactive，不映射 priority。
+// RealConnection.AdminAccountID 在 sub2api 场景下就是 sub2api admin account id。
+// 与独立探活路径一致：降级关调度，恢复开调度（必要时顺带恢复 status=active）。
 func (d *remoteActionDispatcher) degradeSub2API(ctx context.Context, conn my_sites.RealConnection) (string, error) {
 	accountID := conn.AdminAccountID
 	if accountID == "" {
@@ -296,10 +309,8 @@ func (d *remoteActionDispatcher) degradeSub2API(ctx context.Context, conn my_sit
 	if err != nil {
 		return RemoteActionUnsupported, err
 	}
-	if err := d.platform.UpdateSub2APIAdminAccountStatus(session, accountID, "inactive"); err != nil {
-		return RemoteActionSub2APIStatusInactiveFailed, err
-	}
-	return RemoteActionSub2APIStatusInactive, nil
+	target := AdminProbeTarget{AccountID: accountID, Platform: string(upstream.PlatformSub2API), AccountStatus: "active"}
+	return d.applySub2APITrafficControl(session, target, "inactive")
 }
 
 func (d *remoteActionDispatcher) restoreSub2API(ctx context.Context, conn my_sites.RealConnection) (string, error) {
@@ -311,8 +322,7 @@ func (d *remoteActionDispatcher) restoreSub2API(ctx context.Context, conn my_sit
 	if err != nil {
 		return RemoteActionUnsupported, err
 	}
-	if err := d.platform.UpdateSub2APIAdminAccountStatus(session, accountID, "active"); err != nil {
-		return RemoteActionSub2APIStatusActiveFailed, err
-	}
-	return RemoteActionSub2APIStatusActive, nil
+	// 旧路径没有当前 status 快照：恢复时同时尝试 status=active（AccountStatus 置 inactive 触发）。
+	target := AdminProbeTarget{AccountID: accountID, Platform: string(upstream.PlatformSub2API), AccountStatus: "inactive"}
+	return d.applySub2APITrafficControl(session, target, "active")
 }

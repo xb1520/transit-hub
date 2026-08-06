@@ -6,6 +6,38 @@ import (
 	"testing"
 )
 
+// TestUpdateSub2APIAdminAccountSchedulable_UsesFieldOnlyBulkUpdate 验证调度开关更新只写
+// account_ids + schedulable，绝不写 status（健康降级应关调度而非停用账号）。
+func TestUpdateSub2APIAdminAccountSchedulable_UsesFieldOnlyBulkUpdate(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/bulk-update" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var err error
+		body, err = readJSONBody(r)
+		if err != nil {
+			t.Fatalf("failed to decode bulk update body: %v", err)
+		}
+		writeJSON(w, map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	service := NewPlatformService(NewHTTPClient(server.Client()))
+	session := Session{Platform: PlatformSub2API, BaseURL: server.URL, AccessToken: "token-1", TokenType: "Bearer"}
+	if err := service.UpdateSub2APIAdminAccountSchedulable(session, "1515", false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertSub2APIBulkAccountIDs(t, body, 1515)
+	if len(body) != 2 || body["schedulable"] != false {
+		t.Fatalf("schedulable update must contain only account_ids and schedulable: %+v", body)
+	}
+	if _, exists := body["status"]; exists {
+		t.Fatalf("schedulable update must never include status: %+v", body)
+	}
+}
+
 // TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate 验证状态更新不会读取或
 // 回写账号详情。请求体只能包含账号 ID 和目标状态，尤其不能携带倍率、凭据或分组字段。
 func TestUpdateSub2APIAdminAccountStatus_UsesFieldOnlyBulkUpdate(t *testing.T) {

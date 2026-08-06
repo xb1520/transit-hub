@@ -27,6 +27,7 @@ type fakeRepository struct {
 	priorityStates     map[string]PrioritySyncState
 	targetActionStates map[string]TargetActionState
 	budgetClaims       map[string]int
+	budgetCosts        map[string]float64
 	savePolicyErr      error
 	deletePolicyErr    error
 }
@@ -37,6 +38,7 @@ func newFakeRepository() *fakeRepository {
 		priorityStates:     map[string]PrioritySyncState{},
 		targetActionStates: map[string]TargetActionState{},
 		budgetClaims:       map[string]int{},
+		budgetCosts:        map[string]float64{},
 	}
 }
 
@@ -373,7 +375,16 @@ func (f *fakeRepository) CountProbesToday(ctx context.Context, userID string, ad
 	return count, nil
 }
 
-func (f *fakeRepository) TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int) (bool, error) {
+func (f *fakeRepository) GetProbeBudgetUsage(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time) (ProbeBudgetUsage, error) {
+	used, err := f.CountProbesToday(ctx, userID, adminAccountID, policyID, dayStart)
+	if err != nil {
+		return ProbeBudgetUsage{}, err
+	}
+	key := userID + "|" + adminAccountID + "|" + policyID + "|" + dayStart.Format(time.RFC3339)
+	return ProbeBudgetUsage{Used: used, UsedCost: f.budgetCosts[key]}, nil
+}
+
+func (f *fakeRepository) TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int, costLimit float64) (bool, error) {
 	key := userID + "|" + adminAccountID + "|" + policyID + "|" + dayStart.Format(time.RFC3339)
 	if _, initialized := f.budgetClaims[key]; !initialized {
 		count := 0
@@ -384,11 +395,26 @@ func (f *fakeRepository) TryConsumeProbeBudget(ctx context.Context, userID strin
 		}
 		f.budgetClaims[key] = count
 	}
+	if costLimit > 0 && f.budgetCosts[key] >= costLimit {
+		return false, nil
+	}
 	if f.budgetClaims[key] >= limit {
 		return false, nil
 	}
 	f.budgetClaims[key]++
 	return true, nil
+}
+
+func (f *fakeRepository) AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, cost float64) error {
+	if cost <= 0 {
+		return nil
+	}
+	if f.budgetCosts == nil {
+		f.budgetCosts = map[string]float64{}
+	}
+	key := userID + "|" + adminAccountID + "|" + policyID + "|" + dayStart.Format(time.RFC3339)
+	f.budgetCosts[key] += cost
+	return nil
 }
 
 func (f *fakeRepository) TryAcquireSchedulerLease(ctx context.Context) (func(), bool, error) {

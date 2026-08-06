@@ -44,6 +44,9 @@ type AdminProbeTarget struct {
 	AccountID              string   `json:"accountId"`
 	AccountName            string   `json:"accountName"`
 	AccountStatus          string   `json:"accountStatus"`
+	// AccountSchedulable 是 Sub2API 的调度开关；nil 表示上游未返回，按 true 兼容。
+	// 自动降级通过关闭调度摘流，不再写 status=inactive。
+	AccountSchedulable     *bool    `json:"accountSchedulable,omitempty"`
 	AccountWeight          *int     `json:"accountWeight,omitempty"`
 	ProviderFamily         string   `json:"providerFamily"`
 	Models                 []string `json:"models"`
@@ -281,6 +284,85 @@ func (s *Service) resolveManualTarget(ctx context.Context, userID string, target
 	return session, target, account, adminAccountID, nil
 }
 
+// AdminGroupProbeAutomationResult 是分组级手动策略探活的汇总结果。
+type AdminGroupProbeAutomationResult struct {
+	AdminGroupID   string `json:"adminGroupId"`
+	AdminGroupName string `json:"adminGroupName"`
+	// ProbedTargets 成功跑完策略探活（含 0 模型结果）的目标数。
+	ProbedTargets int `json:"probedTargets"`
+	// SkippedTargets 未分配启用探活策略 / 无可探活模型 / 不可探活而跳过的目标数。
+	SkippedTargets int `json:"skippedTargets"`
+	// FailedTargets 探活过程中出错的目标数（凭据失败、上游错误等）。
+	FailedTargets int `json:"failedTargets"`
+	// TotalAccounts 分组内账号/渠道总数。
+	TotalAccounts int `json:"totalAccounts"`
+}
+
+// ProbeAdminGroupAutomation 对指定 admin 分组内所有「已分配启用探活策略」的账号/渠道
+// 立即执行一轮完整策略探活（写状态/事件，并按策略触发自动降级/远端动作）。
+// 与调度器路径口径一致，但不考虑探活间隔冷却——用于运营手动触发整组探测。
+func (s *Service) ProbeAdminGroupAutomation(ctx context.Context, userID string, adminGroupID string) (AdminGroupProbeAutomationResult, error) {
+	adminGroupID = strings.TrimSpace(adminGroupID)
+	if adminGroupID == "" {
+		return AdminGroupProbeAutomationResult{}, requestError(ErrorNotFound)
+	}
+	adminAccountID, err := s.currentAdminAccountID(ctx, userID)
+	if err != nil {
+		return AdminGroupProbeAutomationResult{}, err
+	}
+	if s.platformGroups == nil || s.mySites == nil {
+		return AdminGroupProbeAutomationResult{}, requestError(ErrorUnknown)
+	}
+	session, err := s.mySites.RequireSession(ctx, userID, adminAccountID)
+	if err != nil {
+		return AdminGroupProbeAutomationResult{}, err
+	}
+	groups, err := s.platformGroups.FetchAdminAllGroups(session)
+	if err != nil {
+		return AdminGroupProbeAutomationResult{}, err
+	}
+	var group *upstream.AdminGroupInfo
+	for i := range groups {
+		if groups[i].ID == adminGroupID {
+			group = &groups[i]
+			break
+		}
+	}
+	if group == nil {
+		return AdminGroupProbeAutomationResult{}, requestError(ErrorNotFound)
+	}
+	accounts, err := s.platformGroups.ListAdminGroupAccounts(session, *group)
+	if err != nil {
+		return AdminGroupProbeAutomationResult{}, requestError(ErrorAccountsFetch)
+	}
+
+	result := AdminGroupProbeAutomationResult{
+		AdminGroupID:   group.ID,
+		AdminGroupName: group.Name,
+		TotalAccounts:  len(accounts),
+	}
+	for _, acc := range accounts {
+		targetID := buildTargetID(string(session.Platform), adminAccountID, acc.ID)
+		// 空 models = 探活策略候选池全部模型（与旧 ProbeTarget 语义一致）。
+		if _, probeErr := s.ProbeTarget(ctx, userID, targetID, nil); probeErr != nil {
+			key := probeErr.Error()
+			// 无策略/无模型/不可探活等属于跳过，不记失败。
+			switch key {
+			case ErrorNoMatchingModels, ErrorModelUnavailable, ErrorProbeTargetNotFound,
+				ErrorCredentialUnavailable, ErrorSecureVerificationRequired, ErrorBaseURLUnavailable,
+				ErrorExportUnavailable, ErrorCredentialsRedacted:
+				result.SkippedTargets++
+				continue
+			}
+			log.Printf("[connection-health] group automation probe failed group_id=%s target_id=%s err=%v", adminGroupID, targetID, probeErr)
+			result.FailedTargets++
+			continue
+		}
+		result.ProbedTargets++
+	}
+	return result, nil
+}
+
 // ProbeTarget 手动探活一个独立目标：前端传 targetId + models（不再传 connectionId/base_url/key）。
 // 后端按当前 user/admin workspace 重新解析目标与凭据，不信任前端传入的任何上游地址或密钥。
 // 不可探活时返回结构化 requestError（credential_unavailable / secure_verification_required /
@@ -386,16 +468,17 @@ func (s *Service) findAdminTarget(ctx context.Context, session upstream.Session,
 				continue
 			}
 			resolved := AdminProbeTarget{
-				TargetID:       buildTargetID(platform, adminAccountID, acc.ID),
-				Platform:       platform,
-				AdminGroupID:   group.ID,
-				AdminGroupName: group.Name,
-				AccountID:      acc.ID,
-				AccountName:    acc.Name,
-				AccountStatus:  acc.Status,
-				AccountWeight:  cloneIntPointer(acc.Weight),
-				ProviderFamily: acc.Platform,
-				Models:         splitModelList(acc.Models),
+				TargetID:           buildTargetID(platform, adminAccountID, acc.ID),
+				Platform:           platform,
+				AdminGroupID:       group.ID,
+				AdminGroupName:     group.Name,
+				AccountID:          acc.ID,
+				AccountName:        acc.Name,
+				AccountStatus:      acc.Status,
+				AccountSchedulable: acc.Schedulable,
+				AccountWeight:      cloneIntPointer(acc.Weight),
+				ProviderFamily:     acc.Platform,
+				Models:             splitModelList(acc.Models),
 			}
 			return resolved, acc, true, accountsReadError, nil
 		}
@@ -410,7 +493,7 @@ func (s *Service) findAdminTarget(ctx context.Context, session upstream.Session,
 //   - 自动降级或自动远端动作任一关闭时，即使状态机判定需要远端动作，也只记
 //     RemoteActionSkippedIndependentProbe，绝不调用上游（与旧行为一致）。
 //   - 两个开关都开启且 target.Platform 是 sub2api 时，真实调用
-//     dispatcher.DegradeTarget/RestoreTarget 切换 sub2api 账号 active/inactive。
+//     dispatcher：降级关调度（schedulable=false），恢复开调度；历史 inactive 会顺带写回 active。
 //   - New API target 按 currentWeight 更新 channel weight/status，实现逐步恢复。
 //
 // session 来自调用方（ProbeTarget 的 resolveManualTarget / 调度器 job 的 RequireSession），
@@ -427,7 +510,7 @@ func (s *Service) probeTargetOnce(ctx context.Context, userID string, adminAccou
 	}
 
 	dayStart := probeBudgetDayStart(time.Now())
-	allowed, err := s.repo.TryConsumeProbeBudget(ctx, userID, adminAccountID, spec.policy.ID, dayStart, probeBudgetLimit(spec.policy))
+	allowed, err := s.repo.TryConsumeProbeBudget(ctx, userID, adminAccountID, spec.policy.ID, dayStart, probeBudgetLimit(spec.policy), spec.policy.DailyProbeBudgetCost)
 	if err != nil {
 		return nil, err
 	}
@@ -443,6 +526,10 @@ func (s *Service) probeTargetOnce(ctx context.Context, userID string, adminAccou
 		BaseURL: cred.BaseURL, UpstreamKey: cred.Key, ProviderFamily: providerFamily,
 		ModelName: spec.modelName, MaxTokens: spec.maxProbeTokens, ProbePrompt: spec.probePrompt,
 	})
+	outcome.EstimatedCost = estimateProbeCost(outcome, spec.maxProbeTokens, spec.policy.ProbeCostPer1kTokens)
+	if addErr := s.repo.AddProbeBudgetCost(ctx, userID, adminAccountID, spec.policy.ID, dayStart, outcome.EstimatedCost); addErr != nil {
+		log.Printf("[connection-health] add probe budget cost failed policy_id=%s err=%v", spec.policy.ID, addErr)
+	}
 
 	now := time.Now()
 	transitionOut := Transition(TransitionInput{
@@ -497,6 +584,34 @@ func probeBudgetDayStart(now time.Time) time.Time {
 
 func probeBudgetLimit(policy Policy) int {
 	return defaultInt(policy.DailyProbeBudget, 1000)
+}
+
+// estimateProbeCost 估算单次探活费用（USD）。
+// 优先使用上游 usage.total_tokens；缺失时用 max_tokens + 16（短 prompt 预估）兜底。
+func estimateProbeCost(outcome ProbeOutcome, maxTokens int, costPer1k float64) float64 {
+	rate := defaultProbeCostPer1k(costPer1k)
+	tokens := outcome.TotalTokens
+	if tokens <= 0 {
+		tokens = outcome.PromptTokens + outcome.CompletionTokens
+	}
+	if tokens <= 0 {
+		if maxTokens <= 0 {
+			maxTokens = 1
+		}
+		tokens = maxTokens + 16
+	}
+	cost := float64(tokens) / 1000.0 * rate
+	if cost < 0 || !isFiniteFloat(cost) {
+		return 0
+	}
+	return cost
+}
+
+func maxFloat64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *Service) finishTargetProbeBatch(ctx context.Context, userID string, adminAccountID string, session upstream.Session, target AdminProbeTarget, specs []probeModelSpec, results []targetProbeResult) {

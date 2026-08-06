@@ -37,9 +37,7 @@ func sub2APIProbePolicy(autoRemoteAction bool) Policy {
 }
 
 // TestProbeTargetOnce_Sub2APIAutoRemoteDegradeUpdatesInactive 验证 AutoRemoteActionEnabled=true
-// 时，sub2api target 探活遭遇硬失败（触发 TriggerRemoteDegrade）会真实调用
-// UpdateSub2APIAdminAccountStatus(session, target.AccountID, "inactive")，state/event 的
-// remoteAction 记录为 sub2api_account_status_inactive。
+// 时，sub2api target 探活遭遇硬失败会关调度开关（schedulable=false），绝不写 status=inactive。
 func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeUpdatesInactive(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -66,21 +64,23 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeUpdatesInactive(t *testing.T) {
 	if len(results) != 1 || results[0].State != StateSuspended {
 		t.Fatalf("expected hard failure to suspend immediately, got %+v", results)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].accountID != "acc-1" || platform.sub2APICalls[0].status != "inactive" {
-		t.Fatalf("expected one call accountID=acc-1 status=inactive, got %+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || platform.sub2APISchedulableCalls[0].accountID != "acc-1" || platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=false for acc-1, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 0 {
+		t.Fatalf("degrade must not write status, got %+v", platform.sub2APICalls)
 	}
 	st := repo.states[targetID]["gpt-4o"]
-	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APIStatusInactive) {
-		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APIStatusInactive, st.LastRemoteAction)
+	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APISchedulableOff) {
+		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APISchedulableOff, st.LastRemoteAction)
 	}
-	if len(repo.events) != 1 || !strings.Contains(repo.events[0].RemoteAction, RemoteActionSub2APIStatusInactive) {
-		t.Fatalf("expected event.RemoteAction to include %s, got %+v", RemoteActionSub2APIStatusInactive, repo.events)
+	if len(repo.events) != 1 || !strings.Contains(repo.events[0].RemoteAction, RemoteActionSub2APISchedulableOff) {
+		t.Fatalf("expected event.RemoteAction to include %s, got %+v", RemoteActionSub2APISchedulableOff, repo.events)
 	}
 }
 
-// TestProbeTargetOnce_Sub2APIAutoRemoteRestoreUpdatesActive 验证从 observing 状态达到成功阈值时
-// （触发 TriggerRemoteRestore），真实调用 UpdateSub2APIAdminAccountStatus(session,
-// target.AccountID, "active")，state/event 的 remoteAction 记录为 sub2api_account_status_active。
+// TestProbeTargetOnce_Sub2APIAutoRemoteRestoreUpdatesActive 验证从 observing 达到成功阈值时
+// 会开调度，并因账号仍是历史 inactive 而顺带写 status=active。
 func TestProbeTargetOnce_Sub2APIAutoRemoteRestoreUpdatesActive(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -96,7 +96,7 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteRestoreUpdatesActive(t *testing.T) {
 		"gpt-4o": {
 			ConnectionID: targetID, ModelName: "gpt-4o", UserID: "user1", AdminAccountID: "ws1",
 			State: StateObserving, ConsecutiveSuccesses: 1, ObservingUntil: &observingUntil, CurrentWeight: 0,
-			LastRemoteAction: RemoteActionSub2APIStatusInactive,
+			LastRemoteAction: RemoteActionSub2APISchedulableOff,
 		},
 	}
 	platform := &fakePlatformActioner{}
@@ -115,19 +115,20 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteRestoreUpdatesActive(t *testing.T) {
 	if len(results) != 1 || results[0].State != StateRecovering {
 		t.Fatalf("expected transition to recovering after success threshold, got %+v", results)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].accountID != "acc-1" || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("expected one call accountID=acc-1 status=active, got %+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=true, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("expected status=active recovery write, got %+v", platform.sub2APICalls)
 	}
 	st := repo.states[targetID]["gpt-4o"]
-	if st.LastRemoteAction != RemoteActionSub2APIStatusActive {
-		t.Fatalf("expected state.LastRemoteAction=%s, got %q", RemoteActionSub2APIStatusActive, st.LastRemoteAction)
+	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APISchedulableOn) {
+		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APISchedulableOn, st.LastRemoteAction)
 	}
 }
 
-// TestProbeTargetOnce_Sub2APIAutoRemoteDegradeFailureRecordsFailedAction 验证远端降级调用失败时
-// （UpdateSub2APIAdminAccountStatus 返回 error），state/event 的 remoteAction 记录为
-// sub2api_account_status_inactive_failed，绝不能回退成 unsupported——sub2api 已经支持这个
-// 动作，真的发起了调用只是失败了，和「平台不支持」是两回事。
+// TestProbeTargetOnce_Sub2APIAutoRemoteDegradeFailureRecordsFailedAction 验证关调度失败时
+// remoteAction 记录 schedulable_off_failed，绝不能回退成 unsupported。
 func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeFailureRecordsFailedAction(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -137,7 +138,7 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeFailureRecordsFailedAction(t *t
 
 	repo := newFakeRepository()
 	repo.policies = []Policy{sub2APIProbePolicy(true)}
-	platform := &fakePlatformActioner{sub2APIErr: errors.New("upstream 500")}
+	platform := &fakePlatformActioner{sub2APISchedulableErr: errors.New("upstream 500")}
 	mySites := fakeMySitesReader{session: upstream.Session{Platform: upstream.PlatformSub2API}}
 	reader := fakePlatformGroupReader{
 		groups:        []upstream.AdminGroupInfo{{ID: "g1", Name: "vip"}},
@@ -155,11 +156,11 @@ func TestProbeTargetOnce_Sub2APIAutoRemoteDegradeFailureRecordsFailedAction(t *t
 		t.Fatalf("expected hard failure to suspend, got %+v", results)
 	}
 	st := repo.states[targetID]["gpt-4o"]
-	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APIStatusInactiveFailed) {
-		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APIStatusInactiveFailed, st.LastRemoteAction)
+	if !strings.Contains(st.LastRemoteAction, RemoteActionSub2APISchedulableOffFailed) {
+		t.Fatalf("expected state.LastRemoteAction to include %s, got %q", RemoteActionSub2APISchedulableOffFailed, st.LastRemoteAction)
 	}
-	if len(repo.events) != 1 || !strings.Contains(repo.events[0].RemoteAction, RemoteActionSub2APIStatusInactiveFailed) {
-		t.Fatalf("expected event.RemoteAction to include %s, got %+v", RemoteActionSub2APIStatusInactiveFailed, repo.events)
+	if len(repo.events) != 1 || !strings.Contains(repo.events[0].RemoteAction, RemoteActionSub2APISchedulableOffFailed) {
+		t.Fatalf("expected event.RemoteAction to include %s, got %+v", RemoteActionSub2APISchedulableOffFailed, repo.events)
 	}
 }
 

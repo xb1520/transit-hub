@@ -187,13 +187,19 @@ type Policy struct {
 	PriorityMode            string    `json:"priorityMode"`
 	StrategyMode            string    `json:"strategyMode"`
 	// DailyProbeBudget 是该策略每天允许的真实探活请求次数上限（单位：次/天，按中国自然日 UTC+8 重置）。
-	// 每发起一次真实模型探活消费 1，与 token/金额无关。默认 1000。
+	// 每发起一次真实模型探活消费 1。默认 1000。
 	DailyProbeBudget int `json:"dailyProbeBudget"`
-	// DailyProbeBudgetUsed 不是数据库列：查询时装载的「今日已消费探活次数」（与 DailyProbeBudget 同单位）。
-	// 用于管理端展示已用/剩余预算；multiplier_only 策略不参与探活，此值通常为 0。
+	// DailyProbeBudgetCost 是每日探活金额预算上限（USD/成本口径）。0 表示不按金额限流，仍统计展示已消耗金额。
+	DailyProbeBudgetCost float64 `json:"dailyProbeBudgetCost"`
+	// ProbeCostPer1kTokens 用于估算单次探活费用：cost ≈ tokens/1000 × 本值。默认 0.002。
+	// 优先用上游返回的 usage tokens；无 usage 时按 max_tokens + 预估 prompt 估算。
+	ProbeCostPer1kTokens float64 `json:"probeCostPer1kTokens"`
+	// DailyProbeBudgetUsed 不是数据库列：查询时装载的「今日已消费探活次数」。
 	DailyProbeBudgetUsed int `json:"dailyProbeBudgetUsed"`
-	CreatedAt            time.Time `json:"createdAt"`
-	UpdatedAt            time.Time `json:"updatedAt"`
+	// DailyProbeBudgetCostUsed 不是数据库列：今日已累计估算探活费用（USD）。
+	DailyProbeBudgetCostUsed float64 `json:"dailyProbeBudgetCostUsed"`
+	CreatedAt                time.Time `json:"createdAt"`
+	UpdatedAt                time.Time `json:"updatedAt"`
 	// ModelTargets 不是数据库列，是查询时一并装载的关联目标（connection_health_model_targets）。
 	ModelTargets []ModelTarget `json:"modelTargets"`
 }
@@ -268,6 +274,12 @@ type ProbeOutcome struct {
 	Result    ResultKey
 	LatencyMs int
 	Detail    string
+	// 上游 usage（若响应带 usage 字段）；用于探活费用估算。
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	// EstimatedCost 是本次探活估算费用（USD），由 runner/调用方按策略费率写入。
+	EstimatedCost float64
 }
 
 // MySitesReader 是 connection_health 对 my_sites 模块的全部只读依赖，

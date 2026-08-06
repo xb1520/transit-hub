@@ -35,15 +35,15 @@ func TestReconcileTargetRemoteAction_SuspendedSiblingUsesModelLimits(t *testing.
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 应摘除 model-a，并因非阻塞而恢复账号 active
-	if !strings.Contains(action, RemoteActionSub2APIStatusActive) && !strings.Contains(action, RemoteActionSub2APIModelsUpdated) {
-		t.Fatalf("expected models update and/or status active, action=%q", action)
+	// 应摘除 model-a，并因非阻塞而恢复调度（历史 inactive 顺带写 status=active）
+	if !strings.Contains(action, RemoteActionSub2APISchedulableOn) && !strings.Contains(action, RemoteActionSub2APIModelsUpdated) {
+		t.Fatalf("expected models update and/or schedulable on, action=%q", action)
 	}
 	if len(platform.sub2APIModelCalls) != 1 || normalizeModelListString(platform.sub2APIModelCalls[0].models) != "model-b" {
 		t.Fatalf("expected models=model-b, got %+v", platform.sub2APIModelCalls)
 	}
-	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("partial suspension should re-enable account for healthy models, calls=%+v", platform.sub2APICalls)
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("partial suspension should re-enable scheduling, calls=%+v", platform.sub2APISchedulableCalls)
 	}
 }
 
@@ -139,8 +139,8 @@ func TestReconcileTargetRemoteAction_RestoresWhenPeerHealthyDespiteUnprobedModel
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusActive || len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("healthy peer must restore account active, action=%q calls=%+v", action, platform.sub2APICalls)
+	if !strings.Contains(action, RemoteActionSub2APISchedulableOn) || len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("healthy peer must restore scheduling, action=%q sched=%+v status=%+v", action, platform.sub2APISchedulableCalls, platform.sub2APICalls)
 	}
 }
 
@@ -186,8 +186,43 @@ func TestReconcileTargetRemoteAction_RestoresDespiteLastAppliedMismatch(t *testi
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusActive || len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("must retry active write on inactive/error mismatch, action=%q calls=%+v", action, platform.sub2APICalls)
+	if !strings.Contains(action, RemoteActionSub2APISchedulableOn) || !strings.Contains(action, RemoteActionSub2APIStatusActive) {
+		t.Fatalf("must retry restore on inactive/error mismatch, action=%q", action)
+	}
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=true, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("expected status=active recovery, got %+v", platform.sub2APICalls)
+	}
+}
+
+func TestReconcileTargetRemoteAction_RestoresHistoricalInactiveWithoutLocalStates(t *testing.T) {
+	// 历史 status=inactive 且本地尚无探活状态行时，也应恢复 active+可调度，避免永久卡死。
+	repo := newFakeRepository()
+	platform := &fakePlatformActioner{}
+	service := &Service{repo: repo, dispatcher: newRemoteActionDispatcher(nil, nil, platform)}
+	targetID := "sub2api:ws1:acc-legacy"
+	policy := Policy{ID: "p1", Enabled: true, AutoDegradeEnabled: true, AutoRemoteActionEnabled: true}
+	target := AdminProbeTarget{
+		TargetID: targetID, Platform: string(upstream.PlatformSub2API), AccountID: "acc-legacy",
+		AccountStatus: "inactive", Models: []string{"gpt-4o"},
+	}
+
+	action, err := service.reconcileTargetRemoteAction(context.Background(), "user1", "ws1", upstream.Session{Platform: upstream.PlatformSub2API}, target, []probeModelSpec{
+		{modelName: "gpt-4o", policy: policy},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(action, RemoteActionSub2APISchedulableOn) || !strings.Contains(action, RemoteActionSub2APIStatusActive) {
+		t.Fatalf("expected restore schedulable+status, action=%q", action)
+	}
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=true, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("expected status=active, got %+v", platform.sub2APICalls)
 	}
 }
 
@@ -213,10 +248,15 @@ func TestReconcileTargetRemoteAction_RestoresOrphanInactiveWithHealthyModels(t *
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if action != RemoteActionSub2APIStatusActive || len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
-		t.Fatalf("orphan inactive with healthy models must restore active, action=%q calls=%+v", action, platform.sub2APICalls)
+	if !strings.Contains(action, RemoteActionSub2APISchedulableOn) || !strings.Contains(action, RemoteActionSub2APIStatusActive) {
+		t.Fatalf("orphan inactive with healthy models must restore scheduling+status, action=%q", action)
 	}
-	// 全健康且无模型限制管理时快照会清理；以是否真正调用 status=active 为准。
+	if len(platform.sub2APISchedulableCalls) != 1 || !platform.sub2APISchedulableCalls[0].schedulable {
+		t.Fatalf("expected schedulable=true, got %+v", platform.sub2APISchedulableCalls)
+	}
+	if len(platform.sub2APICalls) != 1 || platform.sub2APICalls[0].status != "active" {
+		t.Fatalf("expected status=active recovery, got %+v", platform.sub2APICalls)
+	}
 }
 
 func TestReconcileTargetRemoteAction_ConfirmsPendingSystemWrite(t *testing.T) {

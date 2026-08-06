@@ -14,6 +14,7 @@ import {
   Eye,
   Gauge,
   Radar,
+  RefreshCw,
   Settings2,
   ShieldCheck,
   ShieldQuestion,
@@ -39,14 +40,19 @@ const props = defineProps<{
   todaySpend?: number | null
   /** 上游分组名 → 今日成本（key 用量合计）。 */
   upstreamGroupSpendToday?: Map<string, number>
-  /** 上游分组消耗是否已成功加载。 */
+  /** 上游分组名 → 今日利润（与仪表盘上游分组利润口径一致）。 */
+  upstreamGroupProfitToday?: Map<string, number>
+  /** 上游分组消耗/利润是否已成功加载。 */
   upstreamGroupSpendLoaded?: boolean
+  /** 整组策略探活是否进行中。 */
+  groupProbeRunning?: boolean
 }>()
 
 const emit = defineEmits<{
   (event: 'setup', group: AdminGroupHealth): void
   (event: 'probe', account: AdminGroupAccount): void
   (event: 'view-events', account: AdminGroupAccount): void
+  (event: 'probe-group', group: AdminGroupHealth): void
 }>()
 
 const { t, te } = useI18n()
@@ -54,7 +60,7 @@ const prefix = 'admin.connectionHealth'
 const detailPrefix = `${prefix}.groupDetail`
 const expandedTargetId = ref('')
 
-type AccountSortKey = 'priority' | 'upstreamMultiplier' | 'upstreamSpend'
+type AccountSortKey = 'priority' | 'upstreamMultiplier' | 'upstreamSpend' | 'upstreamProfit'
 type SortDir = 'asc' | 'desc'
 
 const sortKey = ref<AccountSortKey | null>(null)
@@ -71,8 +77,8 @@ const toggleSort = (key: AccountSortKey) => {
     return
   }
   sortKey.value = key
-  // 优先级默认升序（数值小更优先的平台更直观）；倍率/消耗默认升序（成本更低在前）。
-  sortDir.value = 'asc'
+  // 优先级默认升序（数值小更优先的平台更直观）；倍率/消耗默认升序（成本更低在前）；利润默认降序（贡献更大在前）。
+  sortDir.value = key === 'upstreamProfit' ? 'desc' : 'asc'
 }
 
 const sortIndicator = (key: AccountSortKey) => {
@@ -95,6 +101,25 @@ const accountUpstreamSpend = (account: AdminGroupAccount): number | null => {
 
 const formatAccountUpstreamSpend = (account: AdminGroupAccount): string => {
   const amount = accountUpstreamSpend(account)
+  if (amount == null) return '—'
+  return formatCny(amount)
+}
+
+/** 账号关联上游分组的今日利润；未关联或未加载完成返回 null。 */
+const accountUpstreamProfit = (account: AdminGroupAccount): number | null => {
+  if (!props.upstreamGroupSpendLoaded) return null
+  const name = (account.upstreamKeyGroupName || '').trim()
+  if (!name) return null
+  // 有消耗映射但利润 map 无该组时按 0；完全未关联上游分组仍为 null。
+  if (!props.upstreamGroupSpendToday?.has(name) && !props.upstreamGroupProfitToday?.has(name)) {
+    return 0
+  }
+  const amount = props.upstreamGroupProfitToday?.get(name)
+  return amount != null && Number.isFinite(amount) ? amount : 0
+}
+
+const formatAccountUpstreamProfit = (account: AdminGroupAccount): string => {
+  const amount = accountUpstreamProfit(account)
   if (amount == null) return '—'
   return formatCny(amount)
 }
@@ -132,9 +157,9 @@ const sortedAccounts = computed(() => {
       if (leftVal === rightVal) return 0
       return leftVal < rightVal ? -dir : dir
     }
-    if (key === 'upstreamSpend') {
-      const leftVal = accountUpstreamSpend(left)
-      const rightVal = accountUpstreamSpend(right)
+    if (key === 'upstreamSpend' || key === 'upstreamProfit') {
+      const leftVal = key === 'upstreamSpend' ? accountUpstreamSpend(left) : accountUpstreamProfit(left)
+      const rightVal = key === 'upstreamSpend' ? accountUpstreamSpend(right) : accountUpstreamProfit(right)
       if (leftVal == null && rightVal == null) return 0
       if (leftVal == null) return 1
       if (rightVal == null) return -1
@@ -266,14 +291,26 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
           {{ t(`${detailPrefix}.subtitle`, { monitored: monitoredCount, total: group.accountCount }) }}
         </p>
       </div>
-      <button
-        type="button"
-        class="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-        @click="emit('setup', group)"
-      >
-        <Settings2 class="h-4 w-4" />
-        {{ t(`${detailPrefix}.${group.hasAssignedPolicy ? 'manageMonitoring' : 'enableMonitoring'}`) }}
-      </button>
+      <div class="flex shrink-0 flex-wrap items-center gap-2">
+        <button
+          type="button"
+          class="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-border/60 bg-background px-3 text-sm font-medium text-foreground transition-colors hover:bg-surface focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-50"
+          :disabled="groupProbeRunning || monitoredCount === 0"
+          :title="t(`${detailPrefix}.probeAutomationHint`)"
+          @click="emit('probe-group', group)"
+        >
+          <RefreshCw class="h-4 w-4" :class="groupProbeRunning ? 'animate-spin' : ''" />
+          {{ groupProbeRunning ? t(`${detailPrefix}.probeAutomationRunning`) : t(`${detailPrefix}.probeAutomation`) }}
+        </button>
+        <button
+          type="button"
+          class="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          @click="emit('setup', group)"
+        >
+          <Settings2 class="h-4 w-4" />
+          {{ t(`${detailPrefix}.${group.hasAssignedPolicy ? 'manageMonitoring' : 'enableMonitoring'}`) }}
+        </button>
+      </div>
     </header>
 
     <dl class="grid border-b border-border/50 sm:grid-cols-2 xl:grid-cols-5">
@@ -328,7 +365,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
         <p class="mt-3 text-sm text-muted-foreground">{{ t(`${detailPrefix}.empty`) }}</p>
       </div>
       <div v-else class="overflow-x-auto rounded-lg border border-border/60">
-        <table class="w-full min-w-[66rem] text-sm">
+        <table class="w-full min-w-[74rem] text-sm">
           <thead class="bg-surface/60 text-left text-xs text-muted-foreground">
             <tr>
               <th class="w-10 px-3 py-2.5 font-medium"><span class="sr-only">{{ t(`${detailPrefix}.columns.expand`) }}</span></th>
@@ -372,6 +409,20 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                   <span>{{ t(`${detailPrefix}.columns.upstreamSpend`) }}</span>
                   <ArrowUp v-if="sortIndicator('upstreamSpend') === 'asc'" class="h-3.5 w-3.5" />
                   <ArrowDown v-else-if="sortIndicator('upstreamSpend') === 'desc'" class="h-3.5 w-3.5" />
+                  <ArrowUpDown v-else class="h-3.5 w-3.5 opacity-50" />
+                </button>
+              </th>
+              <th class="px-3 py-2.5 font-medium">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded-md px-1 py-0.5 transition-colors hover:bg-surface hover:text-foreground"
+                  :class="sortKey === 'upstreamProfit' ? 'text-foreground' : ''"
+                  :title="t(`${detailPrefix}.columns.upstreamProfitHint`)"
+                  @click="toggleSort('upstreamProfit')"
+                >
+                  <span>{{ t(`${detailPrefix}.columns.upstreamProfit`) }}</span>
+                  <ArrowUp v-if="sortIndicator('upstreamProfit') === 'asc'" class="h-3.5 w-3.5" />
+                  <ArrowDown v-else-if="sortIndicator('upstreamProfit') === 'desc'" class="h-3.5 w-3.5" />
                   <ArrowUpDown v-else class="h-3.5 w-3.5 opacity-50" />
                 </button>
               </th>
@@ -462,6 +513,21 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                     {{ formatAccountUpstreamSpend(account) }}
                   </span>
                 </td>
+                <td class="px-3 py-3 tabular-nums">
+                  <span
+                    class="text-sm font-medium"
+                    :class="accountUpstreamProfit(account) == null
+                      ? 'text-muted-foreground'
+                      : (accountUpstreamProfit(account) ?? 0) >= 0
+                        ? 'text-signal'
+                        : 'text-destructive'"
+                    :title="account.upstreamKeyGroupName
+                      ? t(`${detailPrefix}.columns.upstreamProfitFor`, { group: account.upstreamKeyGroupName })
+                      : t(`${detailPrefix}.upstreamMultiplierPending`)"
+                  >
+                    {{ formatAccountUpstreamProfit(account) }}
+                  </span>
+                </td>
                 <td class="px-3 py-3">
                   <div class="flex items-center justify-end gap-1">
                     <Tooltip :text="t(`${prefix}.actions.probe`)">
@@ -490,7 +556,7 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                 </td>
               </tr>
               <tr v-if="expandedTargetId === account.targetId" class="border-t border-border/40 bg-surface/25">
-                <td colspan="8" class="px-12 py-4">
+                <td colspan="9" class="px-12 py-4">
                   <div v-if="account.modelHealth.length === 0 && unprobedModels(account).length === 0" class="text-xs text-muted-foreground">{{ t(`${detailPrefix}.models.empty`) }}</div>
                   <div v-else class="grid gap-2 lg:grid-cols-2">
                     <div v-for="model in account.modelHealth" :key="model.modelName" class="rounded-lg border border-border/50 bg-background px-3 py-2.5">
