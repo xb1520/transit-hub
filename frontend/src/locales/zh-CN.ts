@@ -1321,6 +1321,10 @@ export default {
         probe: '手动探活',
         disable: '禁用',
         restore: '恢复',
+        restoreTarget: '手动恢复模型白名单',
+        restoreModel: '恢复该模型',
+        restoreTargetSuccess: '已手动恢复，模型白名单已写回上游',
+        restoreTargetFailed: '手动恢复失败',
         viewEvents: '查看事件'
       },
       errorKeys: {

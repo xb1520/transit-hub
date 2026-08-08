@@ -51,6 +51,8 @@ const {
   loadPolicies,
   removePolicy,
   savePolicy,
+  restoreTargetModels,
+  isActionLoading,
 } = useConnectionHealth()
 
 const searchText = ref('')
@@ -273,6 +275,26 @@ const onProbeAccount = (account: AdminGroupAccount) => {
     groupName: selectedGroup.value.name,
   }
   probeDialogOpen.value = true
+}
+
+const restoreMessage = ref('')
+const restoreError = ref('')
+
+const onRestoreAccount = async (account: AdminGroupAccount, modelName?: string) => {
+  if (isActionLoading.value) return
+  restoreMessage.value = ''
+  restoreError.value = ''
+  groupProbeMessage.value = ''
+  groupProbeError.value = ''
+  const models = modelName ? [modelName] : undefined
+  const ok = await restoreTargetModels(account.targetId, models)
+  if (ok) {
+    restoreMessage.value = t('admin.connectionHealth.actions.restoreTargetSuccess')
+    await loadEvents()
+  } else {
+    const key = errorKey.value || 'admin.connectionHealth.actions.restoreTargetFailed'
+    restoreError.value = readableMessage(key)
+  }
 }
 
 // 策略探活事件。
@@ -503,12 +525,13 @@ const handleDeletePolicy = async (policy: ConnectionHealthPolicy) => {
           :site-recharge-rate="siteRechargeRate"
           @setup="openSetup"
           @probe="onProbeAccount"
+          @restore="onRestoreAccount"
           @probe-group="onProbeGroup"
           @view-events="onViewEventsAccount"
         />
       </div>
-      <p v-if="groupProbeError" class="mt-3 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">{{ groupProbeError }}</p>
-      <p v-else-if="groupProbeMessage" class="mt-3 rounded-lg bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-400">{{ groupProbeMessage }}</p>
+      <p v-if="restoreError || groupProbeError" class="mt-3 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">{{ restoreError || groupProbeError }}</p>
+      <p v-else-if="restoreMessage || groupProbeMessage" class="mt-3 rounded-lg bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-400">{{ restoreMessage || groupProbeMessage }}</p>
     </section>
 
     <GroupHealthSetupDrawer

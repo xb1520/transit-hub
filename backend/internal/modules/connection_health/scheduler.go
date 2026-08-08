@@ -260,7 +260,11 @@ func (s *Service) syncModelLimitsFromStoredStates(
 						ProviderFamily: acc.Platform, Models: splitModelList(acc.Models),
 					}
 					if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, targetID); storeErr == nil {
-						target = expandTargetModelsForProbe(target, stored)
+						known := []string(nil)
+						if states, stateErr := s.repo.ListStatesByConnection(ctx, targetID); stateErr == nil {
+							known = modelNamesFromStates(states)
+						}
+						target = expandTargetModelsForProbe(target, stored, known...)
 					}
 					b = &targetBundle{target: target}
 					bundles[targetID] = b
@@ -278,6 +282,7 @@ func (s *Service) syncModelLimitsFromStoredStates(
 			if !hasModelLimitExclusion(states) && (stored == nil || !hasManagedModelLimits(stored)) {
 				continue
 			}
+			b.target = expandTargetModelsForProbe(b.target, stored, modelNamesFromStates(states)...)
 			specs := candidateModelSpecs(b.target.Models, b.policies)
 			if len(specs) == 0 {
 				continue
@@ -362,7 +367,11 @@ func (s *Service) syncSub2APITrafficRestoreFromInventory(
 						ProviderFamily: acc.Platform, Models: splitModelList(acc.Models),
 					}
 					if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, targetID); storeErr == nil {
-						target = expandTargetModelsForProbe(target, stored)
+						known := []string(nil)
+						if states, stateErr := s.repo.ListStatesByConnection(ctx, targetID); stateErr == nil {
+							known = modelNamesFromStates(states)
+						}
+						target = expandTargetModelsForProbe(target, stored, known...)
 					}
 					b = &targetBundle{target: target}
 					bundles[targetID] = b
@@ -624,9 +633,13 @@ func (s *Service) collectAdminProbeJobsWithGroupsAndCache(ctx context.Context, p
 				break
 			}
 			candidate := candidates[targetID]
-			// 若已对 sub2api 模型限制做过摘除，用 OriginalModels 继续探活被摘除的模型，才能自动恢复。
+			// 若已对 sub2api 模型限制做过摘除，用 OriginalModels / 本地状态补回被摘模型，才能自动恢复。
 			if stored, storeErr := s.repo.GetTargetActionState(ctx, ws.userID, ws.adminAccountID, candidate.target.TargetID); storeErr == nil {
-				candidate.target = expandTargetModelsForProbe(candidate.target, stored)
+				known := []string(nil)
+				if states, stateErr := s.repo.ListStatesByConnection(ctx, candidate.target.TargetID); stateErr == nil {
+					known = modelNamesFromStates(states)
+				}
+				candidate.target = expandTargetModelsForProbe(candidate.target, stored, known...)
 			}
 			specs := candidateModelSpecs(candidate.target.Models, candidate.policies)
 			for index := range specs {

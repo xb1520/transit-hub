@@ -18,6 +18,7 @@ import {
   Settings2,
   ShieldCheck,
   ShieldQuestion,
+  Undo2,
   Wallet,
   Zap,
 } from 'lucide-vue-next'
@@ -59,6 +60,7 @@ const { formatMoneyParts, displayMode } = useCurrencyDisplay()
 const emit = defineEmits<{
   (event: 'setup', group: AdminGroupHealth): void
   (event: 'probe', account: AdminGroupAccount): void
+  (event: 'restore', account: AdminGroupAccount, modelName?: string): void
   (event: 'view-events', account: AdminGroupAccount): void
   (event: 'probe-group', group: AdminGroupHealth): void
 }>()
@@ -249,6 +251,20 @@ const STATE_PRIORITY: ConnectionHealthState[] = ['suspended', 'disabled', 'degra
 /** 已从上游白名单摘除的模型只保留在展开详情里监控，不参与行级健康聚合与 ×N 统计。 */
 const isSchedulableModelHealth = (model: { modelLimitExcluded?: boolean; modelLimitStatus?: string }): boolean =>
   !model.modelLimitExcluded && model.modelLimitStatus !== 'excluded'
+
+const isModelExcluded = (model: { modelLimitExcluded?: boolean; modelLimitStatus?: string; state?: string }): boolean =>
+  Boolean(model.modelLimitExcluded)
+  || model.modelLimitStatus === 'excluded'
+  || model.modelLimitStatus === 'failed'
+  || model.state === 'suspended'
+  || model.state === 'observing'
+  || model.state === 'disabled'
+
+/** 账号行是否展示「恢复」：存在已摘除/暂停/观察中模型，或已接管模型限制。 */
+const accountNeedsRestore = (account: AdminGroupAccount): boolean => {
+  if (account.modelLimitsManaged) return true
+  return (account.modelHealth ?? []).some((model) => isModelExcluded(model) || model.state !== 'healthy')
+}
 
 const schedulableModelHealth = (account: AdminGroupAccount) =>
   (account.modelHealth ?? []).filter(isSchedulableModelHealth)
@@ -633,6 +649,17 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                         <Zap class="h-4 w-4" />
                       </button>
                     </Tooltip>
+                    <Tooltip :text="t(`${prefix}.actions.restoreTarget`)">
+                      <button
+                        type="button"
+                        class="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-surface hover:text-emerald-600 disabled:opacity-35 dark:hover:text-emerald-400"
+                        :aria-label="t(`${prefix}.actions.restoreTarget`)"
+                        :disabled="!accountNeedsRestore(account)"
+                        @click="emit('restore', account)"
+                      >
+                        <Undo2 class="h-4 w-4" />
+                      </button>
+                    </Tooltip>
                     <Tooltip :text="t(`${prefix}.actions.viewEvents`)">
                       <button
                         type="button"
@@ -671,6 +698,16 @@ const formatMultiplierDisplay = (display: string | null | undefined, fallback?: 
                             :title="t(`${detailPrefix}.models.limitFailedHint`)"
                           >{{ t(`${detailPrefix}.models.limitFailed`) }}</span>
                           <span class="rounded-md px-2 py-0.5 text-xs font-medium" :class="connectionHealthStateBadgeClass(model.state)">{{ t(`${prefix}.stateLabels.${model.state}`) }}</span>
+                          <Tooltip v-if="isModelExcluded(model) || model.state !== 'healthy'" :text="t(`${prefix}.actions.restoreModel`)">
+                            <button
+                              type="button"
+                              class="rounded-md p-1 text-muted-foreground transition-colors hover:bg-surface hover:text-emerald-600 dark:hover:text-emerald-400"
+                              :aria-label="t(`${prefix}.actions.restoreModel`)"
+                              @click.stop="emit('restore', account, model.modelName)"
+                            >
+                              <Undo2 class="h-3.5 w-3.5" />
+                            </button>
+                          </Tooltip>
                         </div>
                       </div>
                       <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">

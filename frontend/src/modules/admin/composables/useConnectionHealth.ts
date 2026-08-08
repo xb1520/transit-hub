@@ -32,6 +32,7 @@ import {
   probeConnection,
   probeTarget,
   restoreConnection,
+  restoreTarget,
   setTargetPolicyAssignments,
   setAdminGroupPolicyConfiguration,
   updateConnectionHealthPolicy,
@@ -350,6 +351,23 @@ export function useConnectionHealth() {
     }
   }
 
+  // restoreTargetModels 手动恢复独立目标：清 conflict + 写回模型白名单。
+  // models 省略时恢复该账号全部已摘除/异常模型。
+  const restoreTargetModels = async (targetId: string, models?: string[]) => {
+    isActionLoading.value = true
+    errorKey.value = ''
+    try {
+      await restoreTarget(targetId, models)
+      await loadAll({ silent: true })
+      return true
+    } catch (err) {
+      errorKey.value = err instanceof Error ? err.message : 'admin.connectionHealth.errors.request'
+      return false
+    } finally {
+      isActionLoading.value = false
+    }
+  }
+
   return {
     overview,
     groups,
@@ -379,6 +397,7 @@ export function useConnectionHealth() {
     saveAdminGroupPolicyConfiguration,
     disable,
     restore,
+    restoreTargetModels,
   }
 }
 

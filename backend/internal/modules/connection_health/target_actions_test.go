@@ -165,6 +165,53 @@ func TestReconcileTargetRemoteAction_DoesNotEnableInitiallyDisabledTarget(t *tes
 	}
 }
 
+func TestReconcileTargetRemoteAction_StatusConflictStillRestoresModelLimits(t *testing.T) {
+	// 线上复现：账号已 active，但 LastAppliedStatus 仍是 inactive（陈旧 conflict），
+	// 模型探活已成功却被 skipped_target_conflict 永久阻断写回白名单。
+	repo := newFakeRepository()
+	platform := &fakePlatformActioner{}
+	service := &Service{repo: repo, dispatcher: newRemoteActionDispatcher(nil, nil, platform)}
+	targetID := "sub2api:ws1:52"
+	repo.states[targetID] = map[string]ConnectionHealthState{
+		"claude-fable-5": {ConnectionID: targetID, ModelName: "claude-fable-5", State: StateDegraded, CurrentWeight: 50},
+		"claude-opus-5":  {ConnectionID: targetID, ModelName: "claude-opus-5", State: StateHealthy, CurrentWeight: 100},
+	}
+	repo.targetActionStates["user1|ws1|"+targetID] = TargetActionState{
+		UserID: "user1", AdminAccountID: "ws1", TargetID: targetID,
+		OriginalStatus: "active", LastAppliedStatus: "inactive", Conflict: true,
+		OriginalModels: "claude-fable-5,claude-opus-5", LastAppliedModels: "claude-opus-5",
+	}
+	policy := Policy{ID: "p1", Enabled: true, AutoDegradeEnabled: true, AutoRemoteActionEnabled: true}
+	target := AdminProbeTarget{
+		TargetID: targetID, Platform: string(upstream.PlatformSub2API), AccountID: "52",
+		AccountStatus: "active", Models: []string{"claude-opus-5"},
+	}
+	sched := true
+	target.AccountSchedulable = &sched
+	specs := []probeModelSpec{
+		{modelName: "claude-fable-5", policy: policy},
+		{modelName: "claude-opus-5", policy: policy},
+	}
+
+	action, err := service.reconcileTargetRemoteAction(context.Background(), "user1", "ws1", upstream.Session{Platform: upstream.PlatformSub2API}, target, specs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(action, RemoteActionSub2APIModelsUpdated) {
+		t.Fatalf("status conflict must not block model-limit restore, action=%q calls=%+v", action, platform.sub2APIModelCalls)
+	}
+	if len(platform.sub2APIModelCalls) != 1 {
+		t.Fatalf("expected one models write, got %+v", platform.sub2APIModelCalls)
+	}
+	if normalizeModelListString(platform.sub2APIModelCalls[0].models) != normalizeModelListString("claude-fable-5,claude-opus-5") {
+		t.Fatalf("expected full original models restored, got %q", platform.sub2APIModelCalls[0].models)
+	}
+	stored := repo.targetActionStates["user1|ws1|"+targetID]
+	if stored.Conflict {
+		t.Fatal("healable active conflict should be cleared")
+	}
+}
+
 func TestReconcileTargetRemoteAction_RestoresDespiteLastAppliedMismatch(t *testing.T) {
 	// LastApplied=active 但上游仍是 inactive/error（写入失败或进程中断）时，
 	// 不得永久 conflict，应重试写 active。

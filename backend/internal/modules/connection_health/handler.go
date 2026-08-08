@@ -24,6 +24,7 @@ func RegisterRoutes(mux *http.ServeMux, service *Service) {
 	mux.HandleFunc("GET /api/connection-health/events", handler.events)
 	mux.HandleFunc("POST /api/connection-health/connections/{id}/probe", handler.probe)
 	mux.HandleFunc("POST /api/connection-health/targets/{id}/probe", handler.probeTarget)
+	mux.HandleFunc("POST /api/connection-health/targets/{id}/restore", handler.restoreTarget)
 	mux.HandleFunc("POST /api/connection-health/connections/{id}/disable", handler.disable)
 	mux.HandleFunc("POST /api/connection-health/connections/{id}/restore", handler.restore)
 	mux.HandleFunc("GET /api/connection-health/policies", handler.listPolicies)
@@ -207,6 +208,31 @@ func (h *Handler) restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpjson.Write(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// restoreTarget 手动恢复独立探活目标：清除 conflict、强制模型 healthy，并立即写回 sub2api 模型白名单。
+// 可选 body: { "models": ["claude-fable-5"] }；空/省略表示恢复当前已摘除或非 healthy 的受控模型。
+func (h *Handler) restoreTarget(w http.ResponseWriter, r *http.Request) {
+	userID, ok := authctx.UserID(r.Context())
+	if !ok {
+		httpjson.WriteError(w, http.StatusUnauthorized, "auth.errors.unauthorized")
+		return
+	}
+	targetID := r.PathValue("id")
+	var input ProbeConnectionInput
+	if err := httpjson.Decode(r, &input); err != nil && !errors.Is(err, io.EOF) {
+		httpjson.WriteError(w, http.StatusBadRequest, ErrorRequest)
+		return
+	}
+	results, err := h.service.ManualRestoreTarget(r.Context(), userID, targetID, input.Models)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if results == nil {
+		results = []ModelHealth{}
+	}
+	httpjson.Write(w, http.StatusOK, results)
 }
 
 func (h *Handler) listPolicies(w http.ResponseWriter, r *http.Request) {

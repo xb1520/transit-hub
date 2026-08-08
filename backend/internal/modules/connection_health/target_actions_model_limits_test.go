@@ -195,3 +195,69 @@ func TestExpandTargetModelsForProbe_UsesOriginal(t *testing.T) {
 		t.Fatalf("expanded models = %v", expanded.Models)
 	}
 }
+
+func TestExpandTargetModelsForProbe_UnrestrictedMergesExtra(t *testing.T) {
+	// 原本不限制：摘除后 live 列表变短，必须靠 extra（本地状态）把被摘模型补回候选。
+	target := AdminProbeTarget{Models: []string{"ok"}}
+	stored := &TargetActionState{LastAppliedModels: "ok"}
+	expanded := expandTargetModelsForProbe(target, stored, "ok", "bad")
+	if normalizeModelListString(joinModelList(expanded.Models)) != normalizeModelListString("ok,bad") {
+		t.Fatalf("unrestricted expand = %v", expanded.Models)
+	}
+}
+
+func TestManualRestoreTarget_ClearsConflictAndRestoresModels(t *testing.T) {
+	repo := newFakeRepository()
+	platform := &fakePlatformActioner{}
+	reader := fakePlatformGroupReader{
+		groups: []upstream.AdminGroupInfo{{ID: "g1", Name: "kiro"}},
+		accountsByGrp: map[string][]upstream.AdminGroupAccountInfo{
+			"g1": {{ID: "52", Name: "acc", Status: "active", Models: "claude-opus-5", Platform: "anthropic"}},
+		},
+	}
+	mySites := fakeMySitesReader{session: upstream.Session{Platform: upstream.PlatformSub2API}}
+	svc := &Service{
+		repo:           repo,
+		dispatcher:     newRemoteActionDispatcher(nil, nil, platform),
+		platformGroups: reader,
+		mySites:        mySites,
+		accounts:       fakeAdminAccountResolver{id: "ws1"},
+	}
+	targetID := "sub2api:ws1:52"
+	repo.states[targetID] = map[string]ConnectionHealthState{
+		"claude-fable-5": {ConnectionID: targetID, ModelName: "claude-fable-5", State: StateDegraded, CurrentWeight: 50},
+		"claude-opus-5":  {ConnectionID: targetID, ModelName: "claude-opus-5", State: StateHealthy, CurrentWeight: 100},
+	}
+	repo.targetActionStates["user1|ws1|"+targetID] = TargetActionState{
+		UserID: "user1", AdminAccountID: "ws1", TargetID: targetID,
+		OriginalStatus: "active", LastAppliedStatus: "inactive", Conflict: true,
+		OriginalModels: "claude-fable-5,claude-opus-5", LastAppliedModels: "claude-opus-5",
+	}
+	repo.policies = []Policy{{
+		ID: "p1", UserID: "user1", AdminAccountID: "ws1", Enabled: true,
+		AutoDegradeEnabled: true, AutoRemoteActionEnabled: true,
+		ModelTargets: []ModelTarget{
+			{ModelName: "claude-fable-5", Enabled: true},
+			{ModelName: "claude-opus-5", Enabled: true},
+		},
+	}}
+
+	out, err := svc.ManualRestoreTarget(context.Background(), "user1", targetID, []string{"claude-fable-5"})
+	if err != nil {
+		t.Fatalf("ManualRestoreTarget: %v", err)
+	}
+	if len(out) != 1 || out[0].State != StateHealthy || out[0].CurrentWeight != 100 {
+		t.Fatalf("expected fable healthy/100, got %+v", out)
+	}
+	if len(platform.sub2APIModelCalls) == 0 {
+		t.Fatal("expected models write to restore whitelist")
+	}
+	got := platform.sub2APIModelCalls[len(platform.sub2APIModelCalls)-1].models
+	if normalizeModelListString(got) != normalizeModelListString("claude-fable-5,claude-opus-5") {
+		t.Fatalf("restored models = %q", got)
+	}
+	stored := repo.targetActionStates["user1|ws1|"+targetID]
+	if stored.Conflict {
+		t.Fatal("manual restore must clear conflict")
+	}
+}

@@ -187,45 +187,47 @@ func (s *Service) reconcileTargetRemoteAction(
 		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 			return "", err
 		}
-	} else if len(statusModels) > 0 && targetActionCheckpointConflicted(target, stored, currentStatus, currentWeight) {
-		// 当前摘流 + 有健康有效模型：优先视为「写入失败/进程中断/error 残留」，不要标死 conflict。
-		// 只有账号已可调度却与 lastApplied 不一致时，才当作用户手动改动并停止覆盖。
-		if !logicalStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
-			log.Printf("[connection-health] ignore status mismatch for restore target_id=%s current=%s lastApplied=%s pending=%s",
+	}
+
+	// statusConflictSkip：账号 status/weight 冲突时仍继续模型限制 reconcile，
+	// 避免「探活已恢复但 skipped_target_conflict 永久阻断写回 model_mapping」。
+	statusConflictSkip := false
+	if len(statusModels) > 0 && targetActionCheckpointConflicted(target, stored, currentStatus, currentWeight) {
+		if shouldHealTargetActionConflict(target.Platform, currentStatus, blocked, hasHealthyEffective) {
+			log.Printf("[connection-health] heal status checkpoint target_id=%s current=%s lastApplied=%s pending=%s",
 				target.TargetID, currentStatus, stored.LastAppliedStatus, stored.PendingStatus)
-			stored.Conflict = false
-			stored.PendingStatus = ""
-			stored.PendingWeight = nil
+			healTargetActionConflict(stored, target.Platform, currentStatus, currentWeight)
 		} else {
 			stored.Conflict = true
 			stored.PendingStatus = ""
 			stored.PendingWeight = nil
-			stored.PendingModels = ""
+			// 不清除 PendingModels：模型白名单恢复仍需继续。
 			if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
 				return "", err
 			}
-			log.Printf("[connection-health] skip target conflict target_id=%s current=%s lastApplied=%s",
+			statusConflictSkip = true
+			log.Printf("[connection-health] status conflict; continue model-limits target_id=%s current=%s lastApplied=%s",
 				target.TargetID, currentStatus, stored.LastAppliedStatus)
-			return RemoteActionSkippedTargetConflict, nil
 		}
 	}
-	if stored.Conflict {
-		// 摘流且有健康模型：清掉陈旧 conflict，允许恢复。
-		if !logicalStatusEnabled(target.Platform, currentStatus) && hasHealthyEffective && !blocked {
-			log.Printf("[connection-health] clear conflict for disabled healthy target_id=%s", target.TargetID)
-			stored.Conflict = false
+	if stored.Conflict && !statusConflictSkip {
+		if shouldHealTargetActionConflict(target.Platform, currentStatus, blocked, hasHealthyEffective) {
+			log.Printf("[connection-health] clear conflict for healable target_id=%s current=%s lastApplied=%s",
+				target.TargetID, currentStatus, stored.LastAppliedStatus)
+			healTargetActionConflict(stored, target.Platform, currentStatus, currentWeight)
 		} else if targetStateEqual(target, currentStatus, currentWeight, stored.LastAppliedStatus, stored.LastAppliedWeight) {
 			log.Printf("[connection-health] clear stale target conflict target_id=%s current=%s lastApplied=%s",
 				target.TargetID, currentStatus, stored.LastAppliedStatus)
 			stored.Conflict = false
 		} else {
-			log.Printf("[connection-health] skip stored conflict target_id=%s current=%s lastApplied=%s",
+			statusConflictSkip = true
+			log.Printf("[connection-health] stored conflict; continue model-limits target_id=%s current=%s lastApplied=%s",
 				target.TargetID, currentStatus, stored.LastAppliedStatus)
-			return RemoteActionSkippedTargetConflict, nil
 		}
 	}
 
 	// 先处理 sub2api 模型限制摘除/恢复；动作标签可能与账号启停叠加。
+	// 即使账号 status 冲突，也必须执行：否则已恢复的模型无法写回上游白名单。
 	var modelsAction string
 	var modelsErr error
 	if needsModelLimits {
@@ -241,6 +243,10 @@ func (s *Service) reconcileTargetRemoteAction(
 	// 无远端启停权限时，只做模型限制。
 	if len(statusModels) == 0 {
 		return modelsAction, modelsErr
+	}
+	// 账号 status 仍冲突：不覆盖用户/上游的启停差异，但模型限制结果照常返回。
+	if statusConflictSkip {
+		return joinRemoteActions(modelsAction, RemoteActionSkippedTargetConflict), modelsErr
 	}
 
 	desiredStatus, desiredWeight := desiredTargetState(target.Platform, fullyHealthy, blocked, hasHealthyEffective, minWeight, *stored)
@@ -730,17 +736,42 @@ func joinRemoteActions(parts ...string) string {
 	return strings.Join(out, ",")
 }
 
-// expandTargetModelsForProbe 若已接管模型限制，用 OriginalModels 作为探活候选来源，
-// 否则被摘除的模型会从账号列表消失，永远无法再被探活恢复。
-func expandTargetModelsForProbe(target AdminProbeTarget, stored *TargetActionState) AdminProbeTarget {
+// modelNamesFromStates 提取健康状态行中的模型名，供 expandTargetModelsForProbe 补回被摘候选。
+func modelNamesFromStates(states []ConnectionHealthState) []string {
+	out := make([]string, 0, len(states))
+	for _, state := range states {
+		if name := strings.TrimSpace(state.ModelName); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// expandTargetModelsForProbe 若已接管模型限制，把被摘除的模型补回探活候选。
+//   - OriginalModels 非空：用首次接管时的完整列表；
+//   - OriginalModels 为空（原本不限制）：合并当前上游列表、LastApplied 临时白名单、
+//     以及 extraModels（通常来自本地健康状态行），避免被摘模型从候选池消失后永远无法恢复。
+func expandTargetModelsForProbe(target AdminProbeTarget, stored *TargetActionState, extraModels ...string) AdminProbeTarget {
 	if stored == nil {
+		if len(extraModels) == 0 {
+			return target
+		}
+		target.Models = splitModelList(joinModelList(append(append([]string{}, target.Models...), extraModels...)))
 		return target
 	}
 	original := splitModelList(stored.OriginalModels)
-	if len(original) == 0 {
+	if len(original) > 0 {
+		target.Models = original
 		return target
 	}
-	target.Models = original
+	if !hasManagedModelLimits(stored) && len(extraModels) == 0 {
+		return target
+	}
+	merged := make([]string, 0, len(target.Models)+8)
+	merged = append(merged, target.Models...)
+	merged = append(merged, splitModelList(stored.LastAppliedModels)...)
+	merged = append(merged, extraModels...)
+	target.Models = splitModelList(joinModelList(merged))
 	return target
 }
 
@@ -878,6 +909,30 @@ func targetActionConflicted(target AdminProbeTarget, stored TargetActionState, c
 		return !equalIntPointers(currentWeight, stored.LastAppliedWeight)
 	}
 	return false
+}
+
+// shouldHealTargetActionConflict 判断 status 检查点冲突是否应自动愈合。
+// - 账号已可调度：以上游现状为准，对齐 lastApplied，避免永久 conflict 阻断模型白名单恢复；
+// - 账号摘流但已有健康有效模型：允许继续走恢复路径（写入失败/中断残留）。
+func shouldHealTargetActionConflict(platform string, currentStatus string, blocked bool, hasHealthyEffective bool) bool {
+	if logicalStatusEnabled(platform, currentStatus) && !blocked {
+		return true
+	}
+	return !logicalStatusEnabled(platform, currentStatus) && hasHealthyEffective && !blocked
+}
+
+// healTargetActionConflict 清除 conflict，并在账号已可调度时把 lastApplied 对齐为当前上游状态。
+func healTargetActionConflict(stored *TargetActionState, platform string, currentStatus string, currentWeight *int) {
+	if stored == nil {
+		return
+	}
+	stored.Conflict = false
+	stored.PendingStatus = ""
+	stored.PendingWeight = nil
+	if logicalStatusEnabled(platform, currentStatus) {
+		stored.LastAppliedStatus = currentStatus
+		stored.LastAppliedWeight = cloneIntPointer(currentWeight)
+	}
 }
 
 // targetActionCheckpointConflicted reconciles the two-phase action checkpoint. A current

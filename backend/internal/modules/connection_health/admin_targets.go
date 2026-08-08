@@ -392,9 +392,13 @@ func (s *Service) ProbeTarget(ctx context.Context, userID string, targetID strin
 	if err != nil {
 		return nil, err
 	}
-	// 已摘除模型限制时仍用 OriginalModels 作为候选，避免被摘模型无法再被手动探活恢复。
+	// 已摘除模型限制时仍用 OriginalModels / 本地状态补回候选，避免被摘模型无法再被手动探活恢复。
 	if stored, storeErr := s.repo.GetTargetActionState(ctx, userID, adminAccountID, target.TargetID); storeErr == nil {
-		target = expandTargetModelsForProbe(target, stored)
+		known := []string(nil)
+		if states, stateErr := s.repo.ListStatesByConnection(ctx, target.TargetID); stateErr == nil {
+			known = modelNamesFromStates(states)
+		}
+		target = expandTargetModelsForProbe(target, stored, known...)
 	}
 	allSpecs := candidateModelSpecs(target.Models, policies)
 	specs := allSpecs
@@ -450,6 +454,232 @@ func (s *Service) ProbeTarget(ctx context.Context, userID string, targetID strin
 		results = append(results, toModelHealth(result.spec.modelName, *result.state))
 	}
 	return results, nil
+}
+
+// ManualRestoreTarget 管理员手动恢复独立探活目标：
+//  1. 清除 TargetActionState.Conflict，避免自动路径永久 skip；
+//  2. 将指定模型（空 = 当前已摘除/非 healthy 的受控模型）强制置为 healthy/100；
+//  3. 立即 reconcile 写回 sub2api 模型白名单，并尝试恢复账号可调度。
+//
+// 这是运维兜底：不等观察窗/冷却，也不再被 status conflict 卡住。
+func (s *Service) ManualRestoreTarget(ctx context.Context, userID string, targetID string, models []string) ([]ModelHealth, error) {
+	session, target, _, adminAccountID, err := s.resolveManualTarget(ctx, userID, targetID)
+	if err != nil {
+		return nil, err
+	}
+	release, err := s.repo.AcquireTargetLease(ctx, targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	policies, err := s.repo.ListPolicies(ctx, userID, adminAccountID)
+	if err != nil {
+		return nil, err
+	}
+	allStates, err := s.repo.ListStatesByConnection(ctx, target.TargetID)
+	if err != nil {
+		return nil, err
+	}
+	stored, err := s.repo.GetTargetActionState(ctx, userID, adminAccountID, target.TargetID)
+	if err != nil {
+		return nil, err
+	}
+	target = expandTargetModelsForProbe(target, stored, modelNamesFromStates(allStates)...)
+
+	fallbackPolicy := Policy{Enabled: true, AutoDegradeEnabled: true, AutoRemoteActionEnabled: true}
+	for _, p := range policies {
+		if p.Enabled && policySupportsProbing(p) {
+			fallbackPolicy = p
+			break
+		}
+	}
+
+	// specs 覆盖：策略候选 ∩ 目标模型 + 本地状态模型 + OriginalModels。
+	specs := candidateModelSpecs(target.Models, policies)
+	seenSpec := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		seenSpec[spec.modelName] = struct{}{}
+	}
+	addSpec := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seenSpec[name]; ok {
+			return
+		}
+		seenSpec[name] = struct{}{}
+		specs = append(specs, probeModelSpec{modelName: name, policy: fallbackPolicy})
+	}
+	for _, state := range allStates {
+		addSpec(state.ModelName)
+	}
+	if stored != nil {
+		for _, name := range splitModelList(stored.OriginalModels) {
+			addSpec(name)
+		}
+	}
+
+	requested := make(map[string]struct{})
+	for _, m := range models {
+		if name := strings.TrimSpace(m); name != "" {
+			requested[name] = struct{}{}
+			addSpec(name)
+		}
+	}
+	filterRequested := len(requested) > 0
+
+	stateByName := make(map[string]ConnectionHealthState, len(allStates))
+	for _, state := range allStates {
+		stateByName[state.ModelName] = state
+	}
+
+	restoreSet := make(map[string]struct{})
+	mark := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if filterRequested {
+			if _, ok := requested[name]; !ok {
+				return
+			}
+		}
+		state, ok := stateByName[name]
+		if filterRequested || !ok || isModelLimitExclusionState(state) || state.State != StateHealthy || state.CurrentWeight < 100 {
+			restoreSet[name] = struct{}{}
+		}
+	}
+	for _, spec := range specs {
+		mark(spec.modelName)
+	}
+	for name := range stateByName {
+		mark(name)
+	}
+	if stored != nil {
+		for _, name := range splitModelList(stored.OriginalModels) {
+			mark(name)
+		}
+	}
+	restoreNames := make([]string, 0, len(restoreSet))
+	for name := range restoreSet {
+		restoreNames = append(restoreNames, name)
+	}
+	restoreNames = splitModelList(joinModelList(restoreNames))
+	if filterRequested && len(restoreNames) == 0 {
+		return nil, requestError(ErrorNoMatchingModels)
+	}
+
+	// 清除 conflict；无快照时不伪造 OriginalModels（避免把已摘除后的短列表固化成基线）。
+	if stored != nil {
+		healTargetActionConflict(stored, target.Platform, effectiveLogicalStatus(target), normalizedTargetWeight(target))
+		if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+			return nil, err
+		}
+	}
+
+	now := time.Now()
+	for _, name := range restoreNames {
+		fromState := string(StateSuspended)
+		var next ConnectionHealthState
+		if current, ok := stateByName[name]; ok {
+			fromState = string(current.State)
+			next = current
+		} else {
+			next = defaultTargetState(userID, adminAccountID, target, name)
+		}
+		next.State = StateHealthy
+		next.CurrentWeight = 100
+		next.ConsecutiveFailures = 0
+		next.ConsecutiveSuccesses = 0
+		next.CooldownUntil = nil
+		next.ObservingUntil = nil
+		next.LastErrorKey = ""
+		next.LastErrorDetail = ""
+		next.LastSuccessAt = &now
+		next.UserID = userID
+		next.AdminAccountID = adminAccountID
+		if err := s.repo.UpsertState(ctx, next); err != nil {
+			return nil, err
+		}
+		stateByName[name] = next
+		s.recordTargetEvent(ctx, userID, adminAccountID, target, "", name, "manual_restore", fromState, string(StateHealthy), nil, "", "", "", 0, 0)
+	}
+
+	// 确保 reconcile 至少覆盖 original 中的模型（含刚恢复的）。
+	if stored != nil && strings.TrimSpace(stored.OriginalModels) != "" {
+		for _, name := range splitModelList(stored.OriginalModels) {
+			addSpec(name)
+		}
+	}
+	if len(specs) == 0 {
+		for _, name := range restoreNames {
+			addSpec(name)
+		}
+	}
+
+	var remoteAction string
+	if len(specs) > 0 {
+		action, actionErr := s.reconcileTargetRemoteAction(ctx, userID, adminAccountID, session, target, specs)
+		remoteAction = action
+		if actionErr != nil {
+			log.Printf("[connection-health] manual restore reconcile failed target_id=%s action=%s err=%v", target.TargetID, action, actionErr)
+			// 状态已写 healthy；把远端错误返回 UI。
+			out := make([]ModelHealth, 0, len(restoreNames))
+			for _, name := range restoreNames {
+				if st, ok := stateByName[name]; ok {
+					out = append(out, toModelHealth(name, st))
+				}
+			}
+			return out, actionErr
+		}
+	}
+
+	// 兜底：reconcile 后仍 managed 且 original 未写回时，直接 ApplyTargetModels(original)。
+	if target.Platform == string(upstream.PlatformSub2API) && s.dispatcher != nil {
+		if latest, getErr := s.repo.GetTargetActionState(ctx, userID, adminAccountID, target.TargetID); getErr == nil && latest != nil {
+			stored = latest
+		}
+		if stored != nil && hasManagedModelLimits(stored) {
+			desired := stored.OriginalModels
+			if !modelListsEqual(stored.LastAppliedModels, desired) || !modelListsEqual(joinModelList(target.Models), desired) {
+				action, actionErr := s.dispatcher.ApplyTargetModels(ctx, session, target, desired)
+				if actionErr != nil {
+					log.Printf("[connection-health] manual restore apply models failed target_id=%s err=%v", target.TargetID, actionErr)
+					return nil, actionErr
+				}
+				remoteAction = joinRemoteActions(remoteAction, action)
+				stored.LastAppliedModels = desired
+				stored.PendingModels = ""
+				stored.Conflict = false
+				if err := s.repo.UpsertTargetActionState(ctx, *stored); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	if remoteAction != "" && len(restoreNames) > 0 {
+		if st, ok := stateByName[restoreNames[len(restoreNames)-1]]; ok {
+			st.LastRemoteAction = remoteAction
+			_ = s.repo.UpsertState(ctx, st)
+			stateByName[restoreNames[len(restoreNames)-1]] = st
+		}
+	}
+
+	out := make([]ModelHealth, 0, len(restoreNames))
+	for _, name := range restoreNames {
+		if st, ok := stateByName[name]; ok {
+			out = append(out, toModelHealth(name, st))
+		}
+	}
+	if len(out) == 0 {
+		for _, st := range stateByName {
+			out = append(out, toModelHealth(st.ModelName, st))
+		}
+	}
+	return out, nil
 }
 
 // findAdminTarget 在当前 workspace 的 admin 分组/账号里按 accountID 找到目标，并构造 AdminProbeTarget。

@@ -165,6 +165,14 @@ export const restoreConnection = async (connectionId: string): Promise<void> => 
   })
 }
 
+// restoreTarget 手动恢复独立探活目标：清 conflict、强制模型 healthy，并立即写回 sub2api 模型白名单。
+// models 为空时恢复当前已摘除/非 healthy 的受控模型；指定时只恢复这些模型。
+export const restoreTarget = async (targetId: string, models?: string[]): Promise<ModelHealth[]> =>
+  requestJson<ModelHealth[]>(`/connection-health/targets/${encodeURIComponent(targetId)}/restore`, {
+    method: 'POST',
+    body: models && models.length > 0 ? JSON.stringify({ models }) : undefined,
+  })
+
 export const listConnectionHealthPolicies = async (): Promise<ConnectionHealthPolicy[]> =>
   requestJson<ConnectionHealthPolicy[]>('/connection-health/policies')
 

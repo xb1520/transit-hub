@@ -618,7 +618,11 @@ func modelHealthForConnection(byModel map[string]ConnectionHealthState) []ModelH
 // 保证被摘除的模型仍出现在分组监控 UI 中（带「已摘除」标记），并能继续被探活恢复。
 func modelsForHealthDisplay(liveModels string, actionState *TargetActionState, byModel map[string]ConnectionHealthState) []string {
 	target := AdminProbeTarget{Models: splitModelList(liveModels)}
-	target = expandTargetModelsForProbe(target, actionState)
+	extra := make([]string, 0, len(byModel))
+	for name := range byModel {
+		extra = append(extra, name)
+	}
+	target = expandTargetModelsForProbe(target, actionState, extra...)
 	seen := make(map[string]struct{}, len(target.Models)+len(byModel))
 	out := make([]string, 0, len(target.Models)+len(byModel))
 	for _, name := range target.Models {

@@ -1321,6 +1321,10 @@ export default {
         probe: 'Probe Now',
         disable: 'Disable',
         restore: 'Restore',
+        restoreTarget: 'Restore model whitelist',
+        restoreModel: 'Restore this model',
+        restoreTargetSuccess: 'Restored; model whitelist written back upstream',
+        restoreTargetFailed: 'Manual restore failed',
         viewEvents: 'View Events'
       },
       errorKeys: {
