@@ -799,6 +799,44 @@ func (r *Repository) SumProbeCostTodayByConnection(ctx context.Context, userID s
 	return out, rows.Err()
 }
 
+// ProbeCostTodayRow 是 (connection_id, own_group_name) 维度的今日探活费用。
+// connection_id 为 targetId（platform:ws:account）或旧版 real_connection UUID。
+type ProbeCostTodayRow struct {
+	ConnectionID string
+	OwnGroupName string
+	CostCNY      float64
+	CostUSD      float64
+}
+
+// SumProbeCostTodayDetailed 按 connection_id + own_group_name 聚合今日真实探活费用，
+// 供仪表盘净利润把探测消耗并入分组/上游成本。
+func (r *Repository) SumProbeCostTodayDetailed(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) ([]ProbeCostTodayRow, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT connection_id,
+			COALESCE(own_group_name, ''),
+			COALESCE(SUM(cost_cny), 0),
+			COALESCE(SUM(cost_usd), 0)
+		FROM connection_health_events
+		WHERE user_id = $1 AND admin_account_id = $2 AND created_at >= $3
+			AND result = ANY($4)
+			AND (cost_cny > 0 OR cost_usd > 0)
+		GROUP BY connection_id, own_group_name
+	`, userID, adminAccountID, dayStart, probeResultKeys())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ProbeCostTodayRow, 0)
+	for rows.Next() {
+		var item ProbeCostTodayRow
+		if err := rows.Scan(&item.ConnectionID, &item.OwnGroupName, &item.CostCNY, &item.CostUSD); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 // TryConsumeProbeBudget atomically reserves one probe (count). Optionally enforces cost budget:
 // when costLimit > 0 and used_cost >= costLimit, reservation is denied.
 // The first reservation of a day seeds the counter from existing events so a rolling upgrade

@@ -309,6 +309,8 @@ func New(cfg config.Config, db *pgxpool.Pool, redisClient *redis.Client) *Server
 	metricsService := dashboard.NewMetricsService(dashboardSessionStore, platformService, upstreamService, metricsRepo, adminAccountsService)
 	metricsService.SetMySiteSync(mySitesService)
 	metricsService.SetPricingMappingSource(dashboardPricingMappingSource{svc: mySitesService})
+	metricsService.SetRealConnectionSource(dashboardRealConnectionSource{svc: mySitesService})
+	metricsService.SetProbeCostSource(dashboardProbeCostSource{svc: connHealthService})
 	metricsService.StartScheduler(context.Background())
 	dashboard.RegisterRoutes(server.mux, dashboardService, metricsService)
 
@@ -342,6 +344,59 @@ func (a dashboardPricingMappingSource) ListPricingTargetLinks(ctx context.Contex
 			OwnGroup:  link.OwnGroup,
 			SiteID:    link.SiteID,
 			GroupName: link.GroupName,
+		})
+	}
+	return out, nil
+}
+
+// dashboardRealConnectionSource 把真实对接记录适配为 dashboard 只读接口（按管理站账号取真实营收）。
+type dashboardRealConnectionSource struct {
+	svc *my_sites.Service
+}
+
+func (a dashboardRealConnectionSource) ListRealConnectionLinks(ctx context.Context, userID string) ([]dashboard.RealConnectionLink, error) {
+	if a.svc == nil {
+		return nil, nil
+	}
+	conns, err := a.svc.ListRealConnections(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dashboard.RealConnectionLink, 0, len(conns))
+	for _, c := range conns {
+		out = append(out, dashboard.RealConnectionLink{
+			ID:               c.ID,
+			SiteID:           c.UpstreamSiteID,
+			UpstreamGroup:    c.UpstreamGroupName,
+			UpstreamKeyID:    c.UpstreamKeyID,
+			AdminAccountID:   c.AdminAccountID,
+			AdminAccountName: c.AdminAccountName,
+			AdminPlatform:    c.AdminPlatform,
+			OwnGroupNames:    append([]string(nil), c.OwnGroupNames...),
+		})
+	}
+	return out, nil
+}
+
+// dashboardProbeCostSource 把分组健康探活费用适配为 dashboard 只读接口。
+type dashboardProbeCostSource struct {
+	svc *connection_health.Service
+}
+
+func (a dashboardProbeCostSource) ListTodayProbeCosts(ctx context.Context, userID string) ([]dashboard.ProbeCostEntry, error) {
+	if a.svc == nil {
+		return nil, nil
+	}
+	rows, err := a.svc.TodayProbeCostBreakdown(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dashboard.ProbeCostEntry, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, dashboard.ProbeCostEntry{
+			ConnectionID: r.ConnectionID,
+			OwnGroupName: r.OwnGroupName,
+			CostCNY:      r.CostCNY,
 		})
 	}
 	return out, nil

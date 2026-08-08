@@ -31,6 +31,7 @@ type healthRepository interface {
 	TryConsumeProbeBudget(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, limit int, costLimit float64) (bool, error)
 	AddProbeBudgetCost(ctx context.Context, userID string, adminAccountID string, policyID string, dayStart time.Time, costCNY float64, costUSD float64) error
 	SumProbeCostTodayByConnection(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) (map[string]ProbeCostByTarget, error)
+	SumProbeCostTodayDetailed(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) ([]ProbeCostTodayRow, error)
 	TryAcquireSchedulerLease(ctx context.Context) (release func(), acquired bool, err error)
 	AcquireTargetLease(ctx context.Context, targetID string) (release func(), err error)
 	ListEnabledPolicies(ctx context.Context) ([]Policy, error)
@@ -100,6 +101,16 @@ func (s *Service) currentAdminAccountID(ctx context.Context, userID string) (str
 		return "", requestError(ErrorNoCurrentAccount)
 	}
 	return s.accounts.RequireCurrentID(ctx, userID)
+}
+
+// TodayProbeCostBreakdown 返回当前工作区今日探活费用明细（connection_id + own_group）。
+// 供仪表盘净利润把探测消耗并入成本；失败返回空切片不报错给调用方时由对方降级。
+func (s *Service) TodayProbeCostBreakdown(ctx context.Context, userID string) ([]ProbeCostTodayRow, error) {
+	adminAccountID, err := s.currentAdminAccountID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.SumProbeCostTodayDetailed(ctx, userID, adminAccountID, probeBudgetDayStart(time.Now()))
 }
 
 // ModelHealth 是单个模型在某条对接链路上的健康状态展示数据，绝不包含 upstream_key。

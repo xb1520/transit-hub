@@ -175,39 +175,69 @@ export interface GroupUsageTodayResponse {
   date: string
   total: number
   groups: GroupUsageTodayItem[]
+  /** 管理站充值倍率：CNY = 平台金额 × rate（与仪表盘币种展示一致）。 */
+  siteRechargeRate?: number
 }
 
 /** 获取当前工作区「我的站点」所有分组今日的使用额度明细。仅在弹窗打开时按需调用。 */
 export const getGroupUsageToday = async (): Promise<GroupUsageTodayResponse> =>
   requestJson<GroupUsageTodayResponse>('/dashboard/group-usage-today')
 
-/** 自有分组的今日利润明细（「今日净利润 / 今日利润率」下钻）。 */
+/**
+ * 自有分组的今日利润明细（「今日净利润 / 今日利润率」下钻）。
+ * revenue/cost/profit 均为成本/CNY 口径（营收 = 平台消费 × 管理站充值倍率）。
+ * upstreams 为映射到本自有分组的上游子行（可展开）。
+ */
 export interface GroupProfitTodayItem {
   groupName: string
+  /** 成本/CNY：平台营收 × siteRechargeRate */
   revenue: number
+  /** 换算前的管理站平台金额 */
+  revenuePlatform?: number
+  /** 上游 key 实耗 + 探测消耗（已 × 倍率 / 成本 CNY） */
   cost: number
+  /** 今日探测消耗（已含在 cost 中） */
+  probeCost?: number
   profit: number
   /** 利润/营收，0~1 比例。 */
   profitMargin: number
   saleMultiplier?: number | null
+  /** 映射到本自有分组、今日有消耗的上游（嵌套展示）。 */
+  upstreams?: UpstreamGroupProfitTodayItem[]
 }
 
-/** 上游分组的今日利润明细（有消耗才返回）。 */
+/**
+ * 上游子行（嵌套在自有分组下；金额均为成本/CNY）。
+ * cost = 上游 key 实耗；
+ * revenue 优先 = 真实对接管理站账号今日消费；否则母行营收 × 成本占比；
+ * profit = revenue − cost。
+ */
 export interface UpstreamGroupProfitTodayItem {
   siteId: string
   siteName: string
   platform: string
   groupName: string
+  /** key 实耗份额 + 探测消耗 */
   cost: number
+  /** 探测消耗（已含在 cost） */
+  probeCost?: number
   revenue: number
   profit: number
+  /** 实际利润率 = profit/revenue；成本分摊时会等于母行 */
   profitMargin: number
+  /** 预算利润率 (售卖−成本倍率)/售卖，对照调价 */
+  budgetMargin?: number | null
   saleMultiplier?: number | null
   costMultiplier?: number | null
+  /** account=管理站账号/channel 真实；allocated=母行按成本分摊 */
+  revenueSource?: 'account' | 'allocated' | string
   mappedOwnGroups?: string[]
 }
 
-/** 分组今日利润下钻响应（自有分组 + 上游分组）。 */
+/**
+ * 分组今日利润下钻响应。
+ * groups 为主列表（内嵌 upstreams）；upstreamGroups 为扁平兼容列表。
+ */
 export interface GroupProfitTodayResponse {
   date: string
   totalRevenue: number
@@ -216,8 +246,12 @@ export interface GroupProfitTodayResponse {
   totalMargin: number
   groups: GroupProfitTodayItem[]
   upstreamGroups?: UpstreamGroupProfitTodayItem[]
+  /** 未映射到任何自有分组的上游（仅成本）。 */
+  unmappedUpstreams?: UpstreamGroupProfitTodayItem[]
   /** 部分上游站点 key 用量采集失败时为 true。 */
   upstreamPartial?: boolean
+  /** 管理站充值倍率：平台营收 → 成本/CNY。 */
+  siteRechargeRate?: number
 }
 
 /** 获取今天有消耗的自有/上游分组利润与利润率。仅在弹窗打开时按需调用。 */

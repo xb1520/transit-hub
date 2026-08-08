@@ -86,10 +86,13 @@ type AdminGroupItem struct {
 }
 
 // GroupUsageTodayResponse 是 GET /api/dashboard/group-usage-today 返回的分组今日用量明细。
+// Total / TodayAmount 为管理站平台单位（与 todayProfit 同源）；前端按 SiteRechargeRate 与币种模式换算展示。
 type GroupUsageTodayResponse struct {
 	Date   string                `json:"date"`
 	Total  float64               `json:"total"`
 	Groups []GroupUsageTodayItem `json:"groups"`
+	// SiteRechargeRate 工作区管理站充值倍率：CNY = 平台金额 × rate（默认 1）。
+	SiteRechargeRate float64 `json:"siteRechargeRate"`
 }
 
 // GroupUsageTodayItem 是单个分组的今日使用额度。
@@ -99,50 +102,79 @@ type GroupUsageTodayItem struct {
 }
 
 // GroupProfitTodayResponse 是 GET /api/dashboard/group-profit-today 返回的
-// 「今日净利润 / 今日利润率」下钻：今天有消耗的自有分组与上游分组利润/利润率。
-// 自有分组成本 = 调价映射关联的上游 key 实耗之和（与分组健康「上游分组消耗」同源）；
-// 上游分组以 key 今日实际成本为准，营收按售卖/成本倍率估算（与调价映射预算毛利率同公式）。
-// TotalCost 优先为 key 用量合计；key 不可用时回退站点 TodayConsume × 充值倍率。
+// 「今日净利润 / 今日利润率」下钻。
+//
+// 结构：以自有分组为主行；Upstreams 嵌套其映射的上游分组（展开查看）。
+//
+// 金额口径（成本/CNY）：
+//   - 自有营收 = 管理站分组真实消费 × SiteRechargeRate；
+//   - 自有/上游成本 = 上游 key 实耗（已 × 上游 rechargeRate）；
+//   - 上游子行营收优先 = 真实对接管理站账号今日消费 × SiteRechargeRate（筛账号 usage）；
+//     无对接账号数据时回退为母行营收 × (子成本/剩余子成本之和)；
+//   - 利润 = 营收 − 成本。
+//   - 前端双币种：CNY 用本字段，USD = CNY / SiteRechargeRate。
 type GroupProfitTodayResponse struct {
-	Date         string                 `json:"date"`
-	TotalRevenue float64                `json:"totalRevenue"`
-	TotalCost    float64                `json:"totalCost"`
-	TotalProfit  float64                `json:"totalProfit"`
+	Date         string  `json:"date"`
+	TotalRevenue float64 `json:"totalRevenue"`
+	TotalCost    float64 `json:"totalCost"`
+	TotalProfit  float64 `json:"totalProfit"`
 	// TotalMargin 为 totalProfit / totalRevenue；无营收时为 0。
 	TotalMargin float64 `json:"totalMargin"`
-	// Groups 自有（admin）分组：revenue > 0 或关联上游成本 > 0。
+	// Groups 自有（admin）分组：revenue > 0 或关联上游成本 > 0；内含 Upstreams。
 	Groups []GroupProfitTodayItem `json:"groups"`
-	// UpstreamGroups 已接入且今日有消耗的上游分组。
+	// UpstreamGroups 扁平列表（分组健康等复用）；与 groups[].upstreams 同源口径。
 	UpstreamGroups []UpstreamGroupProfitTodayItem `json:"upstreamGroups"`
+	// UnmappedUpstreams 今日有消耗但未映射到任何自有分组的上游（仅成本，营收为 0）。
+	UnmappedUpstreams []UpstreamGroupProfitTodayItem `json:"unmappedUpstreams,omitempty"`
 	// UpstreamPartial 表示部分上游站点 key 用量采集失败，上游列表可能不完整。
 	UpstreamPartial bool `json:"upstreamPartial,omitempty"`
+	// SiteRechargeRate 工作区管理站充值倍率：平台营收 → 成本/CNY（默认 1）。
+	SiteRechargeRate float64 `json:"siteRechargeRate"`
 }
 
-// GroupProfitTodayItem 是单个自有分组利润明细。
+// GroupProfitTodayItem 是单个自有分组利润明细（金额均为成本/CNY 口径）。
 // Cost 为关联上游 key 实耗之和；ProfitMargin 为利润/营收（0~1，无营收时为 0）。
+// RevenuePlatform 为换算前的管理站平台金额，便于核对充值倍率。
+// Upstreams 为映射到本自有分组、今日有消耗的上游子行。
 type GroupProfitTodayItem struct {
-	GroupName      string   `json:"groupName"`
-	Revenue        float64  `json:"revenue"`
-	Cost           float64  `json:"cost"`
+	GroupName       string                         `json:"groupName"`
+	Revenue         float64                        `json:"revenue"`
+	RevenuePlatform float64                        `json:"revenuePlatform,omitempty"`
+	// Cost = 上游 key 实耗 + 探测消耗（均已是成本/CNY）。
+	Cost float64 `json:"cost"`
+	// ProbeCost 今日探测消耗合计（已含在 Cost 中，单独列出便于核对）。
+	ProbeCost      float64  `json:"probeCost,omitempty"`
 	Profit         float64  `json:"profit"`
 	ProfitMargin   float64  `json:"profitMargin"`
 	SaleMultiplier *float64 `json:"saleMultiplier,omitempty"`
+	Upstreams      []UpstreamGroupProfitTodayItem `json:"upstreams,omitempty"`
 }
 
-// UpstreamGroupProfitTodayItem 是单个今日有消耗的上游分组利润明细。
-// Cost 为 key 用量合计（已 × 站点 rechargeRate）；Revenue/Profit 在缺少倍率时按全站利润率回退估算。
+// UpstreamGroupProfitTodayItem 是嵌套在自有分组下的上游子行（金额均为成本/CNY 口径）。
+// Cost = 上游 key 实耗（已 × 上游充值倍率）。
+// Revenue 优先 = 真实对接管理站账号/channel 今日消费 × SiteRechargeRate；
+// 无对接数据时回退为母行真实营收按成本占比分摊（此时 ProfitMargin 会等于母行，属分摊数学结果）。
+// Profit = Revenue − Cost；ProfitMargin = Profit/Revenue（实际）。
+// BudgetMargin = (售卖倍率 − 成本倍率)/售卖倍率，用于对照调价预算，与是否分摊无关。
 type UpstreamGroupProfitTodayItem struct {
-	SiteID         string   `json:"siteId"`
-	SiteName       string   `json:"siteName"`
-	Platform       string   `json:"platform"`
-	GroupName      string   `json:"groupName"`
-	Cost           float64  `json:"cost"`
-	Revenue        float64  `json:"revenue"`
-	Profit         float64  `json:"profit"`
-	ProfitMargin   float64  `json:"profitMargin"`
+	SiteID       string  `json:"siteId"`
+	SiteName     string  `json:"siteName"`
+	Platform     string  `json:"platform"`
+	GroupName string  `json:"groupName"`
+	// Cost = 上游 key 实耗份额 + 探测消耗（成本/CNY）。
+	Cost float64 `json:"cost"`
+	// ProbeCost 该上游今日探测消耗（已含在 Cost 中）。
+	ProbeCost    float64 `json:"probeCost,omitempty"`
+	Revenue      float64 `json:"revenue"`
+	Profit       float64 `json:"profit"`
+	ProfitMargin float64 `json:"profitMargin"`
+	// BudgetMargin 调价预算利润率 0~1；缺倍率时省略。
+	BudgetMargin   *float64 `json:"budgetMargin,omitempty"`
 	SaleMultiplier *float64 `json:"saleMultiplier,omitempty"`
 	CostMultiplier *float64 `json:"costMultiplier,omitempty"`
-	// MappedOwnGroups 参与售卖倍率推断的自有分组名（来自调价映射 / 真实对接）。
+	// RevenueSource: "account"=管理站账号/channel 真实消费；"allocated"=母行营收按成本分摊。
+	RevenueSource string `json:"revenueSource,omitempty"`
+	// MappedOwnGroups 映射到的自有分组（扁平列表用；嵌套子行通常仅含母行名）。
 	MappedOwnGroups []string `json:"mappedOwnGroups,omitempty"`
 }
 

@@ -1064,8 +1064,13 @@ const lastProbeLabel = computed(() => {
       @close="closeAdminModal"
     />
     <SiteBalanceModal :open="siteBalanceOpen" @close="closeSiteBalance" @updated="onSiteBalanceUpdated" />
-    <GroupUsageTodayModal :open="groupUsageTodayOpen" @close="closeGroupUsageToday" />
-    <GroupProfitTodayModal :open="groupProfitTodayOpen" :focus="groupProfitFocus" @close="closeGroupProfitToday" />
+    <GroupUsageTodayModal :open="groupUsageTodayOpen" :site-recharge-rate="siteRate" @close="closeGroupUsageToday" />
+    <GroupProfitTodayModal
+      :open="groupProfitTodayOpen"
+      :focus="groupProfitFocus"
+      :site-recharge-rate="siteRate"
+      @close="closeGroupProfitToday"
+    />
     <UpstreamKeyUsageTodayModal :open="upstreamKeyUsageTodayOpen" @close="closeUpstreamKeyUsageToday" />
     <TodayInboundBreakdownModal :open="todayInboundBreakdownOpen" @close="closeTodayInboundBreakdown" />
     <UpstreamBalanceBreakdownModal :open="upstreamBalanceBreakdownOpen" @close="closeUpstreamBalanceBreakdown" />

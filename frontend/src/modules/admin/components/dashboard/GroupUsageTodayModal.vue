@@ -3,10 +3,12 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ArrowDownWideNarrow, ArrowUpWideNarrow, Loader2, RefreshCw, TrendingUp, X } from 'lucide-vue-next'
 import { getGroupUsageToday, type GroupUsageTodayItem } from '../../api/dashboardAdmin'
-import { formatCny } from '../../utils/dashboard'
+import { useCurrencyDisplay } from '../../composables/useCurrencyDisplay'
 
 const props = defineProps<{
   open: boolean
+  /** 仪表盘已加载的管理站充值倍率（兜底）；接口 siteRechargeRate 优先。 */
+  siteRechargeRate?: number
 }>()
 
 const emit = defineEmits<{
@@ -14,13 +16,27 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { displayMode, formatMoneyParts } = useCurrencyDisplay()
 
 const loading = ref(false)
 const error = ref<string | null>(null)
 const groups = ref<GroupUsageTodayItem[]>([])
 const total = ref(0)
+/** 管理站充值倍率：今日营收为平台单位，CNY = 平台 × rate。 */
+const siteRate = ref(1)
 // 默认按金额从高到低排序；toggle 后按金额从低到高，金额相同时用分组名排序，均不触发新的请求。
 const sortAsc = ref(false)
+
+/** 与仪表盘「今日营收」卡片一致：平台金额 × 管理站充值倍率，并跟随币种模式。 */
+const money = (usd: number | null | undefined) => {
+  void displayMode.value
+  return formatMoneyParts({ usd, rate: siteRate.value > 0 ? siteRate.value : 1 })
+}
+
+const moneyText = (usd: number | null | undefined): string => {
+  const parts = money(usd)
+  return parts.secondary ? `${parts.primary} / ${parts.secondary}` : parts.primary
+}
 
 const sortedGroups = computed(() => {
   return [...groups.value].sort((a, b) => {
@@ -43,6 +59,15 @@ const loadData = async () => {
     const response = await getGroupUsageToday()
     groups.value = response.groups ?? []
     total.value = response.total ?? 0
+    const fromApi = response.siteRechargeRate
+    const fromProp = props.siteRechargeRate
+    if (fromApi != null && fromApi > 0) {
+      siteRate.value = fromApi
+    } else if (fromProp != null && fromProp > 0) {
+      siteRate.value = fromProp
+    } else {
+      siteRate.value = 1
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'admin.dashboard.groupUsage.loadError'
   } finally {
@@ -77,7 +102,7 @@ watch(() => props.open, (isOpen) => {
             <div>
               <h2 class="text-lg font-semibold text-foreground">{{ t('admin.dashboard.groupUsage.title') }}</h2>
               <p class="text-sm text-muted-foreground">
-                {{ t('admin.dashboard.groupUsage.subtitle', { count: groups.length, total: formatCny(total) }) }}
+                {{ t('admin.dashboard.groupUsage.subtitle', { count: groups.length, total: moneyText(total) }) }}
               </p>
             </div>
           </div>
@@ -146,7 +171,15 @@ watch(() => props.open, (isOpen) => {
                   class="border-b border-border/40 last:border-b-0"
                 >
                   <td class="px-4 py-3 align-middle font-medium text-foreground">{{ group.groupName }}</td>
-                  <td class="px-4 py-3 align-middle text-right text-foreground">{{ formatCny(group.todayAmount) }}</td>
+                  <td class="px-4 py-3 align-middle text-right tabular-nums text-foreground">
+                    <div>{{ money(group.todayAmount).primary }}</div>
+                    <div
+                      v-if="money(group.todayAmount).secondary"
+                      class="text-[11px] font-normal text-muted-foreground"
+                    >
+                      {{ money(group.todayAmount).secondary }}
+                    </div>
+                  </td>
                 </tr>
               </tbody>
             </table>

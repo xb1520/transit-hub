@@ -445,6 +445,34 @@ func (f *fakeRepository) SumProbeCostTodayByConnection(ctx context.Context, user
 	return out, nil
 }
 
+func (f *fakeRepository) SumProbeCostTodayDetailed(ctx context.Context, userID string, adminAccountID string, dayStart time.Time) ([]ProbeCostTodayRow, error) {
+	type key struct{ conn, own string }
+	agg := map[key]ProbeCostTodayRow{}
+	for _, event := range f.events {
+		if event.UserID != userID || event.AdminAccountID != adminAccountID {
+			continue
+		}
+		if !isProbeResultString(event.Result) {
+			continue
+		}
+		if event.CostCNY <= 0 && event.CostUSD <= 0 {
+			continue
+		}
+		k := key{conn: event.ConnectionID, own: event.OwnGroupName}
+		item := agg[k]
+		item.ConnectionID = event.ConnectionID
+		item.OwnGroupName = event.OwnGroupName
+		item.CostCNY += event.CostCNY
+		item.CostUSD += event.CostUSD
+		agg[k] = item
+	}
+	out := make([]ProbeCostTodayRow, 0, len(agg))
+	for _, v := range agg {
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func (f *fakeRepository) TryAcquireSchedulerLease(ctx context.Context) (func(), bool, error) {
 	return func() {}, true, nil
 }

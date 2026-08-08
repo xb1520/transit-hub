@@ -453,6 +453,19 @@ type Sub2APIBatchUserUsage struct {
 	TotalTokens     int64
 }
 
+// Sub2APIAccountTodayStats 来自 GET/POST /api/v1/admin/accounts/.../today-stats 的账号今日用量。
+// 真实对接创建的是 admin accounts（不是 users），营收必须走账号接口。
+//
+// ActualCost = 用户侧总消费/实际（管理站绿色「总消费」），用作营收；
+// Cost = 上游/账号成本（管理站橙色「成本」），仅参考，不参与营收回填。
+type Sub2APIAccountTodayStats struct {
+	AccountID   string
+	ActualCost  float64 // 用户侧计费，→ 子行营收
+	Cost        float64 // 上游成本参考，禁止当作营收
+	Requests    int
+	TotalTokens int64
+}
+
 // Sub2APIBalanceHistoryItem 是上游用户侧入账流水的统一结构（sub2api / new-api 共用）。
 type Sub2APIBalanceHistoryItem struct {
 	ID        string

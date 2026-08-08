@@ -90,6 +90,9 @@ type fakePlatformClient struct {
 	capturedAdminKey     string
 	capturedUserID       string
 	capturedPlatform     upstream.Platform
+	// 管理站按账号今日消费（group profit 真实对接营收）。
+	batchUsage map[string]upstream.Sub2APIBatchUserUsage
+	groupUsage map[string][]upstream.Sub2APIUserGroupUsage // accountID → 分组用量
 }
 
 func (f *fakePlatformClient) NormalizeURL(value string) (string, error) { return value, nil }
@@ -160,6 +163,34 @@ func (f *fakePlatformClient) FetchSub2APIAdminUsageStats(session upstream.Sessio
 
 func (f *fakePlatformClient) FetchSub2APIAdminSiteBalanceFiltered(session upstream.Session, filter upstream.BalanceFilter) (upstream.AdminSiteBalance, error) {
 	return upstream.AdminSiteBalance{}, nil
+}
+
+func (f *fakePlatformClient) FetchSub2APIAdminAccountsTodayStats(session upstream.Session, accountIDs []string) (map[string]upstream.Sub2APIAccountTodayStats, error) {
+	out := make(map[string]upstream.Sub2APIAccountTodayStats)
+	if f.batchUsage == nil {
+		return out, nil
+	}
+	for _, id := range accountIDs {
+		if v, ok := f.batchUsage[id]; ok {
+			out[id] = upstream.Sub2APIAccountTodayStats{
+				AccountID:  id,
+				ActualCost: v.TodayActualCost,
+				Cost:       v.TodayActualCost,
+			}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakePlatformClient) FetchNewAPIAdminChannelTodayUsage(session upstream.Session, channelID string) (float64, error) {
+	if f.batchUsage == nil {
+		return 0, nil
+	}
+	// 测试复用 batchUsage 存 channel 今日消费（平台 USD）。
+	if v, ok := f.batchUsage[channelID]; ok {
+		return v.TodayActualCost, nil
+	}
+	return 0, nil
 }
 
 func (f *fakePlatformClient) FetchSub2APIAdminGroups(session upstream.Session) ([]upstream.GroupInfo, error) {

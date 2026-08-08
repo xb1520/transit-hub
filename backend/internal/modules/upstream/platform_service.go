@@ -1770,6 +1770,38 @@ func (s *PlatformService) fetchNewAPIAdminUsageStats(session Session, startDate,
 	return s.fetchNewAPISelfUsageActualCost(session, startDate, endDate)
 }
 
+// FetchNewAPIAdminChannelTodayUsage 拉取管理站 new-api 指定 channel 今日消费（USD 平台单位）。
+// 走管理员日志统计 GET /api/log/stat?type=2&channel=…（非 self），与 UI「按渠道筛使用记录」同源。
+// 真实对接时 AdminAccountID 存的是 channel id。
+func (s *PlatformService) FetchNewAPIAdminChannelTodayUsage(session Session, channelID string) (float64, error) {
+	if session.Platform != PlatformNewAPI || !session.IsAuthenticated() {
+		return 0, newRequestError(ErrorAuth, PlatformNewAPI)
+	}
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return 0, nil
+	}
+	values := url.Values{}
+	values.Set("type", "2")
+	values.Set("start_timestamp", strconvInt(BusinessDayStart()))
+	values.Set("end_timestamp", strconvInt(BusinessDayEnd()))
+	values.Set("channel", channelID)
+	statURL := session.BaseURL + "/api/log/stat?" + values.Encode()
+	response, err := s.httpClient.requestJSON(statURL, newAPIAuthOptions(session))
+	if err != nil {
+		// 部分部署仅有 /api/log/self/stat 或字段名不同；再试 channel_id。
+		values.Set("channel_id", channelID)
+		values.Del("channel")
+		statURL = session.BaseURL + "/api/log/stat?" + values.Encode()
+		response, err = s.httpClient.requestJSON(statURL, newAPIAuthOptions(session))
+		if err != nil {
+			return 0, err
+		}
+	}
+	quota := firstNumber(dataRecord(response.Payload), []string{"quota", "used_quota", "usedQuota", "total_quota", "totalQuota"})
+	return quotaToUSDValueWithUnit(quota, session.QuotaPerUnit), nil
+}
+
 // FetchAdminSiteBalanceFiltered 平台中性的站点用户总余额统计。
 func (s *PlatformService) FetchAdminSiteBalanceFiltered(session Session, filter BalanceFilter) (AdminSiteBalance, error) {
 	switch session.Platform {
@@ -2744,6 +2776,266 @@ func normalizeSub2APIUserBreakdownQuery(query Sub2APIUserBreakdownQuery) Sub2API
 		query.Timezone = "Asia/Shanghai"
 	}
 	return query
+}
+
+// FetchSub2APIAdminAccountsTodayStats 批量拉取 admin 转发账号今日消费。
+// 真实对接写入的是 /api/v1/admin/accounts 账号（非 end-user），必须用账号 today-stats，
+// 不能用 users-usage（站点用户列表那条链路）。
+//
+// 优先 POST /api/v1/admin/accounts/today-stats/batch；失败则逐个 GET .../accounts/:id/today-stats。
+func (s *PlatformService) FetchSub2APIAdminAccountsTodayStats(session Session, accountIDs []string) (map[string]Sub2APIAccountTodayStats, error) {
+	if session.Platform != PlatformSub2API || !session.IsAuthenticated() {
+		return nil, newRequestError(ErrorAuth, PlatformSub2API)
+	}
+	ids := make([]int64, 0, len(accountIDs))
+	idStrs := make([]string, 0, len(accountIDs))
+	seen := map[int64]struct{}{}
+	for _, raw := range accountIDs {
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		ids = append(ids, n)
+		idStrs = append(idStrs, strconv.FormatInt(n, 10))
+	}
+	out := make(map[string]Sub2APIAccountTodayStats, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	// 批量接口
+	const chunk = 50
+	for i := 0; i < len(ids); i += chunk {
+		end := i + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+		options := adminAuthOptions(session)
+		options.Method = http.MethodPost
+		// 兼容 ids 为 number 或 string 的上游实现
+		options.Body = map[string]any{"ids": batch}
+		response, err := s.httpClient.requestJSON(session.BaseURL+"/api/v1/admin/accounts/today-stats/batch", options)
+		if err != nil {
+			// 批量失败：本批改走单账号
+			for _, id := range batch {
+				stats, oneErr := s.fetchSub2APIAdminAccountTodayStatsOne(session, strconv.FormatInt(id, 10))
+				if oneErr != nil {
+					log.Printf("sub2api account today-stats failed account_id=%d err=%v", id, oneErr)
+					continue
+				}
+				if stats.AccountID != "" {
+					out[stats.AccountID] = stats
+				}
+			}
+			continue
+		}
+		for k, v := range parseSub2APIAccountsTodayStats(response.Payload) {
+			out[k] = v
+		}
+	}
+	// 批量返回空时再逐个补齐（部分上游 batch 成功但 body 结构不符）
+	if len(out) == 0 {
+		for _, idStr := range idStrs {
+			if _, ok := out[idStr]; ok {
+				continue
+			}
+			stats, oneErr := s.fetchSub2APIAdminAccountTodayStatsOne(session, idStr)
+			if oneErr != nil {
+				continue
+			}
+			if stats.AccountID != "" {
+				out[stats.AccountID] = stats
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *PlatformService) fetchSub2APIAdminAccountTodayStatsOne(session Session, accountID string) (Sub2APIAccountTodayStats, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return Sub2APIAccountTodayStats{}, nil
+	}
+	url := session.BaseURL + "/api/v1/admin/accounts/" + url.PathEscape(accountID) + "/today-stats"
+	response, err := s.httpClient.requestJSON(url, adminAuthOptions(session))
+	if err != nil {
+		return Sub2APIAccountTodayStats{}, err
+	}
+	parsed := parseSub2APIAccountsTodayStats(response.Payload)
+	if v, ok := parsed[accountID]; ok {
+		return v, nil
+	}
+	// 单对象响应：整包即 stats
+	for _, v := range parsed {
+		if v.AccountID == "" {
+			v.AccountID = accountID
+		}
+		return v, nil
+	}
+	// 直接从 data 解析
+	rec := dataRecord(response.Payload)
+	stats := sub2APIAccountTodayStatsFromRecord(accountID, rec)
+	return stats, nil
+}
+
+func parseSub2APIAccountsTodayStats(payload any) map[string]Sub2APIAccountTodayStats {
+	out := make(map[string]Sub2APIAccountTodayStats)
+	// 形态1：{ "data": { "50": {...}, "36": {...} } }
+	data := dataRecord(payload)
+	if len(data) > 0 {
+		// 若 data 本身就是 stats 对象（含用户侧/成本字段）
+		if firstNumber(data, []string{
+			"user_cost", "userCost", "user_actual_cost", "userActualCost",
+			"account_cost", "accountCost", "actual_cost", "actualCost",
+			"today_actual_cost", "todayActualCost", "cost", "today_cost", "todayCost",
+		}) != nil || dataRecord(data["today"]) != nil {
+			stats := sub2APIAccountTodayStatsFromRecord("", data)
+			if id := firstStringy(data, []string{"account_id", "accountId", "id"}); id != "" {
+				stats.AccountID = id
+				out[id] = stats
+			} else if stats.ActualCost > 0 || stats.Cost > 0 {
+				out["_"] = stats
+			}
+		}
+		for k, raw := range data {
+			rec := dataRecord(raw)
+			if len(rec) == 0 {
+				continue
+			}
+			// 跳过非对象统计字段（含用户侧/账号侧成本字段）
+			if firstNumber(rec, []string{
+				"user_cost", "userCost", "user_actual_cost", "userActualCost",
+				"account_cost", "accountCost", "account_actual_cost", "accountActualCost",
+				"actual_cost", "actualCost", "today_actual_cost", "todayActualCost",
+				"cost", "today_cost", "todayCost", "total_tokens", "totalTokens", "requests",
+			}) == nil && firstStringy(rec, []string{"account_id", "accountId", "id"}) == "" {
+				continue
+			}
+			id := firstStringy(rec, []string{"account_id", "accountId", "id"})
+			if id == "" {
+				id = strings.TrimSpace(k)
+			}
+			if id == "" || id == "stats" || id == "summary" {
+				continue
+			}
+			out[id] = sub2APIAccountTodayStatsFromRecord(id, rec)
+		}
+	}
+	// 形态2：{ "data": [ {...}, ... ] }
+	for _, item := range dataArray(payload) {
+		rec := dataRecord(item)
+		id := firstStringy(rec, []string{"account_id", "accountId", "id"})
+		if id == "" {
+			continue
+		}
+		out[id] = sub2APIAccountTodayStatsFromRecord(id, rec)
+	}
+	return out
+}
+
+// ParseSub2APIAccountsTodayStatsForTest 导出解析逻辑供单测（避免重复实现）。
+func ParseSub2APIAccountsTodayStatsForTest(payload any) map[string]Sub2APIAccountTodayStats {
+	return parseSub2APIAccountsTodayStats(payload)
+}
+
+func sub2APIAccountTodayStatsFromRecord(accountID string, rec map[string]any) Sub2APIAccountTodayStats {
+	// 兼容嵌套 today / usage / summary
+	for _, nest := range []string{"today", "usage", "summary", "stats"} {
+		if nested := dataRecord(rec[nest]); len(nested) > 0 {
+			for k, v := range nested {
+				if _, exists := rec[k]; !exists {
+					rec[k] = v
+				}
+			}
+		}
+	}
+	stats := Sub2APIAccountTodayStats{AccountID: accountID}
+	if id := firstStringy(rec, []string{"account_id", "accountId", "id"}); id != "" {
+		stats.AccountID = id
+	}
+
+	// 管理站 UI：总消费/实际（用户侧计费）≠ 成本（上游侧）。
+	// 营收必须用用户侧；成本字段仅作参考，禁止把 account_cost 当成营收。
+	userBilling := floatFromRecord(rec, []string{
+		"user_cost", "userCost",
+		"user_actual_cost", "userActualCost",
+		"total_user_cost", "totalUserCost",
+		"user_today_cost", "userTodayCost",
+		"total_user_actual_cost", "totalUserActualCost",
+	})
+	accountCost := floatFromRecord(rec, []string{
+		"account_cost", "accountCost",
+		"account_actual_cost", "accountActualCost",
+		"total_account_cost", "totalAccountCost",
+		"upstream_cost", "upstreamCost",
+	})
+	// 部分版本用 actual_cost 表示「实际」（用户侧），用 cost 表示上游成本；
+	// 也有版本 actual_cost 实为 account 成本。用多字段交叉判断。
+	genericActual := floatFromRecord(rec, []string{
+		"actual_cost", "actualCost", "today_actual_cost", "todayActualCost",
+	})
+	genericCost := floatFromRecord(rec, []string{
+		"cost", "today_cost", "todayCost", "total_cost", "totalCost",
+	})
+
+	// Cost 字段：上游/账号成本
+	stats.Cost = accountCost
+	if stats.Cost <= 0 {
+		stats.Cost = genericCost
+	}
+
+	// ActualCost 字段：用户侧营收（总消费）
+	switch {
+	case userBilling > 0:
+		stats.ActualCost = userBilling
+	case genericActual > 0 && accountCost > 0:
+		// 两者都有：较大者通常是用户侧总消费（如 121 vs 91）
+		if genericActual >= accountCost {
+			stats.ActualCost = genericActual
+		} else {
+			// genericActual 更小，更像成本；尝试 genericCost 是否更大
+			if genericCost > genericActual {
+				stats.ActualCost = genericCost
+				if stats.Cost <= 0 {
+					stats.Cost = genericActual
+				}
+			} else {
+				stats.ActualCost = genericActual
+			}
+		}
+	case genericActual > 0 && genericCost > 0 && genericActual != genericCost:
+		// 实际 vs 成本两个数：取较大为营收、较小为成本参考
+		if genericActual >= genericCost {
+			stats.ActualCost = genericActual
+			if stats.Cost <= 0 {
+				stats.Cost = genericCost
+			}
+		} else {
+			stats.ActualCost = genericCost
+			if stats.Cost <= 0 {
+				stats.Cost = genericActual
+			}
+		}
+	case genericActual > 0:
+		stats.ActualCost = genericActual
+	case genericCost > 0 && accountCost <= 0:
+		// 仅有一个模糊 cost，且无明确 account_cost 时，可能是用户侧（旧接口）
+		stats.ActualCost = genericCost
+	default:
+		stats.ActualCost = 0
+	}
+
+	// 不再用 Cost 回填 ActualCost（避免把上游成本当成营收）。
+	if n := firstInt(rec, []string{"requests", "request_count", "requestCount", "today_requests"}); n != nil {
+		stats.Requests = *n
+	}
+	stats.TotalTokens = int64FromRecord(rec, []string{"total_tokens", "totalTokens", "today_tokens", "todayTokens"})
+	return stats
 }
 
 // FetchSub2APIAdminBatchUsersUsage 批量拉取用户今日/累计实际消费（POST users-usage）。
